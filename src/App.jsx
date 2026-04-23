@@ -231,12 +231,22 @@ function itemsMatch(sifatItem, pedidoItem, colorTable = []) {
   const sMed = normalizeMedida(sifatItem.medida);
   const pMed = normalizeMedida(pedidoItem.medida);
 
+  // IMPORTANTE: medida com "X" (canto, ex: 2.50X2.50) é um PRODUTO DIFERENTE
+  // de medida sem "X" (sofá reto, ex: 2.50). Nunca podem casar entre si.
+  const sTemX = sMed.includes("X");
+  const pTemX = pMed.includes("X");
+  if (sTemX !== pTemX) return false;
+
   if (!sMed && !pMed) return true;
   if (sMed === pMed) return true;
 
-  const sNum = parseFloat(sMed);
-  const pNum = parseFloat(pMed);
-  if (!isNaN(sNum) && !isNaN(pNum) && Math.abs(sNum - pNum) < 0.01) return true;
+  // Só compara numericamente quando NENHUM dos dois tem X
+  // (medidas compostas precisam bater exatamente, não numericamente)
+  if (!sTemX && !pTemX) {
+    const sNum = parseFloat(sMed);
+    const pNum = parseFloat(pMed);
+    if (!isNaN(sNum) && !isNaN(pNum) && Math.abs(sNum - pNum) < 0.01) return true;
+  }
 
   return false;
 }
@@ -353,10 +363,14 @@ function loadPdfJs() {
 function conciliar(sifatItems, pedidoItems, colorTable = []) {
   const esquecidos = [];
   const cobertos = [];
+  const pedidosUsados = new Set(); // rastreia quais pedidos casaram com algum negativo
 
   for (const s of sifatItems) {
     const matches = pedidoItems.filter((p) => itemsMatch(s, p, colorTable));
     const qtdPedida = matches.reduce((sum, p) => sum + (p.quantidade || 0), 0);
+
+    // Marca os pedidos que casaram com esse negativo
+    matches.forEach((p) => pedidosUsados.add(p));
 
     if (qtdPedida >= s.quantidadeNegativa) {
       cobertos.push({ sifat: s, pedidos: matches, qtdPedida });
@@ -370,7 +384,11 @@ function conciliar(sifatItems, pedidoItems, colorTable = []) {
     }
   }
 
-  return { esquecidos, cobertos };
+  // Pedidos que NÃO casaram com nenhum negativo do SIFAT
+  // (loja fez encomenda mas o produto não está negativo no estoque)
+  const semNegativo = pedidoItems.filter((p) => !pedidosUsados.has(p));
+
+  return { esquecidos, cobertos, semNegativo };
 }
 
 // ============================================================
@@ -605,6 +623,19 @@ function ConciliacaoModule({ colorTable }) {
     );
   }, [result, searchTerm]);
 
+  const filteredSemNegativo = useMemo(() => {
+    if (!result) return [];
+    const t = searchTerm.toLowerCase();
+    if (!t) return result.semNegativo;
+    return result.semNegativo.filter(
+      (p) =>
+        p.modelo.toLowerCase().includes(t) ||
+        p.cliente.toLowerCase().includes(t) ||
+        p.numeroPedido.toLowerCase().includes(t) ||
+        p.corNome.toLowerCase().includes(t)
+    );
+  }, [result, searchTerm]);
+
   const exportarEsquecidos = () => {
     if (!result) return;
     const rows = result.esquecidos.map((e) => ({
@@ -658,7 +689,7 @@ function ConciliacaoModule({ colorTable }) {
       {/* Upload */}
       <div className="grid md:grid-cols-2 gap-4 mb-6">
         <FileDropZone
-          label="Pedidos da Loja"
+          label="Produtos Encomendados"
           sublabel="Planilha .xlsx exportada do sistema de pedidos"
           icon={FileSpreadsheet}
           accept=".xlsx,.xls,.csv"
@@ -704,38 +735,38 @@ function ConciliacaoModule({ colorTable }) {
         <>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
             <StatCard
-              label="Itens em Negativo"
-              value={sifat.length}
-              sublabel="no SIFAT"
-              accent="stone"
-              icon={Package}
-            />
-            <StatCard
-              label="Pedidos da Loja"
-              value={pedidos.length}
-              sublabel="linhas processadas"
-              accent="stone"
-              icon={FileSpreadsheet}
-            />
-            <StatCard
               label="Esquecidos"
               value={result.esquecidos.length}
-              sublabel="sem encomenda"
+              sublabel="negativo sem pedido"
               accent="red"
               icon={XCircle}
             />
             <StatCard
+              label="Divergências"
+              value={result.semNegativo.length}
+              sublabel="pedido sem negativo"
+              accent="amber"
+              icon={AlertTriangle}
+            />
+            <StatCard
               label="Conciliados"
               value={result.cobertos.length}
-              sublabel="já com pedido"
+              sublabel="tudo certo"
               accent="green"
               icon={CheckCircle2}
+            />
+            <StatCard
+              label="Total processado"
+              value={`${sifat.length} / ${pedidos.length}`}
+              sublabel="negativos / pedidos"
+              accent="stone"
+              icon={Package}
             />
           </div>
 
           {/* Barra de ações */}
           <div className="flex flex-wrap items-center gap-3 mb-4 pb-4 border-b border-stone-200">
-            <div className="flex bg-stone-100 rounded-md p-1">
+            <div className="flex bg-stone-100 rounded-md p-1 flex-wrap">
               <button
                 onClick={() => setActiveView("esquecidos")}
                 className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
@@ -745,6 +776,16 @@ function ConciliacaoModule({ colorTable }) {
                 }`}
               >
                 Esquecidos ({result.esquecidos.length})
+              </button>
+              <button
+                onClick={() => setActiveView("semNegativo")}
+                className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
+                  activeView === "semNegativo"
+                    ? "bg-white text-amber-900 shadow-sm"
+                    : "text-stone-600 hover:text-stone-900"
+                }`}
+              >
+                Divergências ({result.semNegativo.length})
               </button>
               <button
                 onClick={() => setActiveView("cobertos")}
@@ -788,11 +829,9 @@ function ConciliacaoModule({ colorTable }) {
           </div>
 
           {/* Lista */}
-          {activeView === "esquecidos" ? (
-            <EsquecidosList items={filteredEsquecidos} />
-          ) : (
-            <CobertosList items={filteredCobertos} />
-          )}
+          {activeView === "esquecidos" && <EsquecidosList items={filteredEsquecidos} />}
+          {activeView === "semNegativo" && <SemNegativoList items={filteredSemNegativo} />}
+          {activeView === "cobertos" && <CobertosList items={filteredCobertos} />}
         </>
       )}
 
@@ -987,6 +1026,84 @@ function CobertosList({ items }) {
               </div>
             </div>
           )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SemNegativoList({ items }) {
+  if (!items.length) {
+    return (
+      <div className="text-center py-12">
+        <CheckCircle2 className="w-10 h-10 text-emerald-600 mx-auto mb-3" />
+        <p className="font-serif text-lg text-stone-800">Nenhuma divergência</p>
+        <p className="text-sm text-stone-600 mt-1">
+          Todos os pedidos têm produto correspondente em negativo no SIFAT.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-3 flex items-start gap-2">
+        <AlertTriangle className="w-4 h-4 text-amber-800 mt-0.5 flex-shrink-0" />
+        <p className="text-xs text-amber-900">
+          <strong>Pedidos lançados mas o produto NÃO está negativo no SIFAT.</strong>{" "}
+          Possíveis causas: a loja esqueceu de dar baixa no estoque ao vender, o
+          pedido foi lançado em duplicidade, ou o produto do pedido é diferente
+          do que foi vendido.
+        </p>
+      </div>
+
+      {items.map((p, i) => (
+        <div
+          key={i}
+          className="border border-amber-200 bg-white rounded-lg overflow-hidden"
+        >
+          <div className="flex items-start p-4 gap-4">
+            <div className="w-10 h-10 rounded-md bg-amber-100 flex items-center justify-center flex-shrink-0">
+              <AlertTriangle className="w-5 h-5 text-amber-700" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-baseline gap-2 mb-1">
+                <span className="text-xs font-mono text-stone-500">
+                  {p.numeroPedido}
+                </span>
+                <h3 className="font-serif font-semibold text-stone-900 truncate">
+                  {p.modelo}
+                  {p.medida && ` — ${p.medida}`}
+                </h3>
+              </div>
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-600">
+                <span>
+                  Cliente: <strong className="text-stone-900">{p.cliente}</strong>
+                </span>
+                <span>
+                  Cor:{" "}
+                  <strong className="text-stone-900">
+                    {p.corCodigo} {p.corNome}
+                  </strong>
+                </span>
+                <span>
+                  Fornecedor: <strong className="text-stone-900">{p.fornecedor}</strong>
+                </span>
+                <span>Data: <strong className="text-stone-900">{p.data}</strong></span>
+                {p.obs && (
+                  <span className="text-amber-800">
+                    Obs: <strong>{p.obs}</strong>
+                  </span>
+                )}
+              </div>
+            </div>
+            <div className="text-right flex-shrink-0">
+              <p className="text-xs text-stone-500 uppercase tracking-wider">Quantidade</p>
+              <p className="font-serif text-2xl font-bold text-amber-700">
+                {p.quantidade}
+              </p>
+            </div>
+          </div>
         </div>
       ))}
     </div>
