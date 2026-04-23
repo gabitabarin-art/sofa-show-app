@@ -678,7 +678,7 @@ function ConciliacaoModule({ colorTable }) {
           </span>
         </div>
         <h1 className="font-serif text-4xl font-bold text-stone-900 tracking-tight">
-          Conciliação dos Pedidos com os Negativos
+          Conciliação dos Pedidos com os Negativos do Sistema
         </h1>
         <p className="text-stone-600 mt-2 max-w-2xl">
           Cruza o relatório de estoque negativo do <strong>SIFAT</strong> com a planilha de
@@ -735,7 +735,7 @@ function ConciliacaoModule({ colorTable }) {
         <>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
             <StatCard
-              label="Esquecidos"
+              label="Esquecidos de Encomendar"
               value={result.esquecidos.length}
               sublabel="negativo sem pedido"
               accent="red"
@@ -775,7 +775,7 @@ function ConciliacaoModule({ colorTable }) {
                     : "text-stone-600 hover:text-stone-900"
                 }`}
               >
-                Esquecidos ({result.esquecidos.length})
+                Esquecidos de Encomendar ({result.esquecidos.length})
               </button>
               <button
                 onClick={() => setActiveView("semNegativo")}
@@ -862,7 +862,7 @@ function EsquecidosList({ items }) {
     return (
       <div className="text-center py-12">
         <CheckCircle2 className="w-10 h-10 text-emerald-600 mx-auto mb-3" />
-        <p className="font-serif text-lg text-stone-800">Nenhum item esquecido</p>
+        <p className="font-serif text-lg text-stone-800">Nenhum item esquecido de encomendar</p>
         <p className="text-sm text-stone-600 mt-1">
           Todos os negativos do SIFAT têm pedido correspondente.
         </p>
@@ -1051,9 +1051,9 @@ function SemNegativoList({ items }) {
         <AlertTriangle className="w-4 h-4 text-amber-800 mt-0.5 flex-shrink-0" />
         <p className="text-xs text-amber-900">
           <strong>Pedidos lançados mas o produto NÃO está negativo no SIFAT.</strong>{" "}
-          Possíveis causas: a loja esqueceu de dar baixa no estoque ao vender, o
-          pedido foi lançado em duplicidade, ou o produto do pedido é diferente
-          do que foi vendido.
+          Possíveis causas: é uma troca; tem produto em estoque e mesmo assim a
+          loja encomendou; o pedido não foi finalizado; ou o estoque não está
+          batendo.
         </p>
       </div>
 
@@ -1450,7 +1450,7 @@ export default function App() {
   const modules = [
     {
       id: "conciliacao",
-      label: "Conciliação dos Pedidos com os Negativos",
+      label: "Conciliação dos Pedidos com os Negativos do Sistema",
       icon: GitCompare,
       available: true,
     },
