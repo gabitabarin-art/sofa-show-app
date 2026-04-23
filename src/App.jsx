@@ -636,23 +636,74 @@ function ConciliacaoModule({ colorTable }) {
     );
   }, [result, searchTerm]);
 
-  const exportarEsquecidos = () => {
+  const exportarAtual = () => {
     if (!result) return;
-    const rows = result.esquecidos.map((e) => ({
-      "Código SIFAT": e.sifat.codigo,
-      Descrição: e.sifat.descricao,
-      Modelo: e.sifat.modelo,
-      Medida: e.sifat.medida,
-      "Código Cor": e.sifat.corCodigo,
-      "Nome Cor": e.sifat.corNome,
-      "Qtde Negativa": e.sifat.quantidadeNegativa,
-      "Qtde Pedida": e.qtdPedida,
-      "Qtde Faltando": e.faltam,
-    }));
+
+    // Data de hoje pro nome do arquivo (formato YYYY-MM-DD)
+    const hoje = new Date().toISOString().slice(0, 10);
+
+    let rows = [];
+    let sheetName = "";
+    let fileName = "";
+
+    if (activeView === "esquecidos") {
+      rows = result.esquecidos.map((e) => ({
+        "Código SIFAT": e.sifat.codigo,
+        Descrição: e.sifat.descricao,
+        Modelo: e.sifat.modelo,
+        Medida: e.sifat.medida,
+        "Código Cor": e.sifat.corCodigo,
+        "Nome Cor": e.sifat.corNome,
+        "Qtde Negativa": e.sifat.quantidadeNegativa,
+        "Qtde Pedida": e.qtdPedida,
+        "Qtde Faltando": e.faltam,
+      }));
+      sheetName = "Encomendas Nao Realizadas";
+      fileName = `encomendas-nao-realizadas_${hoje}.xlsx`;
+    } else if (activeView === "cobertos") {
+      // Conciliados — uma linha por PEDIDO vinculado (pra ficar mais útil)
+      rows = result.cobertos.flatMap((e) =>
+        e.pedidos.map((p) => ({
+          "Código SIFAT": e.sifat.codigo,
+          "Produto": e.sifat.descricao,
+          "Modelo": e.sifat.modelo,
+          "Medida": e.sifat.medida,
+          "Código Cor": e.sifat.corCodigo,
+          "Nome Cor": e.sifat.corNome,
+          "Qtde Negativa": e.sifat.quantidadeNegativa,
+          "Nº Pedido": p.numeroPedido,
+          "Cliente": p.cliente,
+          "Fornecedor": p.fornecedor,
+          "Data": p.data,
+          "Qtde Pedida": p.quantidade,
+          "Obs": p.obs,
+        }))
+      );
+      sheetName = "Conciliados";
+      fileName = `conciliados_${hoje}.xlsx`;
+    } else if (activeView === "semNegativo") {
+      rows = result.semNegativo.map((p) => ({
+        "Nº Pedido": p.numeroPedido,
+        "Cliente": p.cliente,
+        "Modelo": p.modelo,
+        "Medida": p.medida,
+        "Código Cor": p.corCodigo,
+        "Nome Cor": p.corNome,
+        "Fornecedor": p.fornecedor,
+        "Data": p.data,
+        "Qtde Pedida": p.quantidade,
+        "Obs": p.obs,
+      }));
+      sheetName = "Divergencias";
+      fileName = `divergencias_${hoje}.xlsx`;
+    }
+
+    if (rows.length === 0) return;
+
     const ws = XLSX.utils.json_to_sheet(rows);
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Esquecidos");
-    XLSX.writeFile(wb, "conciliacao_esquecidos.xlsx");
+    XLSX.utils.book_append_sheet(wb, ws, sheetName);
+    XLSX.writeFile(wb, fileName);
   };
 
   const reset = () => {
@@ -735,7 +786,7 @@ function ConciliacaoModule({ colorTable }) {
         <>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
             <StatCard
-              label="Esquecidos de Encomendar"
+              label="Encomendas Não Realizadas"
               value={result.esquecidos.length}
               sublabel="negativo sem pedido"
               accent="red"
@@ -775,7 +826,7 @@ function ConciliacaoModule({ colorTable }) {
                     : "text-stone-600 hover:text-stone-900"
                 }`}
               >
-                Esquecidos de Encomendar ({result.esquecidos.length})
+                Encomendas Não Realizadas ({result.esquecidos.length})
               </button>
               <button
                 onClick={() => setActiveView("semNegativo")}
@@ -812,12 +863,17 @@ function ConciliacaoModule({ colorTable }) {
 
             <div className="flex gap-2 ml-auto">
               <button
-                onClick={exportarEsquecidos}
-                disabled={!result.esquecidos.length}
+                onClick={exportarAtual}
+                disabled={
+                  (activeView === "esquecidos" && !result.esquecidos.length) ||
+                  (activeView === "cobertos" && !result.cobertos.length) ||
+                  (activeView === "semNegativo" && !result.semNegativo.length)
+                }
                 className="flex items-center gap-2 px-3 py-2 text-sm border border-stone-300 rounded-md bg-white hover:bg-stone-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                title="Baixar a aba atual em Excel"
               >
                 <Download className="w-4 h-4" />
-                Exportar
+                Baixar Excel
               </button>
               <button
                 onClick={reset}
@@ -862,7 +918,7 @@ function EsquecidosList({ items }) {
     return (
       <div className="text-center py-12">
         <CheckCircle2 className="w-10 h-10 text-emerald-600 mx-auto mb-3" />
-        <p className="font-serif text-lg text-stone-800">Nenhum item esquecido de encomendar</p>
+        <p className="font-serif text-lg text-stone-800">Nenhuma encomenda não realizada</p>
         <p className="text-sm text-stone-600 mt-1">
           Todos os negativos do SIFAT têm pedido correspondente.
         </p>
@@ -988,7 +1044,7 @@ function CobertosList({ items }) {
             <div className="flex items-center gap-4 flex-shrink-0">
               <div className="text-right">
                 <p className="text-xs text-emerald-700 uppercase tracking-wider font-semibold">
-                  Coberto
+                  Quantidade
                 </p>
                 <p className="font-serif text-xl font-bold text-emerald-800">
                   {e.qtdPedida}/{e.sifat.quantidadeNegativa}
@@ -1049,12 +1105,18 @@ function SemNegativoList({ items }) {
     <div className="space-y-2">
       <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-3 flex items-start gap-2">
         <AlertTriangle className="w-4 h-4 text-amber-800 mt-0.5 flex-shrink-0" />
-        <p className="text-xs text-amber-900">
-          <strong>Pedidos lançados mas o produto NÃO está negativo no SIFAT.</strong>{" "}
-          Possíveis causas: é uma troca; tem produto em estoque e mesmo assim a
-          loja encomendou; o pedido não foi finalizado; ou o estoque não está
-          batendo.
-        </p>
+        <div className="text-xs text-amber-900">
+          <p className="mb-2">
+            <strong>Pedidos lançados mas o produto NÃO está negativo no SIFAT.</strong>
+          </p>
+          <p className="mb-1 font-semibold">Possíveis causas:</p>
+          <ul className="list-disc list-inside space-y-0.5 pl-1">
+            <li>Pode se tratar de uma troca</li>
+            <li>O produto já estava em estoque e, mesmo assim, foi feita a encomenda</li>
+            <li>O pedido não foi finalizado corretamente</li>
+            <li>Divergência de estoque (estoque não confere com o sistema)</li>
+          </ul>
+        </div>
       </div>
 
       {items.map((p, i) => (
