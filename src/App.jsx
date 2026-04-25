@@ -43,16 +43,61 @@ const DEFAULT_COLOR_TABLE = [
 ];
 
 // Normaliza nome de cor pra comparação (remove acentos, espaços extras, prefixos de material)
+// Lista de materiais que podem aparecer no nome do modelo ou da cor
+// Removidos para não confundir o matching
+const MATERIAIS = ["VELUDO", "LINHO", "VELVET", "SUEDE", "BOUCLE", "COURO", "CAMURÇA", "CAMURCA", "LINHÃO", "LINHAO"];
+
 function normalizeColorName(name) {
   if (!name) return "";
-  return name
-    .toUpperCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "") // remove acentos
-    .replace(/\b(VELUDO|LINHO|VELVET|SUEDE|BEGE)\b/g, "") // remove materiais comuns
+  let s = name.toUpperCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  for (const mat of MATERIAIS) {
+    s = s.replace(new RegExp(`\\b${mat}\\b`, "g"), "");
+  }
+  return s
     .replace(/[^A-Z0-9\s]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+// Remove acentos para comparação de modelo
+function removeAcentos(s) {
+  return (s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
+
+// Limpa o nome do modelo: remove materiais, "+ PUFF", parênteses, etc.
+function limparModelo(modelo) {
+  if (!modelo) return "";
+  let s = modelo.toUpperCase().trim();
+  // Remove "+ PUFF" e variações
+  s = s.replace(/\s*\+\s*PUFF\b/gi, "");
+  // Remove conteúdo entre parênteses: "(2L SEM BRAÇO)"
+  s = s.replace(/\([^)]*\)/g, "");
+  // Remove materiais
+  for (const mat of MATERIAIS) {
+    s = s.replace(new RegExp(`\\b${mat}\\b`, "gi"), "");
+  }
+  // Remove números soltos no final (códigos de cor que escaparam)
+  s = s.replace(/\s+\d+\s*$/, "");
+  return s.replace(/\s+/g, " ").trim();
+}
+
+// Se a medida estiver vazia mas o modelo tiver medida embutida, extrai
+function extrairMedidaDoModelo(modelo, medidaAtual) {
+  if (medidaAtual && medidaAtual.trim()) return { modelo, medida: medidaAtual };
+  if (!modelo) return { modelo, medida: medidaAtual };
+  // Procura medida composta: "1,80X3,50", "2.15 X 1.95"
+  const mMult = modelo.match(/(\d+[,.]?\d*\s*[Xx]\s*\d+[,.]?\d*)/);
+  if (mMult) {
+    const novoModelo = (modelo.substring(0, mMult.index) + modelo.substring(mMult.index + mMult[0].length)).trim();
+    return { modelo: novoModelo, medida: mMult[1] };
+  }
+  // Procura medida simples: "1,30", "2,90"
+  const mSing = modelo.match(/(?<!\d)(\d+[,.]\d+)(?!\d)/);
+  if (mSing) {
+    const novoModelo = (modelo.substring(0, mSing.index) + modelo.substring(mSing.index + mSing[0].length)).trim();
+    return { modelo: novoModelo, medida: mSing[1] };
+  }
+  return { modelo, medida: medidaAtual };
 }
 
 // ============================================================
@@ -105,7 +150,7 @@ function parseDescricao(desc) {
   if (!desc) return { modelo: "", medida: "", corCodigo: "", corNome: "" };
 
   let s = desc.toUpperCase().trim();
-  s = s.replace(/^ESTOF\s+/i, "");
+  s = s.replace(/^ESTOF(?:ADO)?\s+/i, "");
 
   // Se tem "C/n MOD...", corta tudo a partir daí ANTES de procurar medida/cor
   // (isso evita pegar "1,00" como medida em "TIGUAN 3,50 C/2 MOD 1,00 E C/1 CHAISE")
@@ -144,21 +189,35 @@ function parseDescricao(desc) {
   }
 
   s = s.replace(/\s+/g, " ").trim();
+  s = limparModelo(s); // remove materiais, "+ PUFF", parênteses
 
   return { modelo: s, medida, corCodigo: corCodigo.toUpperCase(), corNome };
 }
 
 function parsePedidoRow(row) {
-  const modelo = String(row["MODELO"] || "").toUpperCase().trim();
-  const medidaRaw = String(row["MEDIDA"] || "").trim();
+  let modeloRaw = String(row["MODELO"] || "").toUpperCase().trim();
+  let medidaRaw = String(row["MEDIDA"] || "").trim();
   const corRaw = String(row["COR"] || "").toUpperCase().trim();
   const quant = Number(row["QUANT"] || 0);
 
+  // BUG 1: Se a medida estiver vazia mas o modelo tiver medida embutida, extrair
+  const extraido = extrairMedidaDoModelo(modeloRaw, medidaRaw);
+  modeloRaw = extraido.modelo;
+  medidaRaw = extraido.medida;
+
   const medida = normalizeMedida(medidaRaw);
+  const modelo = limparModelo(modeloRaw); // BUGS 3, 4: remove materiais, "+ PUFF"
+
+  // BUG 2: Cor pode vir com prefixo material, ex: "LINHO 02 BEGE" → código "02"
+  let corSemMaterial = corRaw;
+  for (const mat of MATERIAIS) {
+    corSemMaterial = corSemMaterial.replace(new RegExp(`\\b${mat}\\b`, "g"), "").trim();
+  }
+  corSemMaterial = corSemMaterial.replace(/\s+/g, " ").trim();
 
   let corCodigo = "";
   let corNome = corRaw;
-  const codMatch = corRaw.match(/^([\w-]+)(?:\s*-\s*|\s+)?(.*)$/);
+  const codMatch = corSemMaterial.match(/^([\w-]+)(?:\s*-\s*|\s+)?(.*)$/);
   if (codMatch) {
     const possibleCode = codMatch[1];
     if (/\d/.test(possibleCode)) {
@@ -218,30 +277,46 @@ function itemsMatch(sifatItem, pedidoItem, colorTable = []) {
     if (sifatCor !== pedidoCor) return false;
   }
 
-  const sModelo = sifatItem.modelo.replace(/\s+/g, " ").trim();
-  const pModelo = pedidoItem.modelo.replace(/\s+/g, " ").trim();
+  // BUG 6: Match flexível de modelo por palavras-chave
+  // Ex: "POLTRONA CONFORTO" (SIFAT) deve casar com "POLTRONA CONFORTO + PUFF" (pedido)
+  // Ex: "PUFF MUNIQUE" deve casar com "PUFF CANTO MUNIQUE"
+  const sModeloNorm = removeAcentos(sifatItem.modelo).trim();
+  const pModeloNorm = removeAcentos(pedidoItem.modelo).trim();
 
-  const modeloMatch =
-    sModelo === pModelo ||
-    sModelo.includes(pModelo) ||
-    pModelo.includes(sModelo);
+  if (!sModeloNorm || !pModeloNorm) return false;
 
-  if (!modeloMatch) return false;
+  const GENERICAS = new Set(["DE", "DA", "DO", "E", "+"]);
+  const sPalavras = new Set(
+    sModeloNorm.split(/\s+/).filter((w) => w && !GENERICAS.has(w) && w.length >= 2)
+  );
+  const pPalavras = new Set(
+    pModeloNorm.split(/\s+/).filter((w) => w && !GENERICAS.has(w) && w.length >= 2)
+  );
+
+  if (sPalavras.size === 0 || pPalavras.size === 0) return false;
+
+  // SIFAT está contido no pedido OU pedido contido no SIFAT
+  const sIncluidoEmP = [...sPalavras].every((w) => pPalavras.has(w));
+  const pIncluidoEmS = [...pPalavras].every((w) => sPalavras.has(w));
+  if (!sIncluidoEmP && !pIncluidoEmS) return false;
 
   const sMed = normalizeMedida(sifatItem.medida);
   const pMed = normalizeMedida(pedidoItem.medida);
 
-  // IMPORTANTE: medida com "X" (canto, ex: 2.50X2.50) é um PRODUTO DIFERENTE
-  // de medida sem "X" (sofá reto, ex: 2.50). Nunca podem casar entre si.
+  // BUG 7: SIFAT sem medida casa com pedido de qualquer medida
+  // (ex: "ESTOF CANTO MUNIQUE + PUFF" sem medida casa com "CANTO MUNIQUE + PUFF 2,15X1,95")
+  if (!sMed) return true;
+  // Se SIFAT tem medida mas pedido não tem, não casa (medida é obrigatória)
+  if (!pMed) return false;
+
+  // IMPORTANTE: medida com "X" (canto) é PRODUTO DIFERENTE de medida sem "X" (sofá reto)
   const sTemX = sMed.includes("X");
   const pTemX = pMed.includes("X");
   if (sTemX !== pTemX) return false;
 
-  if (!sMed && !pMed) return true;
   if (sMed === pMed) return true;
 
   // Só compara numericamente quando NENHUM dos dois tem X
-  // (medidas compostas precisam bater exatamente, não numericamente)
   if (!sTemX && !pTemX) {
     const sNum = parseFloat(sMed);
     const pNum = parseFloat(pMed);
@@ -259,7 +334,14 @@ function resolveColorCode(item, colorTable) {
   // Sem código explícito → tenta extrair um código numérico de dentro do nome
   // Ex: "MARROM TOSTADO 100828" → código "100828"
   //     "MARROM 11" → código "11"
-  const nome = (item.corNome || "").toUpperCase().trim();
+  //     "LINHO 78 CHAMPAGNE" → "78" (após remover material)
+  let nome = (item.corNome || "").toUpperCase().trim();
+  // Remove materiais antes de procurar código embarcado
+  for (const mat of MATERIAIS) {
+    nome = nome.replace(new RegExp(`\\b${mat}\\b`, "g"), "").trim();
+  }
+  nome = nome.replace(/\s+/g, " ").trim();
+
   const embeddedCode = nome.match(/\b(\d{2,}|\d+-\d+|[A-Z]?-?\d+)\b/);
   if (embeddedCode) {
     return embeddedCode[1].replace(/^0+/, "").toUpperCase();
