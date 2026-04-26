@@ -29,6 +29,7 @@ import {
   CircleDollarSign,
   Eye,
   AlertCircle,
+  CreditCard,
 } from "lucide-react";
 
 // ============================================================
@@ -448,11 +449,14 @@ function loadPdfJs() {
 
 const TOLERANCIA_DIAS = 4;
 
-// Lista de bancos suportados (vai crescer com o tempo)
+// Lista de bancos suportados
+// Bancos do tipo "extrato" usam o fluxo Sicredi (ERP + extrato).
+// Bancos do tipo "blu" usam o fluxo Blu (Excel da Blu + PDF do ERP por seção, match por autorização).
 const BANCOS_SUPORTADOS = [
-  { id: "sicredi", nome: "Sicredi", cor: "emerald" },
-  { id: "pague_veloz", nome: "Pague Veloz", cor: "blue", emBreve: true },
-  { id: "blu", nome: "Blu", cor: "purple", emBreve: true },
+  { id: "sicredi", nome: "Sicredi", tipo: "extrato", cor: "emerald" },
+  { id: "pague_veloz", nome: "Pague Veloz", tipo: "extrato", cor: "blue", emBreve: true },
+  { id: "blu_ss", nome: "Blu SS Express", tipo: "blu", secaoPdf: "BLU SS EXPRESS", cor: "purple" },
+  { id: "blu_lupe", nome: "Blu Lupe", tipo: "blu", secaoPdf: "BLU LUPE", cor: "purple" },
 ];
 
 // Converte "R$ -1.234,56" ou "1234,56" ou "-1,234.56" em número
@@ -871,6 +875,170 @@ function conciliarFinanceiro(erpItems, bancoItems) {
 }
 
 // ============================================================
+// CONCILIAÇÃO BLU — PARSERS E MATCHER
+// ============================================================
+
+// Normaliza chave de match (autorização):
+// - Numérica: tira zeros à esquerda  ("084836" → "84836")
+// - Alfanumérica: mantém como está em maiúsculas ("HMZCDJ" → "HMZCDJ")
+function normalizarChaveBlu(s) {
+  if (s == null) return "";
+  const str = String(s).trim().toUpperCase();
+  if (/^\d+$/.test(str)) {
+    return str.replace(/^0+/, "") || "0";
+  }
+  return str;
+}
+
+// Lê o Excel da Blu (extrato-vendas-completo-XXXX.xlsx).
+// Agrupa por codigo_nsu somando valor_bruto_parcela.
+async function readBluExcel(file) {
+  const data = await file.arrayBuffer();
+  const wb = XLSX.read(data, { type: "array", cellDates: true });
+  const sheet = wb.Sheets[wb.SheetNames[0]];
+  const linhas = XLSX.utils.sheet_to_json(sheet, { defval: null });
+
+  const vendasPorNsu = new Map();
+
+  for (const l of linhas) {
+    const nsu = String(l.codigo_nsu ?? "").trim();
+    if (!nsu) continue;
+
+    if (!vendasPorNsu.has(nsu)) {
+      vendasPorNsu.set(nsu, {
+        nsu,
+        autorizacao: String(l.codigo_autorizacao ?? "").trim().toUpperCase(),
+        chaveMatch: normalizarChaveBlu(l.codigo_autorizacao),
+        dataVenda: l.data_venda instanceof Date ? l.data_venda : parseData(l.data_venda),
+        bandeira: l.bandeira || "",
+        tipo: l.tipo || "",
+        qtdParcelas: l.quantidade_parcelas || 0,
+        status: l.status_venda || "",
+        valorBrutoTotal: 0,
+        valorLiquidoTotal: 0,
+        parcelasNoExtrato: 0,
+        terminal: l.numero_terminal || "",
+      });
+    }
+
+    const v = vendasPorNsu.get(nsu);
+    v.valorBrutoTotal += parseFloat(l.valor_bruto_parcela || 0);
+    v.valorLiquidoTotal += parseFloat(l.valor_liquido_parcela || 0);
+    v.parcelasNoExtrato += 1;
+  }
+
+  return Array.from(vendasPorNsu.values());
+}
+
+// Lê o PDF do ERP (Vendas Por Finalizadores) e extrai vendas de uma seção
+// específica (BLU SS EXPRESS ou BLU LUPE).
+async function readErpBluPdf(file, secaoNome) {
+  if (!window.pdfjsLib) await loadPdfJs();
+  const data = await file.arrayBuffer();
+  const pdf = await window.pdfjsLib.getDocument({ data }).promise;
+  let texto = "";
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    const linhas = {};
+    for (const item of content.items) {
+      const y = Math.round(item.transform[5]);
+      if (!linhas[y]) linhas[y] = [];
+      linhas[y].push({ x: item.transform[4], str: item.str });
+    }
+    const ys = Object.keys(linhas).sort((a, b) => b - a);
+    for (const y of ys) {
+      linhas[y].sort((a, b) => a.x - b.x);
+      texto += linhas[y].map((i) => i.str).join(" ") + "\n";
+    }
+  }
+
+  return parseErpBluTexto(texto, secaoNome);
+}
+
+// Extrai vendas de uma seção do PDF do ERP.
+// Cada linha: "4 02/03/2026 6544 78454 (068982) MAGALI...  3,500.00 MASTER CRÉDITO/302427/1"
+function parseErpBluTexto(texto, secaoNome) {
+  const inicio = texto.indexOf(`Forma de Pagamento: ${secaoNome}`);
+  if (inicio === -1) return [];
+  const fim = texto.indexOf(`Total: ${secaoNome}`, inicio);
+  const secao = fim === -1 ? texto.slice(inicio) : texto.slice(inicio, fim);
+
+  const re = /(\d+)\s+(\d{2}\/\d{2}\/\d{4})\s+(\d+)\s+(\d+)\s+\((\d+)\)\s*([^\n\r]+?)\s+([\d.,]+)\s+([^/\n]+?)\/([^/\s]+)\/(\d+)/g;
+
+  const vendas = [];
+  let m;
+  while ((m = re.exec(secao)) !== null) {
+    const [, loja, data, numVenda, numPedido, codCliente, cliente, valor, rede, nsuErp, parcelasErp] = m;
+    const dataObj = parseData(data);
+    vendas.push({
+      origem: "erp_blu",
+      loja: loja.trim(),
+      data: dataObj,
+      dataStr: data,
+      numVenda: numVenda.trim(),
+      numPedido: numPedido.trim(),
+      codCliente: codCliente.trim(),
+      cliente: cliente.trim(),
+      valor: parseValor(valor),
+      rede: rede.trim(),
+      nsuErp: nsuErp.trim().toUpperCase(),
+      chaveMatch: normalizarChaveBlu(nsuErp),
+      parcelasErp: parseInt(parcelasErp),
+    });
+  }
+  return vendas;
+}
+
+// Matcher Blu: chave (autorização normalizada) + mesmo mês/ano + valor com tolerância R$ 0,01
+function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01) {
+  const bluPorChave = new Map();
+  for (const v of vendasBlu) {
+    if (!bluPorChave.has(v.chaveMatch)) bluPorChave.set(v.chaveMatch, []);
+    bluPorChave.get(v.chaveMatch).push(v);
+  }
+
+  const conciliados = [];
+  const soNoErp = [];
+  const bluMatched = new Set();
+
+  for (const vErp of vendasErp) {
+    const candidatos = bluPorChave.get(vErp.chaveMatch) || [];
+    let match = null;
+
+    for (const cand of candidatos) {
+      if (bluMatched.has(cand.nsu)) continue;
+      const dErp = vErp.data;
+      const dBlu = cand.dataVenda;
+      if (!dErp || !dBlu) continue;
+      const mesmoMes =
+        dErp.getFullYear() === dBlu.getFullYear() &&
+        dErp.getMonth() === dBlu.getMonth();
+      const valorBate = Math.abs(cand.valorBrutoTotal - vErp.valor) <= toleranciaValor;
+
+      if (mesmoMes && valorBate) {
+        match = cand;
+        break;
+      }
+    }
+
+    if (match) {
+      conciliados.push({ erp: vErp, blu: match });
+      bluMatched.add(match.nsu);
+    } else {
+      soNoErp.push(vErp);
+    }
+  }
+
+  const soNaBlu = vendasBlu.filter(
+    (v) => !bluMatched.has(v.nsu) && v.status === "Confirmada"
+  );
+  const canceladas = vendasBlu.filter((v) => v.status !== "Confirmada");
+
+  return { conciliados, soNoErp, soNaBlu, canceladas };
+}
+
+// ============================================================
 // CONCILIAÇÃO
 // ============================================================
 
@@ -1063,12 +1231,14 @@ function StatCard({ label, value, sublabel, accent, icon: Icon }) {
     green: "border-emerald-200 bg-emerald-50/60",
     amber: "border-amber-200 bg-amber-50/60",
     stone: "border-stone-200 bg-white",
+    purple: "border-purple-200 bg-purple-50/60",
   };
   const textColors = {
     red: "text-red-900",
     green: "text-emerald-800",
     amber: "text-amber-900",
     stone: "text-stone-900",
+    purple: "text-purple-900",
   };
   return (
     <div className={`border rounded-lg p-4 ${accentColors[accent]}`}>
@@ -2020,6 +2190,119 @@ function ColorTableModule({ table, onSave }) {
 
 function FinanceiroModule() {
   const [bancoSelecionado, setBancoSelecionado] = useState(null);
+
+  const trocarBanco = () => {
+    setBancoSelecionado(null);
+  };
+
+  // === SELEÇÃO DE BANCO ===
+  if (!bancoSelecionado) {
+    return (
+      <div className="max-w-5xl mx-auto">
+        <div className="mb-8 border-b border-stone-200 pb-6">
+          <div className="flex items-baseline gap-3 mb-2">
+            <span className="text-xs uppercase tracking-[0.2em] text-amber-800 font-semibold">
+              Módulo 02
+            </span>
+            <span className="text-stone-300">—</span>
+            <span className="text-xs uppercase tracking-wider text-stone-500">
+              Financeiro
+            </span>
+          </div>
+          <h1 className="font-serif text-4xl font-bold text-stone-900 tracking-tight">
+            Conciliação Financeira
+          </h1>
+          <p className="text-stone-600 mt-2 max-w-2xl">
+            Compara o relatório de lançamentos do <strong>ERP</strong> com o{" "}
+            <strong>extrato bancário</strong> e identifica divergências, lançamentos
+            esquecidos e diferenças de data.
+          </p>
+        </div>
+
+        <h2 className="font-serif text-xl font-semibold text-stone-900 mb-4">
+          Escolha o banco para conciliar:
+        </h2>
+
+        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+          {BANCOS_SUPORTADOS.map((banco) => (
+            <button
+              key={banco.id}
+              onClick={() => !banco.emBreve && setBancoSelecionado(banco)}
+              disabled={banco.emBreve}
+              className={`p-6 border-2 rounded-lg text-left transition-all ${
+                banco.emBreve
+                  ? "border-stone-200 bg-stone-50 cursor-not-allowed opacity-60"
+                  : "border-stone-300 bg-white hover:border-amber-700 hover:shadow-md"
+              }`}
+            >
+              <div className="flex items-center gap-3 mb-2">
+                {banco.tipo === "blu" ? (
+                  <CreditCard
+                    className={`w-6 h-6 ${
+                      banco.emBreve ? "text-stone-400" : "text-purple-700"
+                    }`}
+                  />
+                ) : (
+                  <Landmark
+                    className={`w-6 h-6 ${
+                      banco.emBreve ? "text-stone-400" : "text-amber-800"
+                    }`}
+                  />
+                )}
+                <h3 className="font-serif text-lg font-semibold text-stone-900">
+                  {banco.nome}
+                </h3>
+              </div>
+              {banco.emBreve ? (
+                <span className="text-[10px] uppercase tracking-wider bg-stone-200 text-stone-600 px-2 py-0.5 rounded">
+                  Em breve
+                </span>
+              ) : banco.tipo === "blu" ? (
+                <p className="text-xs text-stone-600">
+                  Conciliar vendas da maquininha com o ERP
+                </p>
+              ) : (
+                <p className="text-xs text-stone-600">
+                  Conciliar extrato deste banco com o ERP
+                </p>
+              )}
+            </button>
+          ))}
+        </div>
+
+        <div className="mt-8 bg-amber-50 border border-amber-200 rounded-lg p-4 text-sm text-amber-900">
+          <p className="font-semibold mb-1">⚠️ Como funciona</p>
+          <ul className="list-disc list-inside space-y-1 text-xs">
+            <li>Suba o relatório de lançamentos do ERP (PDF ou Excel).</li>
+            <li>Suba o extrato bancário do mesmo período (PDF, Excel ou CSV).</li>
+            <li>
+              O app casa lançamentos pelo <strong>valor</strong> e{" "}
+              <strong>data</strong> (com tolerância de {TOLERANCIA_DIAS} dias).
+            </li>
+            <li>
+              Identifica: lançamentos esquecidos no ERP, lançamentos só no banco e
+              divergências de data.
+            </li>
+          </ul>
+        </div>
+      </div>
+    );
+  }
+
+  // === FLUXO BLU (maquininha) ===
+  if (bancoSelecionado.tipo === "blu") {
+    return <BluFlow banco={bancoSelecionado} onTrocar={trocarBanco} />;
+  }
+
+  // === FLUXO EXTRATO (Sicredi e similares) ===
+  return <ExtratoBancarioFlow banco={bancoSelecionado} onTrocar={trocarBanco} />;
+}
+
+// ============================================================
+// FLUXO: EXTRATO BANCÁRIO (Sicredi, Pague Veloz...)
+// ============================================================
+
+function ExtratoBancarioFlow({ banco, onTrocar }) {
   const [erpFile, setErpFile] = useState(null);
   const [bancoFile, setBancoFile] = useState(null);
   const [erpItems, setErpItems] = useState([]);
@@ -2056,10 +2339,10 @@ function FinanceiroModule() {
     setLoading(true);
     setBancoFile(f);
     try {
-      const items = await readBancoFile(f, bancoSelecionado.id);
+      const items = await readBancoFile(f, banco.id);
       if (!items.length) {
         setError(
-          `Nenhum lançamento foi extraído do extrato. O parser do ${bancoSelecionado.nome} pode não estar lendo este formato. Tente exportar em outro formato (Excel/CSV) ou verifique se o PDF não é uma imagem escaneada.`
+          `Nenhum lançamento foi extraído do extrato. O parser do ${banco.nome} pode não estar lendo este formato. Tente exportar em outro formato (Excel/CSV) ou verifique se o PDF não é uma imagem escaneada.`
         );
         setBancoFile(null);
       } else {
@@ -2189,7 +2472,7 @@ function FinanceiroModule() {
     const wsResumo = XLSX.utils.aoa_to_sheet([
       ["RESUMO DA CONCILIAÇÃO"],
       [],
-      ["Banco", bancoSelecionado.nome],
+      ["Banco", banco.nome],
       ["Data da conciliação", hoje],
       [],
       ["Lançamentos no ERP", erpItems.length],
@@ -2206,7 +2489,7 @@ function FinanceiroModule() {
     ]);
     XLSX.utils.book_append_sheet(wb, wsResumo, "Resumo");
 
-    const fileName = `conciliacao-financeira_${bancoSelecionado.id}_${hoje}.xlsx`;
+    const fileName = `conciliacao-financeira_${banco.id}_${hoje}.xlsx`;
     XLSX.writeFile(wb, fileName);
   };
 
@@ -2219,94 +2502,6 @@ function FinanceiroModule() {
     setSearchTerm("");
   };
 
-  const trocarBanco = () => {
-    setBancoSelecionado(null);
-    reset();
-  };
-
-  // === SELEÇÃO DE BANCO ===
-  if (!bancoSelecionado) {
-    return (
-      <div className="max-w-4xl mx-auto">
-        <div className="mb-8 border-b border-stone-200 pb-6">
-          <div className="flex items-baseline gap-3 mb-2">
-            <span className="text-xs uppercase tracking-[0.2em] text-amber-800 font-semibold">
-              Módulo 02
-            </span>
-            <span className="text-stone-300">—</span>
-            <span className="text-xs uppercase tracking-wider text-stone-500">
-              Financeiro
-            </span>
-          </div>
-          <h1 className="font-serif text-4xl font-bold text-stone-900 tracking-tight">
-            Conciliação Financeira
-          </h1>
-          <p className="text-stone-600 mt-2 max-w-2xl">
-            Compara o relatório de lançamentos do <strong>ERP</strong> com o{" "}
-            <strong>extrato bancário</strong> e identifica divergências, lançamentos
-            esquecidos e diferenças de data.
-          </p>
-        </div>
-
-        <h2 className="font-serif text-xl font-semibold text-stone-900 mb-4">
-          Escolha o banco para conciliar:
-        </h2>
-
-        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
-          {BANCOS_SUPORTADOS.map((banco) => (
-            <button
-              key={banco.id}
-              onClick={() => !banco.emBreve && setBancoSelecionado(banco)}
-              disabled={banco.emBreve}
-              className={`p-6 border-2 rounded-lg text-left transition-all ${
-                banco.emBreve
-                  ? "border-stone-200 bg-stone-50 cursor-not-allowed opacity-60"
-                  : "border-stone-300 bg-white hover:border-amber-700 hover:shadow-md"
-              }`}
-            >
-              <div className="flex items-center gap-3 mb-2">
-                <Landmark
-                  className={`w-6 h-6 ${
-                    banco.emBreve ? "text-stone-400" : "text-amber-800"
-                  }`}
-                />
-                <h3 className="font-serif text-lg font-semibold text-stone-900">
-                  {banco.nome}
-                </h3>
-              </div>
-              {banco.emBreve ? (
-                <span className="text-[10px] uppercase tracking-wider bg-stone-200 text-stone-600 px-2 py-0.5 rounded">
-                  Em breve
-                </span>
-              ) : (
-                <p className="text-xs text-stone-600">
-                  Conciliar extrato deste banco com o ERP
-                </p>
-              )}
-            </button>
-          ))}
-        </div>
-
-        <div className="mt-8 bg-amber-50 border border-amber-200 rounded-lg p-4 text-sm text-amber-900">
-          <p className="font-semibold mb-1">⚠️ Como funciona</p>
-          <ul className="list-disc list-inside space-y-1 text-xs">
-            <li>Suba o relatório de lançamentos do ERP (PDF ou Excel).</li>
-            <li>Suba o extrato bancário do mesmo período (PDF, Excel ou CSV).</li>
-            <li>
-              O app casa lançamentos pelo <strong>valor</strong> e{" "}
-              <strong>data</strong> (com tolerância de {TOLERANCIA_DIAS} dias).
-            </li>
-            <li>
-              Identifica: lançamentos esquecidos no ERP, lançamentos só no banco e
-              divergências de data.
-            </li>
-          </ul>
-        </div>
-      </div>
-    );
-  }
-
-  // === TELA DE UPLOAD E RESULTADO ===
   return (
     <div className="max-w-7xl mx-auto">
       <div className="mb-8 border-b border-stone-200 pb-6">
@@ -2316,21 +2511,21 @@ function FinanceiroModule() {
           </span>
           <span className="text-stone-300">—</span>
           <span className="text-xs uppercase tracking-wider text-stone-500">
-            {bancoSelecionado.nome}
+            {banco.nome}
           </span>
           <button
-            onClick={trocarBanco}
+            onClick={onTrocar}
             className="ml-2 text-xs text-amber-800 hover:text-amber-900 underline"
           >
             trocar banco
           </button>
         </div>
         <h1 className="font-serif text-4xl font-bold text-stone-900 tracking-tight">
-          Conciliação Financeira — {bancoSelecionado.nome}
+          Conciliação Financeira — {banco.nome}
         </h1>
         <p className="text-stone-600 mt-2 max-w-2xl">
           Compara os lançamentos do ERP com o extrato do{" "}
-          <strong>{bancoSelecionado.nome}</strong>.
+          <strong>{banco.nome}</strong>.
         </p>
       </div>
 
@@ -2350,7 +2545,7 @@ function FinanceiroModule() {
           disabled={loading}
         />
         <FileDropZone
-          label={`Extrato do ${bancoSelecionado.nome}`}
+          label={`Extrato do ${banco.nome}`}
           sublabel="PDF, Excel ou CSV"
           icon={Landmark}
           accept=".pdf,.xlsx,.xls,.csv,.ofx"
@@ -2389,7 +2584,7 @@ function FinanceiroModule() {
               icon={FileSpreadsheet}
             />
             <StatCard
-              label={bancoSelecionado.nome}
+              label={banco.nome}
               value={bancoItems.length}
               sublabel="lançamentos"
               accent="stone"
@@ -2503,11 +2698,680 @@ function FinanceiroModule() {
             Pronto para conciliar
           </p>
           <p className="text-sm text-stone-600 max-w-md mx-auto">
-            Envie o relatório do ERP e o extrato do {bancoSelecionado.nome} para
+            Envie o relatório do ERP e o extrato do {banco.nome} para
             identificar divergências, lançamentos esquecidos e diferenças de data.
           </p>
         </div>
       )}
+    </div>
+  );
+}
+
+// ============================================================
+// FLUXO BLU (Blu SS Express e Blu Lupe)
+// ============================================================
+
+function BluFlow({ banco, onTrocar }) {
+  const [bluFile, setBluFile] = useState(null);
+  const [erpFile, setErpFile] = useState(null);
+  const [vendasBlu, setVendasBlu] = useState([]);
+  const [vendasErp, setVendasErp] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [activeView, setActiveView] = useState("conciliados");
+  const [searchTerm, setSearchTerm] = useState("");
+
+  const handleBlu = async (f) => {
+    setError("");
+    setLoading(true);
+    setBluFile(f);
+    try {
+      const items = await readBluExcel(f);
+      if (!items.length) {
+        setError(
+          "Nenhuma venda foi extraída do Excel da Blu. Verifique se o arquivo é o extrato de vendas (extrato-vendas-completo-XXXX.xlsx)."
+        );
+        setBluFile(null);
+      } else {
+        setVendasBlu(items);
+      }
+    } catch (e) {
+      setError("Erro ao ler Excel da Blu: " + e.message);
+      setBluFile(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleErp = async (f) => {
+    setError("");
+    setLoading(true);
+    setErpFile(f);
+    try {
+      const items = await readErpBluPdf(f, banco.secaoPdf);
+      if (!items.length) {
+        setError(
+          `Nenhuma venda foi encontrada na seção "${banco.secaoPdf}" do PDF do ERP. Verifique se o relatório é "Vendas Por Finalizadores" e tem essa forma de pagamento.`
+        );
+        setErpFile(null);
+      } else {
+        setVendasErp(items);
+      }
+    } catch (e) {
+      setError("Erro ao ler PDF do ERP: " + e.message);
+      setErpFile(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const result = useMemo(() => {
+    if (!vendasBlu.length || !vendasErp.length) return null;
+    return conciliarBlu(vendasBlu, vendasErp);
+  }, [vendasBlu, vendasErp]);
+
+  const filtrarLista = (items, getCampos) => {
+    const t = searchTerm.toLowerCase().trim();
+    if (!t) return items;
+    return items.filter((it) => {
+      const campos = getCampos(it);
+      return campos.some((c) => String(c || "").toLowerCase().includes(t));
+    });
+  };
+
+  const filteredConciliados = useMemo(() => {
+    if (!result) return [];
+    return filtrarLista(result.conciliados, (c) => [
+      c.erp.cliente,
+      c.erp.numVenda,
+      c.erp.numPedido,
+      c.blu.autorizacao,
+      c.blu.bandeira,
+      c.blu.valorBrutoTotal.toFixed(2),
+    ]);
+  }, [result, searchTerm]);
+
+  const filteredSoErp = useMemo(() => {
+    if (!result) return [];
+    return filtrarLista(result.soNoErp, (it) => [
+      it.cliente,
+      it.numVenda,
+      it.numPedido,
+      it.nsuErp,
+      it.rede,
+      it.valor.toFixed(2),
+    ]);
+  }, [result, searchTerm]);
+
+  const filteredSoBlu = useMemo(() => {
+    if (!result) return [];
+    return filtrarLista(result.soNaBlu, (it) => [
+      it.nsu,
+      it.autorizacao,
+      it.bandeira,
+      it.valorBrutoTotal.toFixed(2),
+    ]);
+  }, [result, searchTerm]);
+
+  const filteredCanceladas = useMemo(() => {
+    if (!result) return [];
+    return filtrarLista(result.canceladas, (it) => [
+      it.nsu,
+      it.autorizacao,
+      it.status,
+      it.valorBrutoTotal.toFixed(2),
+    ]);
+  }, [result, searchTerm]);
+
+  const exportar = () => {
+    if (!result) return;
+    const hoje = new Date().toISOString().slice(0, 10);
+    const wb = XLSX.utils.book_new();
+
+    // Aba 1: Conciliados
+    const rowsConciliados = result.conciliados.map((c) => ({
+      "Data Venda (Blu)": formatarData(c.blu.dataVenda),
+      "Data Emissão (ERP)": c.erp.dataStr,
+      "Loja": c.erp.loja,
+      "Nº Venda": c.erp.numVenda,
+      "Nº Pedido": c.erp.numPedido,
+      "Cliente": c.erp.cliente,
+      "NSU (Blu)": c.blu.nsu,
+      "Autorização": c.blu.autorizacao,
+      "Bandeira": c.blu.bandeira,
+      "Tipo": c.blu.tipo,
+      "Parcelas": c.blu.qtdParcelas,
+      "Valor Bruto (Blu)": c.blu.valorBrutoTotal,
+      "Valor Líquido (Blu)": c.blu.valorLiquidoTotal,
+      "Valor (ERP)": c.erp.valor,
+    }));
+    if (rowsConciliados.length) {
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rowsConciliados), "Conciliados");
+    } else {
+      XLSX.utils.book_append_sheet(
+        wb,
+        XLSX.utils.aoa_to_sheet([["(nenhuma venda conciliada)"]]),
+        "Conciliados"
+      );
+    }
+
+    // Aba 2: Só no ERP
+    const rowsSoErp = result.soNoErp.map((v) => ({
+      "Data Emissão": v.dataStr,
+      "Loja": v.loja,
+      "Nº Venda": v.numVenda,
+      "Nº Pedido": v.numPedido,
+      "Cliente": v.cliente,
+      "Rede": v.rede,
+      "NSU (ERP)": v.nsuErp,
+      "Parcelas": v.parcelasErp,
+      "Valor": v.valor,
+    }));
+    if (rowsSoErp.length) {
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rowsSoErp), "Só no ERP");
+    } else {
+      XLSX.utils.book_append_sheet(
+        wb,
+        XLSX.utils.aoa_to_sheet([["(nenhuma divergência)"]]),
+        "Só no ERP"
+      );
+    }
+
+    // Aba 3: Só na Blu
+    const rowsSoBlu = result.soNaBlu.map((v) => ({
+      "Data Venda": formatarData(v.dataVenda),
+      "NSU": v.nsu,
+      "Autorização": v.autorizacao,
+      "Bandeira": v.bandeira,
+      "Tipo": v.tipo,
+      "Parcelas": v.qtdParcelas,
+      "Status": v.status,
+      "Valor Bruto": v.valorBrutoTotal,
+      "Valor Líquido": v.valorLiquidoTotal,
+      "Terminal": v.terminal,
+    }));
+    if (rowsSoBlu.length) {
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rowsSoBlu), "Só na Blu");
+    } else {
+      XLSX.utils.book_append_sheet(
+        wb,
+        XLSX.utils.aoa_to_sheet([["(nenhuma divergência)"]]),
+        "Só na Blu"
+      );
+    }
+
+    // Aba 4: Canceladas (se houver)
+    if (result.canceladas.length > 0) {
+      const rowsCanc = result.canceladas.map((v) => ({
+        "Data Venda": formatarData(v.dataVenda),
+        "NSU": v.nsu,
+        "Autorização": v.autorizacao,
+        "Status": v.status,
+        "Bandeira": v.bandeira,
+        "Valor Bruto": v.valorBrutoTotal,
+      }));
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rowsCanc), "Canceladas");
+    }
+
+    // Aba 5: Resumo
+    const totalConcil = result.conciliados.reduce((s, c) => s + c.blu.valorBrutoTotal, 0);
+    const totalSoErp = result.soNoErp.reduce((s, v) => s + v.valor, 0);
+    const totalSoBlu = result.soNaBlu.reduce((s, v) => s + v.valorBrutoTotal, 0);
+    const wsResumo = XLSX.utils.aoa_to_sheet([
+      ["RESUMO DA CONCILIAÇÃO BLU"],
+      [],
+      ["Maquininha", banco.nome],
+      ["Data da conciliação", hoje],
+      [],
+      ["Vendas no Excel da Blu", vendasBlu.length],
+      ["Linhas no PDF do ERP", vendasErp.length],
+      [],
+      ["Conciliados (qtd)", result.conciliados.length],
+      ["Conciliados (valor total)", totalConcil],
+      [],
+      ["Só no ERP (qtd)", result.soNoErp.length],
+      ["Só no ERP (valor total)", totalSoErp],
+      [],
+      ["Só na Blu (qtd)", result.soNaBlu.length],
+      ["Só na Blu (valor total)", totalSoBlu],
+      [],
+      ["Canceladas/Estornadas (qtd)", result.canceladas.length],
+    ]);
+    XLSX.utils.book_append_sheet(wb, wsResumo, "Resumo");
+
+    const fileName = `conciliacao_${banco.id}_${hoje}.xlsx`;
+    XLSX.writeFile(wb, fileName);
+  };
+
+  const reset = () => {
+    setBluFile(null);
+    setErpFile(null);
+    setVendasBlu([]);
+    setVendasErp([]);
+    setError("");
+    setSearchTerm("");
+  };
+
+  const totais = useMemo(() => {
+    if (!result) return null;
+    return {
+      conciliados: result.conciliados.reduce((s, c) => s + c.blu.valorBrutoTotal, 0),
+      soErp: result.soNoErp.reduce((s, v) => s + v.valor, 0),
+      soBlu: result.soNaBlu.reduce((s, v) => s + v.valorBrutoTotal, 0),
+    };
+  }, [result]);
+
+  return (
+    <div className="max-w-7xl mx-auto">
+      <div className="mb-8 border-b border-stone-200 pb-6">
+        <div className="flex items-baseline gap-3 mb-2">
+          <span className="text-xs uppercase tracking-[0.2em] text-amber-800 font-semibold">
+            Módulo 02
+          </span>
+          <span className="text-stone-300">—</span>
+          <span className="text-xs uppercase tracking-wider text-stone-500">
+            {banco.nome}
+          </span>
+          <button
+            onClick={onTrocar}
+            className="ml-2 text-xs text-amber-800 hover:text-amber-900 underline"
+          >
+            trocar banco
+          </button>
+        </div>
+        <h1 className="font-serif text-4xl font-bold text-stone-900 tracking-tight">
+          Conciliação — {banco.nome}
+        </h1>
+        <p className="text-stone-600 mt-2 max-w-2xl">
+          Compara as vendas registradas no <strong>ERP</strong> (forma de pagamento{" "}
+          <strong>{banco.secaoPdf}</strong>) com o extrato de vendas da{" "}
+          <strong>maquininha Blu</strong>. O match é feito pela autorização do cartão.
+        </p>
+      </div>
+
+      {/* Upload */}
+      <div className="grid md:grid-cols-2 gap-4 mb-6">
+        <FileDropZone
+          label="Excel da Blu"
+          sublabel="extrato-vendas-completo-XXXX.xlsx"
+          icon={CreditCard}
+          accept=".xlsx,.xls"
+          file={bluFile}
+          onFile={handleBlu}
+          onClear={() => {
+            setBluFile(null);
+            setVendasBlu([]);
+          }}
+          disabled={loading}
+        />
+        <FileDropZone
+          label="PDF do ERP"
+          sublabel="Relatório de Vendas Por Finalizadores"
+          icon={FileText}
+          accept=".pdf"
+          file={erpFile}
+          onFile={handleErp}
+          onClear={() => {
+            setErpFile(null);
+            setVendasErp([]);
+          }}
+          disabled={loading}
+        />
+      </div>
+
+      {loading && (
+        <div className="flex items-center gap-2 text-stone-600 text-sm mb-4">
+          <Loader2 className="w-4 h-4 animate-spin" />
+          Processando arquivo…
+        </div>
+      )}
+
+      {error && (
+        <div className="flex items-start gap-2 bg-red-50 border border-red-200 text-red-900 rounded-lg p-4 mb-4">
+          <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+          <p className="text-sm">{error}</p>
+        </div>
+      )}
+
+      {result && (
+        <>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+            <StatCard
+              label="Conciliados"
+              value={result.conciliados.length}
+              sublabel={formatarMoeda(totais.conciliados)}
+              accent="green"
+              icon={CheckCircle2}
+            />
+            <StatCard
+              label="Só no ERP"
+              value={result.soNoErp.length}
+              sublabel={formatarMoeda(totais.soErp)}
+              accent="red"
+              icon={XCircle}
+            />
+            <StatCard
+              label="Só na Blu"
+              value={result.soNaBlu.length}
+              sublabel={formatarMoeda(totais.soBlu)}
+              accent="amber"
+              icon={AlertCircle}
+            />
+            <StatCard
+              label="Canceladas"
+              value={result.canceladas.length}
+              sublabel="estornadas/canceladas"
+              accent="stone"
+              icon={AlertTriangle}
+            />
+          </div>
+
+          {/* Barra de ações */}
+          <div className="flex flex-wrap items-center gap-3 mb-4 pb-4 border-b border-stone-200">
+            <div className="flex bg-stone-100 rounded-md p-1 flex-wrap">
+              <button
+                onClick={() => setActiveView("conciliados")}
+                className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
+                  activeView === "conciliados"
+                    ? "bg-white text-emerald-800 shadow-sm"
+                    : "text-stone-600 hover:text-stone-900"
+                }`}
+              >
+                Conciliados ({result.conciliados.length})
+              </button>
+              <button
+                onClick={() => setActiveView("soErp")}
+                className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
+                  activeView === "soErp"
+                    ? "bg-white text-red-900 shadow-sm"
+                    : "text-stone-600 hover:text-stone-900"
+                }`}
+              >
+                Só no ERP ({result.soNoErp.length})
+              </button>
+              <button
+                onClick={() => setActiveView("soBlu")}
+                className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
+                  activeView === "soBlu"
+                    ? "bg-white text-amber-900 shadow-sm"
+                    : "text-stone-600 hover:text-stone-900"
+                }`}
+              >
+                Só na Blu ({result.soNaBlu.length})
+              </button>
+              {result.canceladas.length > 0 && (
+                <button
+                  onClick={() => setActiveView("canceladas")}
+                  className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
+                    activeView === "canceladas"
+                      ? "bg-white text-stone-800 shadow-sm"
+                      : "text-stone-600 hover:text-stone-900"
+                  }`}
+                >
+                  Canceladas ({result.canceladas.length})
+                </button>
+              )}
+            </div>
+
+            <div className="relative flex-1 min-w-[200px] max-w-md">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-stone-400" />
+              <input
+                type="text"
+                placeholder="Buscar por cliente, autorização, valor…"
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-amber-700/30 focus:border-amber-700"
+              />
+            </div>
+
+            <div className="flex gap-2 ml-auto">
+              <button
+                onClick={exportar}
+                className="flex items-center gap-2 px-3 py-2 text-sm border border-stone-300 rounded-md bg-white hover:bg-stone-50"
+                title="Excel com Conciliados, Só no ERP, Só na Blu, Canceladas e Resumo"
+              >
+                <Download className="w-4 h-4" />
+                Baixar Excel completo
+              </button>
+              <button
+                onClick={reset}
+                className="px-3 py-2 text-sm text-stone-600 hover:text-stone-900"
+              >
+                Reiniciar
+              </button>
+            </div>
+          </div>
+
+          {/* Listas */}
+          {activeView === "conciliados" && (
+            <BluConciliadosList items={filteredConciliados} />
+          )}
+          {activeView === "soErp" && (
+            <BluSoErpList items={filteredSoErp} />
+          )}
+          {activeView === "soBlu" && (
+            <BluSoBluList items={filteredSoBlu} />
+          )}
+          {activeView === "canceladas" && (
+            <BluSoBluList items={filteredCanceladas} canceladas />
+          )}
+        </>
+      )}
+
+      {!result && !loading && (bluFile || erpFile) && (
+        <div className="text-center py-12 text-stone-500 text-sm">
+          Envie os dois arquivos para iniciar a conciliação.
+        </div>
+      )}
+
+      {!bluFile && !erpFile && !loading && (
+        <div className="text-center py-16 bg-gradient-to-b from-purple-50/40 to-transparent rounded-lg border border-stone-200">
+          <CreditCard className="w-10 h-10 text-purple-700 mx-auto mb-3" />
+          <p className="font-serif text-lg text-stone-800 mb-1">
+            Pronto para conciliar
+          </p>
+          <p className="text-sm text-stone-600 max-w-md mx-auto">
+            Envie o Excel da {banco.nome} e o PDF do ERP (Vendas Por Finalizadores)
+            para identificar vendas esquecidas, divergências de valor e cancelamentos.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BluConciliadosList({ items }) {
+  if (!items.length) {
+    return (
+      <div className="text-center py-12 text-stone-500 text-sm">
+        Nenhuma venda conciliada ainda.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      {items.map((c, i) => (
+        <div key={i} className="border border-emerald-200 bg-white rounded-lg p-4">
+          <div className="flex items-start gap-4">
+            <div className="w-10 h-10 rounded-md bg-emerald-100 flex items-center justify-center flex-shrink-0">
+              <CheckCircle2 className="w-5 h-5 text-emerald-700" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-baseline gap-2 mb-1 flex-wrap">
+                <span className="text-xs font-mono text-stone-500">
+                  {c.erp.dataStr}
+                </span>
+                <span className="text-[10px] uppercase tracking-wider bg-purple-100 text-purple-800 px-1.5 py-0.5 rounded font-semibold">
+                  {c.blu.bandeira}
+                </span>
+                <span className="text-[10px] uppercase tracking-wider bg-stone-100 text-stone-600 px-1.5 py-0.5 rounded">
+                  {c.blu.qtdParcelas}x {c.blu.tipo}
+                </span>
+              </div>
+              <h3 className="font-serif font-semibold text-stone-900 truncate">
+                {c.erp.cliente}
+              </h3>
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-600 mt-1">
+                <span>
+                  Loja: <strong className="text-stone-900">{c.erp.loja}</strong>
+                </span>
+                <span>
+                  Nº Venda: <strong className="text-stone-900">{c.erp.numVenda}</strong>
+                </span>
+                <span>
+                  Pedido: <strong className="text-stone-900">{c.erp.numPedido}</strong>
+                </span>
+                <span>
+                  Autorização: <strong className="font-mono text-stone-900">{c.blu.autorizacao}</strong>
+                </span>
+              </div>
+            </div>
+            <div className="text-right flex-shrink-0">
+              <p className="font-serif text-xl font-bold text-emerald-700">
+                {formatarMoeda(c.blu.valorBrutoTotal)}
+              </p>
+              <p className="text-xs text-stone-500 mt-0.5">
+                Líquido: {formatarMoeda(c.blu.valorLiquidoTotal)}
+              </p>
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function BluSoErpList({ items }) {
+  if (!items.length) {
+    return (
+      <div className="text-center py-12">
+        <CheckCircle2 className="w-10 h-10 text-emerald-600 mx-auto mb-3" />
+        <p className="font-serif text-lg text-stone-800">Nenhuma venda só no ERP</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-3 flex items-start gap-2">
+        <XCircle className="w-4 h-4 text-red-700 mt-0.5 flex-shrink-0" />
+        <div className="text-xs text-red-900">
+          <p className="font-semibold mb-1">Vendas registradas no ERP que não apareceram na Blu.</p>
+          <p>Pode ser PIX (não tem autorização de cartão) ou divergência de valor com a Blu.</p>
+        </div>
+      </div>
+
+      {items.map((v, i) => (
+        <div key={i} className="border border-red-200 bg-white rounded-lg p-4">
+          <div className="flex items-start gap-4">
+            <div className="w-10 h-10 rounded-md bg-red-100 flex items-center justify-center flex-shrink-0">
+              <XCircle className="w-5 h-5 text-red-700" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-baseline gap-2 mb-1 flex-wrap">
+                <span className="text-xs font-mono text-stone-500">{v.dataStr}</span>
+                <span className="text-[10px] uppercase tracking-wider bg-stone-100 text-stone-700 px-1.5 py-0.5 rounded font-semibold">
+                  {v.rede}
+                </span>
+              </div>
+              <h3 className="font-serif font-semibold text-stone-900 truncate">
+                {v.cliente}
+              </h3>
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-600 mt-1">
+                <span>Loja: <strong className="text-stone-900">{v.loja}</strong></span>
+                <span>Nº Venda: <strong className="text-stone-900">{v.numVenda}</strong></span>
+                <span>Pedido: <strong className="text-stone-900">{v.numPedido}</strong></span>
+                <span>NSU/Aut: <strong className="font-mono text-stone-900">{v.nsuErp}</strong></span>
+                <span>Parc: <strong className="text-stone-900">{v.parcelasErp}x</strong></span>
+              </div>
+            </div>
+            <div className="text-right flex-shrink-0">
+              <p className="font-serif text-xl font-bold text-red-700">
+                {formatarMoeda(v.valor)}
+              </p>
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function BluSoBluList({ items, canceladas = false }) {
+  if (!items.length) {
+    return (
+      <div className="text-center py-12">
+        <CheckCircle2 className="w-10 h-10 text-emerald-600 mx-auto mb-3" />
+        <p className="font-serif text-lg text-stone-800">
+          {canceladas ? "Nenhuma venda cancelada" : "Nenhuma venda só na Blu"}
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      {!canceladas && (
+        <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-3 flex items-start gap-2">
+          <AlertCircle className="w-4 h-4 text-amber-700 mt-0.5 flex-shrink-0" />
+          <div className="text-xs text-amber-900">
+            <p className="font-semibold mb-1">Vendas na Blu que não foram lançadas no ERP.</p>
+            <p>Casos típicos: venda esquecida no sistema, testes de baixo valor (ex: R$ 0,01) ou divergência de valor.</p>
+          </div>
+        </div>
+      )}
+
+      {items.map((v, i) => {
+        const cor = canceladas ? "stone" : "amber";
+        const corBorda = canceladas ? "border-stone-300" : "border-amber-200";
+        const corBg = canceladas ? "bg-stone-100" : "bg-amber-100";
+        const corIcone = canceladas ? "text-stone-700" : "text-amber-700";
+        const corValor = canceladas ? "text-stone-700" : "text-amber-700";
+
+        return (
+          <div key={i} className={`border ${corBorda} bg-white rounded-lg p-4`}>
+            <div className="flex items-start gap-4">
+              <div className={`w-10 h-10 rounded-md ${corBg} flex items-center justify-center flex-shrink-0`}>
+                <AlertTriangle className={`w-5 h-5 ${corIcone}`} />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-baseline gap-2 mb-1 flex-wrap">
+                  <span className="text-xs font-mono text-stone-500">
+                    {formatarData(v.dataVenda)}
+                  </span>
+                  <span className="text-[10px] uppercase tracking-wider bg-purple-100 text-purple-800 px-1.5 py-0.5 rounded font-semibold">
+                    {v.bandeira}
+                  </span>
+                  <span className="text-[10px] uppercase tracking-wider bg-stone-100 text-stone-600 px-1.5 py-0.5 rounded">
+                    {v.qtdParcelas}x {v.tipo}
+                  </span>
+                  {canceladas && (
+                    <span className="text-[10px] uppercase tracking-wider bg-red-100 text-red-800 px-1.5 py-0.5 rounded font-semibold">
+                      {v.status}
+                    </span>
+                  )}
+                </div>
+                <h3 className="font-serif font-semibold text-stone-900">
+                  Autorização: <span className="font-mono">{v.autorizacao}</span>
+                </h3>
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-600 mt-1">
+                  <span>NSU: <strong className="font-mono text-stone-900">{v.nsu}</strong></span>
+                  <span>Terminal: <strong className="font-mono text-stone-900">{v.terminal}</strong></span>
+                </div>
+              </div>
+              <div className="text-right flex-shrink-0">
+                <p className={`font-serif text-xl font-bold ${corValor}`}>
+                  {formatarMoeda(v.valorBrutoTotal)}
+                </p>
+                <p className="text-xs text-stone-500 mt-0.5">
+                  Líquido: {formatarMoeda(v.valorLiquidoTotal)}
+                </p>
+              </div>
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }
