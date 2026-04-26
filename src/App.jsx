@@ -451,7 +451,7 @@ const TOLERANCIA_DIAS = 4;
 
 // Lista de bancos suportados
 // Bancos do tipo "extrato" usam o fluxo Sicredi (ERP + extrato).
-// Bancos do tipo "blu" usam o fluxo Blu (Excel da Blu + PDF do ERP por seção, match por autorização).
+// Bancos do tipo "blu" usam o fluxo Blu (Excel da Blu + PDF do ERP por seção, match por NSU).
 const BANCOS_SUPORTADOS = [
   { id: "sicredi", nome: "Sicredi", tipo: "extrato", cor: "emerald" },
   { id: "pague_veloz", nome: "Pague Veloz", tipo: "extrato", cor: "blue", emBreve: true },
@@ -878,7 +878,7 @@ function conciliarFinanceiro(erpItems, bancoItems) {
 // CONCILIAÇÃO BLU — PARSERS E MATCHER
 // ============================================================
 
-// Normaliza chave de match (autorização):
+// Normaliza chave de match (NSU):
 // - Numérica: tira zeros à esquerda  ("084836" → "84836")
 // - Alfanumérica: mantém como está em maiúsculas ("HMZCDJ" → "HMZCDJ")
 function normalizarChaveBlu(s) {
@@ -1039,8 +1039,9 @@ function parseErpBluTexto(texto, secaoNome) {
   return vendas;
 }
 
-// Matcher Blu: chave (autorização normalizada) + mesmo mês/ano + valor com tolerância R$ 0,01
+// Matcher Blu: chave (NSU normalizado) + mesmo mês/ano + valor com tolerância R$ 0,01
 function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01) {
+  // Indexa Blu por chave de match (NSU normalizado)
   const bluPorChave = new Map();
   for (const v of vendasBlu) {
     if (!bluPorChave.has(v.chaveMatch)) bluPorChave.set(v.chaveMatch, []);
@@ -1048,13 +1049,19 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01) {
   }
 
   const conciliados = [];
-  const soNoErp = [];
+  const soNoErp = [];   // cada item: { ...vErp, motivo, motivoDetalhe, candidatoBlu? }
+  const soNaBlu = [];   // cada item: { ...vBlu, motivo, motivoDetalhe, candidatoErp? }
   const bluMatched = new Set();
+  // Guarda quais NSUs da Blu foram "explicados" como divergência de valor/mês
+  // (pra não duplicar do lado da Blu)
+  const bluExplicado = new Map(); // nsu -> { motivo, candidatoErp }
 
+  // === LADO ERP: classifica cada venda do ERP ===
   for (const vErp of vendasErp) {
     const candidatos = bluPorChave.get(vErp.chaveMatch) || [];
-    let match = null;
+    let conciliado = null;
 
+    // Tenta match perfeito (mês + valor)
     for (const cand of candidatos) {
       if (bluMatched.has(cand.nsu)) continue;
       const dErp = vErp.data;
@@ -1064,24 +1071,119 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01) {
         dErp.getFullYear() === dBlu.getFullYear() &&
         dErp.getMonth() === dBlu.getMonth();
       const valorBate = Math.abs(cand.valorBrutoTotal - vErp.valor) <= toleranciaValor;
-
       if (mesmoMes && valorBate) {
-        match = cand;
+        conciliado = cand;
         break;
       }
     }
 
-    if (match) {
-      conciliados.push({ erp: vErp, blu: match });
-      bluMatched.add(match.nsu);
-    } else {
-      soNoErp.push(vErp);
+    if (conciliado) {
+      conciliados.push({ erp: vErp, blu: conciliado });
+      bluMatched.add(conciliado.nsu);
+      continue;
+    }
+
+    // Não conciliou — descobre o motivo
+    if (candidatos.length === 0) {
+      // 🔴 O NSU do ERP não existe no extrato da Blu
+      soNoErp.push({
+        ...vErp,
+        motivo: "sem_nsu",
+        motivoDetalhe: "O NSU não foi encontrado no extrato da Blu (pode ser PIX ou venda fora desta maquininha).",
+      });
+      continue;
+    }
+
+    // Procura o "melhor candidato" entre os disponíveis (não-matched)
+    // Prioridade: mesmo mês + valor diferente > mês diferente + valor igual > qualquer
+    let melhorCand = null;
+    let motivo = null;
+    let motivoDetalhe = "";
+
+    for (const cand of candidatos) {
+      if (bluMatched.has(cand.nsu)) continue;
+      const dErp = vErp.data;
+      const dBlu = cand.dataVenda;
+      const mesmoMes = dErp && dBlu &&
+        dErp.getFullYear() === dBlu.getFullYear() &&
+        dErp.getMonth() === dBlu.getMonth();
+      const valorBate = Math.abs(cand.valorBrutoTotal - vErp.valor) <= toleranciaValor;
+
+      if (mesmoMes && !valorBate) {
+        // 🟡 mesmo mês, valor diferente → vence outras hipóteses
+        const diff = (cand.valorBrutoTotal - vErp.valor);
+        const diffStr = formatarMoeda(Math.abs(diff));
+        const sinal = diff > 0 ? "Blu maior" : "ERP maior";
+        melhorCand = cand;
+        motivo = "valor_diferente";
+        motivoDetalhe = `Valor diferente: ERP ${formatarMoeda(vErp.valor)} | Blu ${formatarMoeda(cand.valorBrutoTotal)} (diferença ${diffStr}, ${sinal}).`;
+        break;
+      }
+      if (!mesmoMes && valorBate && !melhorCand) {
+        // 🟡 valor igual, mês diferente
+        melhorCand = cand;
+        motivo = "mes_diferente";
+        const mesErp = dErp ? `${String(dErp.getMonth() + 1).padStart(2, "0")}/${dErp.getFullYear()}` : "?";
+        const mesBlu = dBlu ? `${String(dBlu.getMonth() + 1).padStart(2, "0")}/${dBlu.getFullYear()}` : "?";
+        motivoDetalhe = `Mês diferente: ERP ${mesErp} | Blu ${mesBlu} (mesmo valor e NSU).`;
+      }
+    }
+
+    if (!melhorCand) {
+      // Há candidatos mas todos já foram usados, ou nenhum bate parcialmente
+      const cand = candidatos.find((c) => !bluMatched.has(c.nsu)) || candidatos[0];
+      melhorCand = cand;
+      motivo = "valor_e_mes_diferentes";
+      const mesErp = vErp.data ? `${String(vErp.data.getMonth() + 1).padStart(2, "0")}/${vErp.data.getFullYear()}` : "?";
+      const mesBlu = cand.dataVenda ? `${String(cand.dataVenda.getMonth() + 1).padStart(2, "0")}/${cand.dataVenda.getFullYear()}` : "?";
+      motivoDetalhe = `NSU bate, mas valor e mês são diferentes: ERP ${formatarMoeda(vErp.valor)} em ${mesErp} | Blu ${formatarMoeda(cand.valorBrutoTotal)} em ${mesBlu}.`;
+    }
+
+    soNoErp.push({ ...vErp, motivo, motivoDetalhe, candidatoBlu: melhorCand });
+    // Marca esse NSU da Blu como "já explicado" pra não duplicar
+    if (melhorCand) {
+      bluExplicado.set(melhorCand.nsu, { motivo, candidatoErp: vErp });
     }
   }
 
-  const soNaBlu = vendasBlu.filter(
-    (v) => !bluMatched.has(v.nsu) && v.status === "Confirmada"
-  );
+  // === LADO BLU: vendas da Blu que não foram conciliadas ===
+  for (const vBlu of vendasBlu) {
+    if (vBlu.status !== "Confirmada") continue;       // canceladas vão pra outra lista
+    if (bluMatched.has(vBlu.nsu)) continue;           // já conciliada
+
+    // Se já foi "explicada" do lado do ERP (apareceu como divergência), não duplica
+    const explicado = bluExplicado.get(vBlu.nsu);
+    if (explicado) {
+      // Espelha do lado da Blu, com motivo equivalente
+      const candidatoErp = explicado.candidatoErp;
+      let motivo = explicado.motivo;
+      let motivoDetalhe = "";
+      if (motivo === "valor_diferente") {
+        const diff = (vBlu.valorBrutoTotal - candidatoErp.valor);
+        const diffStr = formatarMoeda(Math.abs(diff));
+        const sinal = diff > 0 ? "Blu maior" : "ERP maior";
+        motivoDetalhe = `Valor diferente: Blu ${formatarMoeda(vBlu.valorBrutoTotal)} | ERP ${formatarMoeda(candidatoErp.valor)} (diferença ${diffStr}, ${sinal}).`;
+      } else if (motivo === "mes_diferente") {
+        const mesErp = candidatoErp.data ? `${String(candidatoErp.data.getMonth() + 1).padStart(2, "0")}/${candidatoErp.data.getFullYear()}` : "?";
+        const mesBlu = vBlu.dataVenda ? `${String(vBlu.dataVenda.getMonth() + 1).padStart(2, "0")}/${vBlu.dataVenda.getFullYear()}` : "?";
+        motivoDetalhe = `Mês diferente: Blu ${mesBlu} | ERP ${mesErp} (mesmo valor e NSU).`;
+      } else {
+        const mesErp = candidatoErp.data ? `${String(candidatoErp.data.getMonth() + 1).padStart(2, "0")}/${candidatoErp.data.getFullYear()}` : "?";
+        const mesBlu = vBlu.dataVenda ? `${String(vBlu.dataVenda.getMonth() + 1).padStart(2, "0")}/${vBlu.dataVenda.getFullYear()}` : "?";
+        motivoDetalhe = `NSU bate, mas valor e mês são diferentes: Blu ${formatarMoeda(vBlu.valorBrutoTotal)} em ${mesBlu} | ERP ${formatarMoeda(candidatoErp.valor)} em ${mesErp}.`;
+      }
+      soNaBlu.push({ ...vBlu, motivo, motivoDetalhe, candidatoErp });
+      continue;
+    }
+
+    // Sem candidato no ERP — venda 100% só na Blu
+    soNaBlu.push({
+      ...vBlu,
+      motivo: "sem_no_erp",
+      motivoDetalhe: "Esta venda não tem correspondente no PDF do ERP (pode ser teste, venda esquecida no sistema ou divergência de cadastro).",
+    });
+  }
+
   const canceladas = vendasBlu.filter((v) => v.status !== "Confirmada");
 
   return { conciliados, soNoErp, soNaBlu, canceladas };
@@ -2887,8 +2989,8 @@ function BluFlow({ banco, onTrocar }) {
       "Nº Venda": c.erp.numVenda,
       "Nº Pedido": c.erp.numPedido,
       "Cliente": c.erp.cliente,
-      "NSU (Blu)": c.blu.nsu,
-      "Autorização": c.blu.autorizacao,
+      "NSU": c.blu.autorizacao,
+      "ID interno Blu": c.blu.nsu,
       "Bandeira": c.blu.bandeira,
       "Tipo": c.blu.tipo,
       "Parcelas": c.blu.qtdParcelas,
@@ -2914,9 +3016,12 @@ function BluFlow({ banco, onTrocar }) {
       "Nº Pedido": v.numPedido,
       "Cliente": v.cliente,
       "Rede": v.rede,
-      "NSU (ERP)": v.nsuErp,
+      "NSU": v.nsuErp,
       "Parcelas": v.parcelasErp,
-      "Valor": v.valor,
+      "Valor (ERP)": v.valor,
+      "Valor (Blu)": v.candidatoBlu ? v.candidatoBlu.valorBrutoTotal : "",
+      "Motivo": MOTIVOS_DIVERGENCIA[v.motivo]?.label || "",
+      "Detalhe": v.motivoDetalhe || "",
     }));
     if (rowsSoErp.length) {
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rowsSoErp), "Só no ERP");
@@ -2931,15 +3036,18 @@ function BluFlow({ banco, onTrocar }) {
     // Aba 3: Só na Blu
     const rowsSoBlu = result.soNaBlu.map((v) => ({
       "Data Venda": formatarData(v.dataVenda),
-      "NSU": v.nsu,
-      "Autorização": v.autorizacao,
+      "NSU": v.autorizacao,
+      "ID interno Blu": v.nsu,
       "Bandeira": v.bandeira,
       "Tipo": v.tipo,
       "Parcelas": v.qtdParcelas,
       "Status": v.status,
-      "Valor Bruto": v.valorBrutoTotal,
-      "Valor Líquido": v.valorLiquidoTotal,
+      "Valor Bruto (Blu)": v.valorBrutoTotal,
+      "Valor Líquido (Blu)": v.valorLiquidoTotal,
+      "Valor (ERP)": v.candidatoErp ? v.candidatoErp.valor : "",
       "Terminal": v.terminal,
+      "Motivo": MOTIVOS_DIVERGENCIA[v.motivo]?.label || "",
+      "Detalhe": v.motivoDetalhe || "",
     }));
     if (rowsSoBlu.length) {
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rowsSoBlu), "Só na Blu");
@@ -2955,8 +3063,8 @@ function BluFlow({ banco, onTrocar }) {
     if (result.canceladas.length > 0) {
       const rowsCanc = result.canceladas.map((v) => ({
         "Data Venda": formatarData(v.dataVenda),
-        "NSU": v.nsu,
-        "Autorização": v.autorizacao,
+        "NSU": v.autorizacao,
+        "ID interno Blu": v.nsu,
         "Status": v.status,
         "Bandeira": v.bandeira,
         "Valor Bruto": v.valorBrutoTotal,
@@ -3036,7 +3144,7 @@ function BluFlow({ banco, onTrocar }) {
         <p className="text-stone-600 mt-2 max-w-2xl">
           Compara as vendas registradas no <strong>ERP</strong> (forma de pagamento{" "}
           <strong>{banco.secaoPdf}</strong>) com o extrato de vendas da{" "}
-          <strong>maquininha Blu</strong>. O match é feito pela autorização do cartão.
+          <strong>maquininha Blu</strong>. O match é feito pelo NSU do cartão.
         </p>
       </div>
 
@@ -3168,7 +3276,7 @@ function BluFlow({ banco, onTrocar }) {
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-stone-400" />
               <input
                 type="text"
-                placeholder="Buscar por cliente, autorização, valor…"
+                placeholder="Buscar por cliente, NSU, valor…"
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
                 className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-amber-700/30 focus:border-amber-700"
@@ -3274,7 +3382,7 @@ function BluConciliadosList({ items }) {
                   Pedido: <strong className="text-stone-900">{c.erp.numPedido}</strong>
                 </span>
                 <span>
-                  Autorização: <strong className="font-mono text-stone-900">{c.blu.autorizacao}</strong>
+                  NSU: <strong className="font-mono text-stone-900">{c.blu.autorizacao}</strong>
                 </span>
               </div>
             </div>
@@ -3293,6 +3401,49 @@ function BluConciliadosList({ items }) {
   );
 }
 
+// Mapa de motivos para visual e texto curto
+const MOTIVOS_DIVERGENCIA = {
+  sem_nsu: {
+    label: "NSU não está na Blu",
+    cor: "red",
+    explicacao: "O NSU desta venda não está no extrato da Blu.",
+  },
+  sem_no_erp: {
+    label: "Sem correspondente no ERP",
+    cor: "red",
+    explicacao: "Esta venda da Blu não aparece no PDF do ERP.",
+  },
+  valor_diferente: {
+    label: "Divergência de valor",
+    cor: "amber",
+    explicacao: "O NSU e o mês batem, mas o valor é diferente.",
+  },
+  mes_diferente: {
+    label: "Divergência de mês",
+    cor: "amber",
+    explicacao: "O NSU e o valor batem, mas a venda foi em outro mês.",
+  },
+  valor_e_mes_diferentes: {
+    label: "Valor e mês diferentes",
+    cor: "amber",
+    explicacao: "O NSU bate, mas tanto o valor quanto o mês são diferentes.",
+  },
+};
+
+function MotivoBadge({ motivo }) {
+  const info = MOTIVOS_DIVERGENCIA[motivo];
+  if (!info) return null;
+  const cores = {
+    red: "bg-red-100 text-red-800 border-red-200",
+    amber: "bg-amber-100 text-amber-900 border-amber-300",
+  };
+  return (
+    <span className={`text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded font-semibold border ${cores[info.cor]}`}>
+      {info.label}
+    </span>
+  );
+}
+
 function BluSoErpList({ items }) {
   if (!items.length) {
     return (
@@ -3308,43 +3459,67 @@ function BluSoErpList({ items }) {
       <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-3 flex items-start gap-2">
         <XCircle className="w-4 h-4 text-red-700 mt-0.5 flex-shrink-0" />
         <div className="text-xs text-red-900">
-          <p className="font-semibold mb-1">Vendas registradas no ERP que não apareceram na Blu.</p>
-          <p>Pode ser PIX (não tem autorização de cartão) ou divergência de valor com a Blu.</p>
+          <p className="font-semibold mb-1">Vendas registradas no ERP que não fecharam com a Blu.</p>
+          <p>Cada venda mostra o motivo da divergência: NSU não encontrado, valor diferente ou mês diferente.</p>
         </div>
       </div>
 
-      {items.map((v, i) => (
-        <div key={i} className="border border-red-200 bg-white rounded-lg p-4">
-          <div className="flex items-start gap-4">
-            <div className="w-10 h-10 rounded-md bg-red-100 flex items-center justify-center flex-shrink-0">
-              <XCircle className="w-5 h-5 text-red-700" />
-            </div>
-            <div className="flex-1 min-w-0">
-              <div className="flex items-baseline gap-2 mb-1 flex-wrap">
-                <span className="text-xs font-mono text-stone-500">{v.dataStr}</span>
-                <span className="text-[10px] uppercase tracking-wider bg-stone-100 text-stone-700 px-1.5 py-0.5 rounded font-semibold">
-                  {v.rede}
-                </span>
+      {items.map((v, i) => {
+        const info = MOTIVOS_DIVERGENCIA[v.motivo] || MOTIVOS_DIVERGENCIA.sem_nsu;
+        const ehAviso = info.cor === "amber";
+        const corBorda = ehAviso ? "border-amber-200" : "border-red-200";
+        const corIconeBg = ehAviso ? "bg-amber-100" : "bg-red-100";
+        const corIcone = ehAviso ? "text-amber-700" : "text-red-700";
+        const corValor = ehAviso ? "text-amber-700" : "text-red-700";
+
+        return (
+          <div key={i} className={`border ${corBorda} bg-white rounded-lg p-4`}>
+            <div className="flex items-start gap-4">
+              <div className={`w-10 h-10 rounded-md ${corIconeBg} flex items-center justify-center flex-shrink-0`}>
+                {ehAviso ? (
+                  <AlertCircle className={`w-5 h-5 ${corIcone}`} />
+                ) : (
+                  <XCircle className={`w-5 h-5 ${corIcone}`} />
+                )}
               </div>
-              <h3 className="font-serif font-semibold text-stone-900 truncate">
-                {v.cliente}
-              </h3>
-              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-600 mt-1">
-                <span>Loja: <strong className="text-stone-900">{v.loja}</strong></span>
-                <span>Nº Venda: <strong className="text-stone-900">{v.numVenda}</strong></span>
-                <span>Pedido: <strong className="text-stone-900">{v.numPedido}</strong></span>
-                <span>NSU/Aut: <strong className="font-mono text-stone-900">{v.nsuErp}</strong></span>
-                <span>Parc: <strong className="text-stone-900">{v.parcelasErp}x</strong></span>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-baseline gap-2 mb-1 flex-wrap">
+                  <span className="text-xs font-mono text-stone-500">{v.dataStr}</span>
+                  <span className="text-[10px] uppercase tracking-wider bg-stone-100 text-stone-700 px-1.5 py-0.5 rounded font-semibold">
+                    {v.rede}
+                  </span>
+                  <MotivoBadge motivo={v.motivo} />
+                </div>
+                <h3 className="font-serif font-semibold text-stone-900 truncate">
+                  {v.cliente}
+                </h3>
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-600 mt-1">
+                  <span>Loja: <strong className="text-stone-900">{v.loja}</strong></span>
+                  <span>Nº Venda: <strong className="text-stone-900">{v.numVenda}</strong></span>
+                  <span>Pedido: <strong className="text-stone-900">{v.numPedido}</strong></span>
+                  <span>NSU: <strong className="font-mono text-stone-900">{v.nsuErp}</strong></span>
+                  <span>Parc: <strong className="text-stone-900">{v.parcelasErp}x</strong></span>
+                </div>
+                {v.motivoDetalhe && (
+                  <div className={`mt-2 text-xs px-3 py-2 rounded border ${ehAviso ? "bg-amber-50 border-amber-200 text-amber-900" : "bg-red-50 border-red-200 text-red-900"}`}>
+                    <strong>Motivo:</strong> {v.motivoDetalhe}
+                  </div>
+                )}
               </div>
-            </div>
-            <div className="text-right flex-shrink-0">
-              <p className="font-serif text-xl font-bold text-red-700">
-                {formatarMoeda(v.valor)}
-              </p>
+              <div className="text-right flex-shrink-0">
+                <p className={`font-serif text-xl font-bold ${corValor}`}>
+                  {formatarMoeda(v.valor)}
+                </p>
+                {v.candidatoBlu && (
+                  <p className="text-xs text-stone-500 mt-0.5">
+                    Blu: {formatarMoeda(v.candidatoBlu.valorBrutoTotal)}
+                  </p>
+                )}
+              </div>
             </div>
           </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -3368,17 +3543,28 @@ function BluSoBluList({ items, canceladas = false }) {
           <AlertCircle className="w-4 h-4 text-amber-700 mt-0.5 flex-shrink-0" />
           <div className="text-xs text-amber-900">
             <p className="font-semibold mb-1">Vendas na Blu que não foram lançadas no ERP.</p>
-            <p>Casos típicos: venda esquecida no sistema, testes de baixo valor (ex: R$ 0,01) ou divergência de valor.</p>
+            <p>Cada venda mostra o motivo da divergência: sem correspondente no ERP, valor diferente ou mês diferente.</p>
           </div>
         </div>
       )}
 
       {items.map((v, i) => {
-        const cor = canceladas ? "stone" : "amber";
-        const corBorda = canceladas ? "border-stone-300" : "border-amber-200";
-        const corBg = canceladas ? "bg-stone-100" : "bg-amber-100";
-        const corIcone = canceladas ? "text-stone-700" : "text-amber-700";
-        const corValor = canceladas ? "text-stone-700" : "text-amber-700";
+        // Para canceladas: cor stone fixa. Para divergências: cor depende do motivo.
+        let corBorda, corBg, corIcone, corValor;
+        if (canceladas) {
+          corBorda = "border-stone-300";
+          corBg = "bg-stone-100";
+          corIcone = "text-stone-700";
+          corValor = "text-stone-700";
+        } else {
+          const info = MOTIVOS_DIVERGENCIA[v.motivo] || MOTIVOS_DIVERGENCIA.sem_no_erp;
+          const ehAviso = info.cor === "amber";
+          corBorda = ehAviso ? "border-amber-200" : "border-red-200";
+          corBg = ehAviso ? "bg-amber-100" : "bg-red-100";
+          corIcone = ehAviso ? "text-amber-700" : "text-red-700";
+          corValor = ehAviso ? "text-amber-700" : "text-red-700";
+        }
+        const ehAviso = !canceladas && (MOTIVOS_DIVERGENCIA[v.motivo]?.cor === "amber");
 
         return (
           <div key={i} className={`border ${corBorda} bg-white rounded-lg p-4`}>
@@ -3402,14 +3588,20 @@ function BluSoBluList({ items, canceladas = false }) {
                       {v.status}
                     </span>
                   )}
+                  {!canceladas && <MotivoBadge motivo={v.motivo} />}
                 </div>
                 <h3 className="font-serif font-semibold text-stone-900">
-                  Autorização: <span className="font-mono">{v.autorizacao}</span>
+                  NSU: <span className="font-mono">{v.autorizacao}</span>
                 </h3>
                 <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-600 mt-1">
-                  <span>NSU: <strong className="font-mono text-stone-900">{v.nsu}</strong></span>
+                  <span>NSU interno Blu: <strong className="font-mono text-stone-900">{v.nsu}</strong></span>
                   <span>Terminal: <strong className="font-mono text-stone-900">{v.terminal}</strong></span>
                 </div>
+                {!canceladas && v.motivoDetalhe && (
+                  <div className={`mt-2 text-xs px-3 py-2 rounded border ${ehAviso ? "bg-amber-50 border-amber-200 text-amber-900" : "bg-red-50 border-red-200 text-red-900"}`}>
+                    <strong>Motivo:</strong> {v.motivoDetalhe}
+                  </div>
+                )}
               </div>
               <div className="text-right flex-shrink-0">
                 <p className={`font-serif text-xl font-bold ${corValor}`}>
@@ -3418,6 +3610,11 @@ function BluSoBluList({ items, canceladas = false }) {
                 <p className="text-xs text-stone-500 mt-0.5">
                   Líquido: {formatarMoeda(v.valorLiquidoTotal)}
                 </p>
+                {!canceladas && v.candidatoErp && (
+                  <p className="text-xs text-stone-500 mt-0.5">
+                    ERP: {formatarMoeda(v.candidatoErp.valor)}
+                  </p>
+                )}
               </div>
             </div>
           </div>
