@@ -25,6 +25,10 @@ import {
   Save,
   Users,
   RotateCcw,
+  Landmark,
+  CircleDollarSign,
+  Eye,
+  AlertCircle,
 } from "lucide-react";
 
 // ============================================================
@@ -436,6 +440,428 @@ function loadPdfJs() {
     script.onerror = reject;
     document.head.appendChild(script);
   });
+}
+
+// ============================================================
+// CONCILIAÇÃO FINANCEIRA — PARSERS
+// ============================================================
+
+const TOLERANCIA_DIAS = 4;
+
+// Lista de bancos suportados (vai crescer com o tempo)
+const BANCOS_SUPORTADOS = [
+  { id: "sicredi", nome: "Sicredi", cor: "emerald" },
+  { id: "pague_veloz", nome: "Pague Veloz", cor: "blue", emBreve: true },
+  { id: "blu", nome: "Blu", cor: "purple", emBreve: true },
+];
+
+// Converte "R$ -1.234,56" ou "1234,56" ou "-1,234.56" em número
+function parseValor(s) {
+  if (s === null || s === undefined) return NaN;
+  if (typeof s === "number") return s;
+  let str = String(s).trim();
+  if (!str) return NaN;
+  // Remove R$, espaços
+  str = str.replace(/R\$/gi, "").replace(/\s/g, "");
+  // Detecta formato BR (1.234,56) vs US (1,234.56)
+  const ultimaVirgula = str.lastIndexOf(",");
+  const ultimoPonto = str.lastIndexOf(".");
+  if (ultimaVirgula > ultimoPonto) {
+    // Formato BR: ponto é separador de milhar, vírgula é decimal
+    str = str.replace(/\./g, "").replace(",", ".");
+  } else if (ultimoPonto > ultimaVirgula && ultimaVirgula >= 0) {
+    // Formato US: vírgula é separador de milhar
+    str = str.replace(/,/g, "");
+  } else if (ultimaVirgula >= 0 && ultimoPonto < 0) {
+    // Só vírgula → decimal
+    str = str.replace(",", ".");
+  }
+  const num = parseFloat(str);
+  return isNaN(num) ? NaN : num;
+}
+
+// Converte "01/04/2026" ou "01/04" ou "2026-04-01" em Date
+function parseData(s, anoFallback) {
+  if (!s) return null;
+  if (s instanceof Date) return s;
+  const str = String(s).trim();
+
+  // Formato ISO: 2026-04-01
+  let m = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return new Date(parseInt(m[1]), parseInt(m[2]) - 1, parseInt(m[3]));
+
+  // Formato BR completo: 01/04/2026
+  m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (m) return new Date(parseInt(m[3]), parseInt(m[2]) - 1, parseInt(m[1]));
+
+  // Formato BR curto: 01/04
+  m = str.match(/^(\d{1,2})\/(\d{1,2})$/);
+  if (m && anoFallback) return new Date(anoFallback, parseInt(m[2]) - 1, parseInt(m[1]));
+
+  return null;
+}
+
+// Diferença em dias entre 2 datas
+function diffDias(d1, d2) {
+  if (!d1 || !d2) return Infinity;
+  const ms = Math.abs(d1.getTime() - d2.getTime());
+  return Math.round(ms / (1000 * 60 * 60 * 24));
+}
+
+// Formata Date para string DD/MM/YYYY
+function formatarData(d) {
+  if (!d) return "";
+  const dd = String(d.getDate()).padStart(2, "0");
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  return `${dd}/${mm}/${d.getFullYear()}`;
+}
+
+// Formata número como moeda BR
+function formatarMoeda(n) {
+  if (typeof n !== "number" || isNaN(n)) return "—";
+  return n.toLocaleString("pt-BR", {
+    style: "currency",
+    currency: "BRL",
+    minimumFractionDigits: 2,
+  });
+}
+
+// ----- PARSER DO ERP (Sofá Show interno) -----
+// Formato: linhas tipo "01/04 10 Transferência para conta SS PALESTINA -30,000.00"
+// Saldos e cabeçalhos são ignorados.
+function parseErpText(rawText) {
+  const items = [];
+  const linhas = rawText.split(/\r?\n/);
+  let anoAtual = new Date().getFullYear();
+
+  // Tenta detectar o ano no cabeçalho
+  for (const linha of linhas.slice(0, 30)) {
+    const m = linha.match(/(\d{2}\/\d{2}\/(\d{4}))/);
+    if (m) {
+      anoAtual = parseInt(m[2]);
+      break;
+    }
+  }
+
+  // Detecta mês a partir de seções "MARÇO/2026", "ABRIL/2026"
+  const mesesPt = {
+    JANEIRO: 0, FEVEREIRO: 1, MARÇO: 2, MARCO: 2, ABRIL: 3,
+    MAIO: 4, JUNHO: 5, JULHO: 6, AGOSTO: 7, SETEMBRO: 8,
+    OUTUBRO: 9, NOVEMBRO: 10, DEZEMBRO: 11,
+  };
+
+  for (const linhaRaw of linhas) {
+    const linha = linhaRaw.trim();
+    if (!linha) continue;
+
+    // Atualiza ano se vier seção tipo "ABRIL/2026"
+    const mAno = linha.match(/^([A-ZÇÃ]+)\/(\d{4})/i);
+    if (mAno) {
+      const mesNome = mAno[1].toUpperCase().replace("Ç", "C").replace("Ã", "A");
+      if (mesesPt[mesNome] !== undefined) {
+        anoAtual = parseInt(mAno[2]);
+      }
+      continue;
+    }
+
+    // Ignora cabeçalhos e linhas de totais/saldo
+    if (
+      /saldo|total|p[áa]g\.|^data|fl - |produto fora|extrato|per[ií]odo|associado|cooperativa|conta:|cabe/i.test(linha)
+    )
+      continue;
+
+    // Padrão: "DD/MM <documento> <histórico> <valor>"
+    // Valor sempre no fim da linha, formato BR ou US, possivelmente negativo
+    const m = linha.match(
+      /^(\d{1,2}\/\d{1,2})\s+(\S+)\s+(.+?)\s+(-?[\d.,]+\.\d{2})\s*$/
+    );
+    if (!m) continue;
+
+    const dataStr = m[1];
+    const documento = m[2];
+    const historico = m[3].trim();
+    const valor = parseValor(m[4]);
+
+    if (isNaN(valor) || valor === 0) continue;
+
+    const data = parseData(dataStr, anoAtual);
+    if (!data) continue;
+
+    items.push({
+      origem: "erp",
+      data,
+      dataStr: formatarData(data),
+      documento,
+      historico,
+      valor,
+      raw: linha,
+    });
+  }
+
+  return items;
+}
+
+// ----- PARSER DO ERP (Excel) -----
+function parseErpExcel(rows) {
+  const items = [];
+  // Tenta achar nomes de colunas comuns
+  const aliases = {
+    data: ["data", "dt", "data lancamento", "data_lancamento", "data lançamento"],
+    historico: ["histórico", "historico", "descrição", "descricao", "descrição lançamento", "descricao lançamento"],
+    documento: ["lançamento", "lancamento", "documento", "doc", "nº doc", "n doc"],
+    valor: ["valor", "valor r$", "valor (r$)", "vl", "vlr"],
+    debito: ["débito", "debito", "saída", "saida"],
+    credito: ["crédito", "credito", "entrada"],
+  };
+
+  const findCol = (row, nomes) => {
+    const keys = Object.keys(row).map((k) => k.toLowerCase().trim());
+    for (const nome of nomes) {
+      const idx = keys.findIndex((k) => k === nome || k.includes(nome));
+      if (idx >= 0) return Object.keys(row)[idx];
+    }
+    return null;
+  };
+
+  if (!rows.length) return [];
+
+  const sample = rows[0];
+  const colData = findCol(sample, aliases.data);
+  const colHist = findCol(sample, aliases.historico);
+  const colDoc = findCol(sample, aliases.documento);
+  const colValor = findCol(sample, aliases.valor);
+  const colDeb = findCol(sample, aliases.debito);
+  const colCred = findCol(sample, aliases.credito);
+
+  for (const row of rows) {
+    const dataRaw = colData ? row[colData] : null;
+    if (!dataRaw) continue;
+    const data = parseData(dataRaw);
+    if (!data) continue;
+
+    let valor = NaN;
+    if (colValor) {
+      valor = parseValor(row[colValor]);
+    } else if (colDeb || colCred) {
+      const deb = colDeb ? parseValor(row[colDeb]) : 0;
+      const cred = colCred ? parseValor(row[colCred]) : 0;
+      if (!isNaN(deb) && deb !== 0) valor = -Math.abs(deb);
+      else if (!isNaN(cred) && cred !== 0) valor = Math.abs(cred);
+    }
+
+    if (isNaN(valor) || valor === 0) continue;
+
+    items.push({
+      origem: "erp",
+      data,
+      dataStr: formatarData(data),
+      documento: colDoc ? String(row[colDoc] || "").trim() : "",
+      historico: colHist ? String(row[colHist] || "").trim() : "",
+      valor,
+      raw: row,
+    });
+  }
+
+  return items;
+}
+
+// ----- PARSER DO EXTRATO SICREDI -----
+// Formato: "01/04/2026 LIQUIDACAO BOLETO 34086990000144 WAYBE SOLUCOES -314,00 10.226,16"
+function parseSicrediText(rawText) {
+  const items = [];
+  const linhas = rawText.split(/\r?\n/);
+
+  for (const linhaRaw of linhas) {
+    const linha = linhaRaw.trim();
+    if (!linha) continue;
+    if (
+      /saldo anterior|saldo atual|saldo da conta|saldo bloqueado|saldo de investimentos|limite|cheque especial|sicredi fone|sac|ouvidoria|cooperativa|associado|extrato|per[íi]odo|^data\s+descri/i.test(
+        linha
+      )
+    )
+      continue;
+
+    // Padrão: "DD/MM/YYYY <descrição com possível documento> <valor> <saldo>"
+    // O ÚLTIMO número é o saldo, o PENÚLTIMO é o valor da movimentação
+    const m = linha.match(
+      /^(\d{1,2}\/\d{1,2}\/\d{4})\s+(.+?)\s+(-?[\d.,]+)\s+(-?[\d.,]+)\s*$/
+    );
+    if (!m) continue;
+
+    const dataStr = m[1];
+    let descricao = m[2].trim();
+    const valor = parseValor(m[3]);
+
+    if (isNaN(valor) || valor === 0) continue;
+
+    const data = parseData(dataStr);
+    if (!data) continue;
+
+    // Tenta extrair documento (CPF/CNPJ ou número de referência) da descrição
+    let documento = "";
+    const docMatch = descricao.match(/\b(\d{11}|\d{14}|CX\d+|PIX_DEB|PIX_CRED|\d{6,})\b/);
+    if (docMatch) {
+      documento = docMatch[1];
+    }
+
+    items.push({
+      origem: "sicredi",
+      data,
+      dataStr: formatarData(data),
+      documento,
+      historico: descricao,
+      valor,
+      raw: linha,
+    });
+  }
+
+  return items;
+}
+
+// ----- LEITORES DE ARQUIVO (geral, ERP e bancos) -----
+async function readErpFile(file) {
+  const name = file.name.toLowerCase();
+  if (name.endsWith(".pdf")) {
+    if (!window.pdfjsLib) await loadPdfJs();
+    const data = await file.arrayBuffer();
+    const pdf = await window.pdfjsLib.getDocument({ data }).promise;
+    let texto = "";
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      const linhas = {};
+      for (const item of content.items) {
+        const y = Math.round(item.transform[5]);
+        if (!linhas[y]) linhas[y] = [];
+        linhas[y].push({ x: item.transform[4], str: item.str });
+      }
+      const ys = Object.keys(linhas).sort((a, b) => b - a);
+      for (const y of ys) {
+        linhas[y].sort((a, b) => a.x - b.x);
+        texto += linhas[y].map((i) => i.str).join(" ") + "\n";
+      }
+    }
+    return parseErpText(texto);
+  }
+  if (name.endsWith(".xlsx") || name.endsWith(".xls") || name.endsWith(".csv")) {
+    const data = await file.arrayBuffer();
+    const wb = XLSX.read(data, { type: "array" });
+    const sheet = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+    return parseErpExcel(rows);
+  }
+  // Texto puro
+  const txt = await file.text();
+  return parseErpText(txt);
+}
+
+async function readBancoFile(file, bancoId) {
+  const name = file.name.toLowerCase();
+  let texto = "";
+
+  if (name.endsWith(".pdf")) {
+    if (!window.pdfjsLib) await loadPdfJs();
+    const data = await file.arrayBuffer();
+    const pdf = await window.pdfjsLib.getDocument({ data }).promise;
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      const linhas = {};
+      for (const item of content.items) {
+        const y = Math.round(item.transform[5]);
+        if (!linhas[y]) linhas[y] = [];
+        linhas[y].push({ x: item.transform[4], str: item.str });
+      }
+      const ys = Object.keys(linhas).sort((a, b) => b - a);
+      for (const y of ys) {
+        linhas[y].sort((a, b) => a.x - b.x);
+        texto += linhas[y].map((i) => i.str).join(" ") + "\n";
+      }
+    }
+  } else if (name.endsWith(".xlsx") || name.endsWith(".xls") || name.endsWith(".csv")) {
+    const data = await file.arrayBuffer();
+    const wb = XLSX.read(data, { type: "array" });
+    const sheet = wb.Sheets[wb.SheetNames[0]];
+    texto = XLSX.utils.sheet_to_csv(sheet, { FS: " ", RS: "\n" });
+  } else {
+    texto = await file.text();
+  }
+
+  if (bancoId === "sicredi") return parseSicrediText(texto);
+  // Por enquanto só Sicredi tem parser próprio
+  return parseSicrediText(texto);
+}
+
+// ----- ALGORITMO DE CONCILIAÇÃO FINANCEIRA -----
+// Regra: valor exato + data dentro de TOLERANCIA_DIAS
+// Quando houver múltiplos candidatos com mesmo valor, casa o mais próximo na data
+// e marca os matches como "conferir" se houver ambiguidade.
+function conciliarFinanceiro(erpItems, bancoItems) {
+  // Cópias mutáveis
+  const erp = erpItems.map((it, idx) => ({ ...it, _idx: idx, _usado: false }));
+  const banco = bancoItems.map((it, idx) => ({ ...it, _idx: idx, _usado: false }));
+
+  const conciliados = []; // { erp, banco, diffDias, conferir }
+  const soNoErp = [];
+  const soNoBanco = [];
+
+  // Passo 1: matches exatos (valor + data igual)
+  for (const e of erp) {
+    if (e._usado) continue;
+    for (const b of banco) {
+      if (b._usado) continue;
+      if (Math.abs(e.valor - b.valor) > 0.005) continue;
+      if (diffDias(e.data, b.data) === 0) {
+        e._usado = true;
+        b._usado = true;
+        conciliados.push({ erp: e, banco: b, diffDias: 0, conferir: false });
+        break;
+      }
+    }
+  }
+
+  // Passo 2: matches com tolerância de data
+  for (const e of erp) {
+    if (e._usado) continue;
+    let melhor = null;
+    let melhorDiff = Infinity;
+    for (const b of banco) {
+      if (b._usado) continue;
+      if (Math.abs(e.valor - b.valor) > 0.005) continue;
+      const d = diffDias(e.data, b.data);
+      if (d <= TOLERANCIA_DIAS && d < melhorDiff) {
+        melhor = b;
+        melhorDiff = d;
+      }
+    }
+    if (melhor) {
+      e._usado = true;
+      melhor._usado = true;
+      conciliados.push({ erp: e, banco: melhor, diffDias: melhorDiff, conferir: melhorDiff > 0 });
+    }
+  }
+
+  // Passo 3: marca múltiplos lançamentos do mesmo valor como "conferir"
+  // (se 3 boletos R$ 70 no banco, todos os 3 matches recebem conferir=true)
+  const valorContagem = {};
+  for (const c of conciliados) {
+    const key = c.erp.valor.toFixed(2);
+    valorContagem[key] = (valorContagem[key] || 0) + 1;
+  }
+  for (const c of conciliados) {
+    const key = c.erp.valor.toFixed(2);
+    if (valorContagem[key] > 1) c.conferir = true;
+  }
+
+  // Passo 4: o que sobrou são divergências
+  for (const e of erp) {
+    if (!e._usado) soNoErp.push(e);
+  }
+  for (const b of banco) {
+    if (!b._usado) soNoBanco.push(b);
+  }
+
+  return { conciliados, soNoErp, soNoBanco };
 }
 
 // ============================================================
@@ -1582,6 +2008,684 @@ function ColorTableModule({ table, onSave }) {
   );
 }
 
+// ============================================================
+// MÓDULO: CONCILIAÇÃO FINANCEIRA
+// ============================================================
+
+function FinanceiroModule() {
+  const [bancoSelecionado, setBancoSelecionado] = useState(null);
+  const [erpFile, setErpFile] = useState(null);
+  const [bancoFile, setBancoFile] = useState(null);
+  const [erpItems, setErpItems] = useState([]);
+  const [bancoItems, setBancoItems] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [activeView, setActiveView] = useState("conciliados");
+  const [searchTerm, setSearchTerm] = useState("");
+
+  const handleErp = async (f) => {
+    setError("");
+    setLoading(true);
+    setErpFile(f);
+    try {
+      const items = await readErpFile(f);
+      if (!items.length) {
+        setError(
+          "Nenhum lançamento foi extraído do arquivo do ERP. Verifique se o formato está correto (PDF do sistema ou Excel com colunas Data, Histórico, Valor)."
+        );
+        setErpFile(null);
+      } else {
+        setErpItems(items);
+      }
+    } catch (e) {
+      setError("Erro ao ler arquivo do ERP: " + e.message);
+      setErpFile(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleBanco = async (f) => {
+    setError("");
+    setLoading(true);
+    setBancoFile(f);
+    try {
+      const items = await readBancoFile(f, bancoSelecionado.id);
+      if (!items.length) {
+        setError(
+          `Nenhum lançamento foi extraído do extrato. O parser do ${bancoSelecionado.nome} pode não estar lendo este formato. Tente exportar em outro formato (Excel/CSV) ou verifique se o PDF não é uma imagem escaneada.`
+        );
+        setBancoFile(null);
+      } else {
+        setBancoItems(items);
+      }
+    } catch (e) {
+      setError("Erro ao ler extrato bancário: " + e.message);
+      setBancoFile(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const result = useMemo(() => {
+    if (!erpItems.length || !bancoItems.length) return null;
+    return conciliarFinanceiro(erpItems, bancoItems);
+  }, [erpItems, bancoItems]);
+
+  const filtrarLista = (items, getCampos) => {
+    const t = searchTerm.toLowerCase().trim();
+    if (!t) return items;
+    return items.filter((it) => {
+      const campos = getCampos(it);
+      return campos.some((c) => String(c || "").toLowerCase().includes(t));
+    });
+  };
+
+  const filteredConciliados = useMemo(() => {
+    if (!result) return [];
+    return filtrarLista(result.conciliados, (c) => [
+      c.erp.historico,
+      c.banco.historico,
+      c.erp.documento,
+      c.banco.documento,
+      c.erp.valor.toFixed(2),
+    ]);
+  }, [result, searchTerm]);
+
+  const filteredSoErp = useMemo(() => {
+    if (!result) return [];
+    return filtrarLista(result.soNoErp, (it) => [
+      it.historico,
+      it.documento,
+      it.valor.toFixed(2),
+    ]);
+  }, [result, searchTerm]);
+
+  const filteredSoBanco = useMemo(() => {
+    if (!result) return [];
+    return filtrarLista(result.soNoBanco, (it) => [
+      it.historico,
+      it.documento,
+      it.valor.toFixed(2),
+    ]);
+  }, [result, searchTerm]);
+
+  const exportar = () => {
+    if (!result) return;
+    const hoje = new Date().toISOString().slice(0, 10);
+    const wb = XLSX.utils.book_new();
+
+    // Aba 1: Conciliados
+    const rowsConciliados = result.conciliados.map((c) => ({
+      "Data ERP": c.erp.dataStr,
+      "Data Banco": c.banco.dataStr,
+      "Diferença Dias": c.diffDias,
+      Valor: c.erp.valor,
+      "Histórico ERP": c.erp.historico,
+      "Documento ERP": c.erp.documento,
+      "Histórico Banco": c.banco.historico,
+      "Documento Banco": c.banco.documento,
+      Conferir: c.conferir ? "SIM" : "",
+    }));
+    if (rowsConciliados.length) {
+      const ws1 = XLSX.utils.json_to_sheet(rowsConciliados);
+      XLSX.utils.book_append_sheet(wb, ws1, "Conciliados");
+    } else {
+      // Cria aba vazia com cabeçalhos pra facilitar leitura
+      const ws1 = XLSX.utils.aoa_to_sheet([
+        ["Data ERP", "Data Banco", "Diferença Dias", "Valor", "Histórico ERP", "Documento ERP", "Histórico Banco", "Documento Banco", "Conferir"],
+        ["(nenhum lançamento conciliado)"],
+      ]);
+      XLSX.utils.book_append_sheet(wb, ws1, "Conciliados");
+    }
+
+    // Aba 2: Só no ERP
+    const rowsSoErp = result.soNoErp.map((it) => ({
+      Data: it.dataStr,
+      Valor: it.valor,
+      Histórico: it.historico,
+      Documento: it.documento,
+    }));
+    if (rowsSoErp.length) {
+      const ws2 = XLSX.utils.json_to_sheet(rowsSoErp);
+      XLSX.utils.book_append_sheet(wb, ws2, "Só no ERP");
+    } else {
+      const ws2 = XLSX.utils.aoa_to_sheet([
+        ["Data", "Valor", "Histórico", "Documento"],
+        ["(nenhuma divergência)"],
+      ]);
+      XLSX.utils.book_append_sheet(wb, ws2, "Só no ERP");
+    }
+
+    // Aba 3: Só no Banco
+    const rowsSoBanco = result.soNoBanco.map((it) => ({
+      Data: it.dataStr,
+      Valor: it.valor,
+      Histórico: it.historico,
+      Documento: it.documento,
+    }));
+    if (rowsSoBanco.length) {
+      const ws3 = XLSX.utils.json_to_sheet(rowsSoBanco);
+      XLSX.utils.book_append_sheet(wb, ws3, "Só no Banco");
+    } else {
+      const ws3 = XLSX.utils.aoa_to_sheet([
+        ["Data", "Valor", "Histórico", "Documento"],
+        ["(nenhuma divergência)"],
+      ]);
+      XLSX.utils.book_append_sheet(wb, ws3, "Só no Banco");
+    }
+
+    // Aba 4: Resumo
+    const totalConciliados = result.conciliados.length;
+    const matchExato = result.conciliados.filter((c) => c.diffDias === 0).length;
+    const matchTolerancia = result.conciliados.filter((c) => c.diffDias > 0).length;
+    const conferir = result.conciliados.filter((c) => c.conferir).length;
+    const wsResumo = XLSX.utils.aoa_to_sheet([
+      ["RESUMO DA CONCILIAÇÃO"],
+      [],
+      ["Banco", bancoSelecionado.nome],
+      ["Data da conciliação", hoje],
+      [],
+      ["Lançamentos no ERP", erpItems.length],
+      ["Lançamentos no Banco", bancoItems.length],
+      [],
+      ["Conciliados (total)", totalConciliados],
+      ["  Match exato (data igual)", matchExato],
+      ["  Com tolerância (até " + TOLERANCIA_DIAS + " dias)", matchTolerancia],
+      ["  Marcados pra conferir", conferir],
+      [],
+      ["Divergências (total)", result.soNoErp.length + result.soNoBanco.length],
+      ["  Só no ERP", result.soNoErp.length],
+      ["  Só no Banco", result.soNoBanco.length],
+    ]);
+    XLSX.utils.book_append_sheet(wb, wsResumo, "Resumo");
+
+    const fileName = `conciliacao-financeira_${bancoSelecionado.id}_${hoje}.xlsx`;
+    XLSX.writeFile(wb, fileName);
+  };
+
+  const reset = () => {
+    setErpFile(null);
+    setBancoFile(null);
+    setErpItems([]);
+    setBancoItems([]);
+    setError("");
+    setSearchTerm("");
+  };
+
+  const trocarBanco = () => {
+    setBancoSelecionado(null);
+    reset();
+  };
+
+  // === SELEÇÃO DE BANCO ===
+  if (!bancoSelecionado) {
+    return (
+      <div className="max-w-4xl mx-auto">
+        <div className="mb-8 border-b border-stone-200 pb-6">
+          <div className="flex items-baseline gap-3 mb-2">
+            <span className="text-xs uppercase tracking-[0.2em] text-amber-800 font-semibold">
+              Módulo 02
+            </span>
+            <span className="text-stone-300">—</span>
+            <span className="text-xs uppercase tracking-wider text-stone-500">
+              Financeiro
+            </span>
+          </div>
+          <h1 className="font-serif text-4xl font-bold text-stone-900 tracking-tight">
+            Conciliação Financeira
+          </h1>
+          <p className="text-stone-600 mt-2 max-w-2xl">
+            Compara o relatório de lançamentos do <strong>ERP</strong> com o{" "}
+            <strong>extrato bancário</strong> e identifica divergências, lançamentos
+            esquecidos e diferenças de data.
+          </p>
+        </div>
+
+        <h2 className="font-serif text-xl font-semibold text-stone-900 mb-4">
+          Escolha o banco para conciliar:
+        </h2>
+
+        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+          {BANCOS_SUPORTADOS.map((banco) => (
+            <button
+              key={banco.id}
+              onClick={() => !banco.emBreve && setBancoSelecionado(banco)}
+              disabled={banco.emBreve}
+              className={`p-6 border-2 rounded-lg text-left transition-all ${
+                banco.emBreve
+                  ? "border-stone-200 bg-stone-50 cursor-not-allowed opacity-60"
+                  : "border-stone-300 bg-white hover:border-amber-700 hover:shadow-md"
+              }`}
+            >
+              <div className="flex items-center gap-3 mb-2">
+                <Landmark
+                  className={`w-6 h-6 ${
+                    banco.emBreve ? "text-stone-400" : "text-amber-800"
+                  }`}
+                />
+                <h3 className="font-serif text-lg font-semibold text-stone-900">
+                  {banco.nome}
+                </h3>
+              </div>
+              {banco.emBreve ? (
+                <span className="text-[10px] uppercase tracking-wider bg-stone-200 text-stone-600 px-2 py-0.5 rounded">
+                  Em breve
+                </span>
+              ) : (
+                <p className="text-xs text-stone-600">
+                  Conciliar extrato deste banco com o ERP
+                </p>
+              )}
+            </button>
+          ))}
+        </div>
+
+        <div className="mt-8 bg-amber-50 border border-amber-200 rounded-lg p-4 text-sm text-amber-900">
+          <p className="font-semibold mb-1">⚠️ Como funciona</p>
+          <ul className="list-disc list-inside space-y-1 text-xs">
+            <li>Suba o relatório de lançamentos do ERP (PDF ou Excel).</li>
+            <li>Suba o extrato bancário do mesmo período (PDF, Excel ou CSV).</li>
+            <li>
+              O app casa lançamentos pelo <strong>valor</strong> e{" "}
+              <strong>data</strong> (com tolerância de {TOLERANCIA_DIAS} dias).
+            </li>
+            <li>
+              Identifica: lançamentos esquecidos no ERP, lançamentos só no banco e
+              divergências de data.
+            </li>
+          </ul>
+        </div>
+      </div>
+    );
+  }
+
+  // === TELA DE UPLOAD E RESULTADO ===
+  return (
+    <div className="max-w-7xl mx-auto">
+      <div className="mb-8 border-b border-stone-200 pb-6">
+        <div className="flex items-baseline gap-3 mb-2">
+          <span className="text-xs uppercase tracking-[0.2em] text-amber-800 font-semibold">
+            Módulo 02
+          </span>
+          <span className="text-stone-300">—</span>
+          <span className="text-xs uppercase tracking-wider text-stone-500">
+            {bancoSelecionado.nome}
+          </span>
+          <button
+            onClick={trocarBanco}
+            className="ml-2 text-xs text-amber-800 hover:text-amber-900 underline"
+          >
+            trocar banco
+          </button>
+        </div>
+        <h1 className="font-serif text-4xl font-bold text-stone-900 tracking-tight">
+          Conciliação Financeira — {bancoSelecionado.nome}
+        </h1>
+        <p className="text-stone-600 mt-2 max-w-2xl">
+          Compara os lançamentos do ERP com o extrato do{" "}
+          <strong>{bancoSelecionado.nome}</strong>.
+        </p>
+      </div>
+
+      {/* Upload */}
+      <div className="grid md:grid-cols-2 gap-4 mb-6">
+        <FileDropZone
+          label="Lançamentos do ERP"
+          sublabel="PDF do sistema ou planilha Excel"
+          icon={FileSpreadsheet}
+          accept=".pdf,.xlsx,.xls,.csv"
+          file={erpFile}
+          onFile={handleErp}
+          onClear={() => {
+            setErpFile(null);
+            setErpItems([]);
+          }}
+          disabled={loading}
+        />
+        <FileDropZone
+          label={`Extrato do ${bancoSelecionado.nome}`}
+          sublabel="PDF, Excel ou CSV"
+          icon={Landmark}
+          accept=".pdf,.xlsx,.xls,.csv,.ofx"
+          file={bancoFile}
+          onFile={handleBanco}
+          onClear={() => {
+            setBancoFile(null);
+            setBancoItems([]);
+          }}
+          disabled={loading}
+        />
+      </div>
+
+      {loading && (
+        <div className="flex items-center gap-2 text-stone-600 text-sm mb-4">
+          <Loader2 className="w-4 h-4 animate-spin" />
+          Processando arquivo…
+        </div>
+      )}
+
+      {error && (
+        <div className="flex items-start gap-2 bg-red-50 border border-red-200 text-red-900 rounded-lg p-4 mb-4">
+          <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+          <p className="text-sm">{error}</p>
+        </div>
+      )}
+
+      {result && (
+        <>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+            <StatCard
+              label="ERP"
+              value={erpItems.length}
+              sublabel="lançamentos"
+              accent="stone"
+              icon={FileSpreadsheet}
+            />
+            <StatCard
+              label={bancoSelecionado.nome}
+              value={bancoItems.length}
+              sublabel="lançamentos"
+              accent="stone"
+              icon={Landmark}
+            />
+            <StatCard
+              label="Conciliados"
+              value={result.conciliados.length}
+              sublabel={`${
+                result.conciliados.filter((c) => c.conferir).length
+              } pra conferir`}
+              accent="green"
+              icon={CheckCircle2}
+            />
+            <StatCard
+              label="Divergências"
+              value={result.soNoErp.length + result.soNoBanco.length}
+              sublabel={`${result.soNoErp.length} ERP · ${result.soNoBanco.length} banco`}
+              accent="red"
+              icon={AlertCircle}
+            />
+          </div>
+
+          {/* Barra de ações */}
+          <div className="flex flex-wrap items-center gap-3 mb-4 pb-4 border-b border-stone-200">
+            <div className="flex bg-stone-100 rounded-md p-1">
+              <button
+                onClick={() => setActiveView("conciliados")}
+                className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
+                  activeView === "conciliados"
+                    ? "bg-white text-emerald-800 shadow-sm"
+                    : "text-stone-600 hover:text-stone-900"
+                }`}
+              >
+                Conciliados ({result.conciliados.length})
+              </button>
+              <button
+                onClick={() => setActiveView("soErp")}
+                className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
+                  activeView === "soErp"
+                    ? "bg-white text-red-900 shadow-sm"
+                    : "text-stone-600 hover:text-stone-900"
+                }`}
+              >
+                Só no ERP ({result.soNoErp.length})
+              </button>
+              <button
+                onClick={() => setActiveView("soBanco")}
+                className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
+                  activeView === "soBanco"
+                    ? "bg-white text-amber-900 shadow-sm"
+                    : "text-stone-600 hover:text-stone-900"
+                }`}
+              >
+                Só no Banco ({result.soNoBanco.length})
+              </button>
+            </div>
+
+            <div className="relative flex-1 min-w-[200px] max-w-md">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-stone-400" />
+              <input
+                type="text"
+                placeholder="Buscar por valor, histórico ou documento…"
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-amber-700/30 focus:border-amber-700"
+              />
+            </div>
+
+            <div className="flex gap-2 ml-auto">
+              <button
+                onClick={exportar}
+                className="flex items-center gap-2 px-3 py-2 text-sm border border-stone-300 rounded-md bg-white hover:bg-stone-50"
+                title="Baixa um Excel com 4 abas: Conciliados, Só no ERP, Só no Banco e Resumo"
+              >
+                <Download className="w-4 h-4" />
+                Baixar Excel completo
+              </button>
+              <button
+                onClick={reset}
+                className="px-3 py-2 text-sm text-stone-600 hover:text-stone-900"
+              >
+                Reiniciar
+              </button>
+            </div>
+          </div>
+
+          {/* Listas */}
+          {activeView === "conciliados" && (
+            <ConciliadosFinanceirosList items={filteredConciliados} />
+          )}
+          {activeView === "soErp" && (
+            <DivergenciaSimplesList items={filteredSoErp} cor="red" titulo="No ERP, sem extrato bancário" descricao="Lançamentos no sistema que não foram encontrados no extrato. Pode ser pagamento agendado que ainda não saiu do banco, ou erro no lançamento." />
+          )}
+          {activeView === "soBanco" && (
+            <DivergenciaSimplesList items={filteredSoBanco} cor="amber" titulo="No banco, sem ERP" descricao="Lançamentos no extrato que não foram encontrados no ERP. Pode ser lançamento esquecido no sistema, débito automático não cadastrado ou tarifa." />
+          )}
+        </>
+      )}
+
+      {!result && !loading && (erpFile || bancoFile) && (
+        <div className="text-center py-12 text-stone-500 text-sm">
+          Envie os dois arquivos para iniciar a conciliação.
+        </div>
+      )}
+
+      {!erpFile && !bancoFile && !loading && (
+        <div className="text-center py-16 bg-gradient-to-b from-amber-50/40 to-transparent rounded-lg border border-stone-200">
+          <CircleDollarSign className="w-10 h-10 text-amber-800 mx-auto mb-3" />
+          <p className="font-serif text-lg text-stone-800 mb-1">
+            Pronto para conciliar
+          </p>
+          <p className="text-sm text-stone-600 max-w-md mx-auto">
+            Envie o relatório do ERP e o extrato do {bancoSelecionado.nome} para
+            identificar divergências, lançamentos esquecidos e diferenças de data.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ConciliadosFinanceirosList({ items }) {
+  const [expanded, setExpanded] = useState(null);
+
+  if (!items.length) {
+    return (
+      <div className="text-center py-12 text-stone-500 text-sm">
+        Nenhum lançamento conciliado ainda.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      {items.map((c, i) => {
+        const isAviso = c.conferir || c.diffDias > 0;
+        const corBorda = isAviso
+          ? "border-amber-200 bg-amber-50/30"
+          : "border-emerald-200 bg-white";
+        return (
+          <div key={i} className={`border rounded-lg overflow-hidden ${corBorda}`}>
+            <button
+              onClick={() => setExpanded(expanded === i ? null : i)}
+              className="w-full flex items-start p-4 gap-4 text-left hover:bg-stone-50/30 transition-colors"
+            >
+              <div
+                className={`w-10 h-10 rounded-md flex items-center justify-center flex-shrink-0 ${
+                  isAviso ? "bg-amber-100" : "bg-emerald-100"
+                }`}
+              >
+                {isAviso ? (
+                  <AlertCircle className="w-5 h-5 text-amber-700" />
+                ) : (
+                  <CheckCircle2 className="w-5 h-5 text-emerald-700" />
+                )}
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-baseline gap-2 mb-1">
+                  <span className="text-xs font-mono text-stone-500">
+                    {c.erp.dataStr}
+                    {c.diffDias > 0 && (
+                      <span className="text-amber-700 ml-1">
+                        ⇄ {c.banco.dataStr}
+                      </span>
+                    )}
+                  </span>
+                  {c.conferir && (
+                    <span className="text-[10px] uppercase tracking-wider bg-amber-200 text-amber-900 px-1.5 py-0.5 rounded font-semibold">
+                      Conferir
+                    </span>
+                  )}
+                  {c.diffDias > 0 && (
+                    <span className="text-[10px] uppercase tracking-wider bg-stone-200 text-stone-700 px-1.5 py-0.5 rounded">
+                      {c.diffDias} dia{c.diffDias > 1 ? "s" : ""} de diferença
+                    </span>
+                  )}
+                </div>
+                <h3 className="font-serif font-semibold text-stone-900 truncate">
+                  {c.erp.historico}
+                </h3>
+              </div>
+              <div className="flex items-center gap-4 flex-shrink-0">
+                <p
+                  className={`font-serif text-xl font-bold ${
+                    c.erp.valor < 0 ? "text-red-700" : "text-emerald-700"
+                  }`}
+                >
+                  {formatarMoeda(c.erp.valor)}
+                </p>
+                <ChevronRight
+                  className={`w-4 h-4 text-stone-400 transition-transform ${
+                    expanded === i ? "rotate-90" : ""
+                  }`}
+                />
+              </div>
+            </button>
+            {expanded === i && (
+              <div className="border-t border-stone-200 bg-stone-50/50 p-4 grid md:grid-cols-2 gap-4 text-xs">
+                <div className="bg-white border border-stone-200 rounded p-3">
+                  <p className="text-[10px] uppercase tracking-wider font-semibold text-stone-600 mb-2">
+                    Lançamento no ERP
+                  </p>
+                  <p className="text-stone-900 mb-1">
+                    <strong>{c.erp.dataStr}</strong>
+                  </p>
+                  <p className="text-stone-700 break-words">{c.erp.historico}</p>
+                  {c.erp.documento && (
+                    <p className="text-stone-500 font-mono mt-1">
+                      Doc: {c.erp.documento}
+                    </p>
+                  )}
+                </div>
+                <div className="bg-white border border-stone-200 rounded p-3">
+                  <p className="text-[10px] uppercase tracking-wider font-semibold text-stone-600 mb-2">
+                    Lançamento no Banco
+                  </p>
+                  <p className="text-stone-900 mb-1">
+                    <strong>{c.banco.dataStr}</strong>
+                  </p>
+                  <p className="text-stone-700 break-words">{c.banco.historico}</p>
+                  {c.banco.documento && (
+                    <p className="text-stone-500 font-mono mt-1">
+                      Doc: {c.banco.documento}
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function DivergenciaSimplesList({ items, cor, titulo, descricao }) {
+  const cores = {
+    red: { borda: "border-red-200", bg: "bg-red-50/30", icone: "text-red-700", iconeBg: "bg-red-100", aviso: "bg-red-50 border-red-200 text-red-900" },
+    amber: { borda: "border-amber-200", bg: "bg-amber-50/30", icone: "text-amber-700", iconeBg: "bg-amber-100", aviso: "bg-amber-50 border-amber-200 text-amber-900" },
+  };
+  const c = cores[cor] || cores.red;
+
+  return (
+    <div>
+      <div className={`flex items-start gap-2 ${c.aviso} border rounded-lg p-3 mb-4`}>
+        <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+        <div className="text-xs">
+          <p className="font-semibold mb-0.5">{titulo}</p>
+          <p>{descricao}</p>
+        </div>
+      </div>
+
+      {!items.length ? (
+        <div className="text-center py-12">
+          <CheckCircle2 className="w-10 h-10 text-emerald-600 mx-auto mb-3" />
+          <p className="font-serif text-lg text-stone-800">
+            Nenhuma divergência aqui
+          </p>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {items.map((it, i) => (
+            <div
+              key={i}
+              className={`border ${c.borda} bg-white rounded-lg p-4 flex items-start gap-4`}
+            >
+              <div
+                className={`w-10 h-10 rounded-md ${c.iconeBg} flex items-center justify-center flex-shrink-0`}
+              >
+                <AlertTriangle className={`w-5 h-5 ${c.icone}`} />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-baseline gap-2 mb-1">
+                  <span className="text-xs font-mono text-stone-500">
+                    {it.dataStr}
+                  </span>
+                  {it.documento && (
+                    <span className="text-xs font-mono text-stone-400">
+                      {it.documento}
+                    </span>
+                  )}
+                </div>
+                <h3 className="font-serif font-semibold text-stone-900 break-words">
+                  {it.historico}
+                </h3>
+              </div>
+              <p
+                className={`font-serif text-xl font-bold flex-shrink-0 ${
+                  it.valor < 0 ? "text-red-700" : "text-emerald-700"
+                }`}
+              >
+                {formatarMoeda(it.valor)}
+              </p>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PlaceholderModule({ title, description }) {
   return (
     <div className="max-w-3xl mx-auto text-center py-20">
@@ -1616,6 +2720,12 @@ export default function App() {
       id: "cores",
       label: "Tabela de Cores",
       icon: Palette,
+      available: true,
+    },
+    {
+      id: "financeiro",
+      label: "Conciliação Financeira",
+      icon: CircleDollarSign,
       available: true,
     },
     {
@@ -1733,6 +2843,7 @@ export default function App() {
               Carregando tabela…
             </div>
           )}
+          {activeModule === "financeiro" && <FinanceiroModule />}
           {activeModule === "estoque" && (
             <PlaceholderModule
               title="Gestão de Estoque"
