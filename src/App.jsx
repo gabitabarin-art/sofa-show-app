@@ -565,8 +565,14 @@ function parseErpText(rawText) {
     }
 
     // Ignora cabeçalhos e linhas de totais/saldo
+    // ATENÇÃO: "saldo" e "total" só descarta quando estão no INÍCIO da linha
+    // (linha começa com "Saldo Anterior", "Saldo atual", "Total Créditos:" etc.)
+    // pra não descartar lançamentos válidos com "SALDO A PAGAR" no histórico.
     if (
-      /saldo|total|p[áa]g\.|^data|fl - |produto fora|extrato|per[ií]odo|associado|cooperativa|conta:|cabe/i.test(linha)
+      /^(saldo|total)\b/i.test(linha) ||
+      /p[áa]g\.|^data\s|fl\s*-|produto fora|extrato\b|per[ií]odo|associado|cooperativa|conta:\s*\d|cabe\u00e7alho/i.test(
+        linha
+      )
     )
       continue;
 
