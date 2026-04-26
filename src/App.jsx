@@ -1048,11 +1048,21 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01) {
     bluPorChave.get(v.chaveMatch).push(v);
   }
 
+  // Helper: mesmo mês entre 2 datas
+  const mesmoMes = (d1, d2) =>
+    d1 && d2 &&
+    d1.getFullYear() === d2.getFullYear() &&
+    d1.getMonth() === d2.getMonth();
+
+  // Helper: formata "MM/YYYY"
+  const formatMesAno = (d) =>
+    d ? `${String(d.getMonth() + 1).padStart(2, "0")}/${d.getFullYear()}` : "?";
+
   const conciliados = [];
   const soNoErp = [];   // cada item: { ...vErp, motivo, motivoDetalhe, candidatoBlu? }
   const soNaBlu = [];   // cada item: { ...vBlu, motivo, motivoDetalhe, candidatoErp? }
   const bluMatched = new Set();
-  // Guarda quais NSUs da Blu foram "explicados" como divergência de valor/mês
+  // Guarda quais NSUs da Blu foram "explicados" como divergência de valor/mês/NSU
   // (pra não duplicar do lado da Blu)
   const bluExplicado = new Map(); // nsu -> { motivo, candidatoErp }
 
@@ -1064,14 +1074,8 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01) {
     // Tenta match perfeito (mês + valor)
     for (const cand of candidatos) {
       if (bluMatched.has(cand.nsu)) continue;
-      const dErp = vErp.data;
-      const dBlu = cand.dataVenda;
-      if (!dErp || !dBlu) continue;
-      const mesmoMes =
-        dErp.getFullYear() === dBlu.getFullYear() &&
-        dErp.getMonth() === dBlu.getMonth();
       const valorBate = Math.abs(cand.valorBrutoTotal - vErp.valor) <= toleranciaValor;
-      if (mesmoMes && valorBate) {
+      if (mesmoMes(vErp.data, cand.dataVenda) && valorBate) {
         conciliado = cand;
         break;
       }
@@ -1085,7 +1089,38 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01) {
 
     // Não conciliou — descobre o motivo
     if (candidatos.length === 0) {
-      // 🔴 O NSU do ERP não existe no extrato da Blu
+      // 🟠 Nova checagem: o NSU não bate com a Blu, mas talvez exista uma venda
+      // com mesmo VALOR + mesmo MÊS (NSU divergente — provável erro de digitação).
+      // Procura entre todas as vendas Confirmadas da Blu ainda não usadas.
+      let candNsuDivergente = null;
+      for (const v of vendasBlu) {
+        if (v.status !== "Confirmada") continue;
+        if (bluMatched.has(v.nsu)) continue;
+        if (bluExplicado.has(v.nsu)) continue;
+        const valorBate = Math.abs(v.valorBrutoTotal - vErp.valor) <= toleranciaValor;
+        if (valorBate && mesmoMes(vErp.data, v.dataVenda)) {
+          candNsuDivergente = v;
+          break;
+        }
+      }
+
+      if (candNsuDivergente) {
+        // 🟠 NSU divergente: mesmo valor e mês, mas NSU diferente entre ERP e Blu
+        const motivoDetalhe =
+          `NSU divergente entre os dois arquivos: ERP registra "${vErp.nsuErp}" e Blu registra "${candNsuDivergente.autorizacao}". ` +
+          `Os dois lançamentos têm mesmo valor (${formatarMoeda(vErp.valor)}) e mesmo mês (${formatMesAno(vErp.data)}), ` +
+          `provável erro de digitação em um dos lados.`;
+        soNoErp.push({
+          ...vErp,
+          motivo: "nsu_divergente",
+          motivoDetalhe,
+          candidatoBlu: candNsuDivergente,
+        });
+        bluExplicado.set(candNsuDivergente.nsu, { motivo: "nsu_divergente", candidatoErp: vErp });
+        continue;
+      }
+
+      // 🔴 O NSU do ERP não existe no extrato da Blu (e não tem nada com mesmo valor/mês)
       soNoErp.push({
         ...vErp,
         motivo: "sem_nsu",
@@ -1094,7 +1129,7 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01) {
       continue;
     }
 
-    // Procura o "melhor candidato" entre os disponíveis (não-matched)
+    // Tem candidatos com mesmo NSU → procura o "melhor candidato" entre os disponíveis
     // Prioridade: mesmo mês + valor diferente > mês diferente + valor igual > qualquer
     let melhorCand = null;
     let motivo = null;
@@ -1102,14 +1137,10 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01) {
 
     for (const cand of candidatos) {
       if (bluMatched.has(cand.nsu)) continue;
-      const dErp = vErp.data;
-      const dBlu = cand.dataVenda;
-      const mesmoMes = dErp && dBlu &&
-        dErp.getFullYear() === dBlu.getFullYear() &&
-        dErp.getMonth() === dBlu.getMonth();
       const valorBate = Math.abs(cand.valorBrutoTotal - vErp.valor) <= toleranciaValor;
+      const mm = mesmoMes(vErp.data, cand.dataVenda);
 
-      if (mesmoMes && !valorBate) {
+      if (mm && !valorBate) {
         // 🟡 mesmo mês, valor diferente → vence outras hipóteses
         const diff = (cand.valorBrutoTotal - vErp.valor);
         const diffStr = formatarMoeda(Math.abs(diff));
@@ -1119,13 +1150,11 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01) {
         motivoDetalhe = `Valor diferente: ERP ${formatarMoeda(vErp.valor)} | Blu ${formatarMoeda(cand.valorBrutoTotal)} (diferença ${diffStr}, ${sinal}).`;
         break;
       }
-      if (!mesmoMes && valorBate && !melhorCand) {
+      if (!mm && valorBate && !melhorCand) {
         // 🟡 valor igual, mês diferente
         melhorCand = cand;
         motivo = "mes_diferente";
-        const mesErp = dErp ? `${String(dErp.getMonth() + 1).padStart(2, "0")}/${dErp.getFullYear()}` : "?";
-        const mesBlu = dBlu ? `${String(dBlu.getMonth() + 1).padStart(2, "0")}/${dBlu.getFullYear()}` : "?";
-        motivoDetalhe = `Mês diferente: ERP ${mesErp} | Blu ${mesBlu} (mesmo valor e NSU).`;
+        motivoDetalhe = `Mês diferente: ERP ${formatMesAno(vErp.data)} | Blu ${formatMesAno(cand.dataVenda)} (mesmo valor e NSU).`;
       }
     }
 
@@ -1134,9 +1163,7 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01) {
       const cand = candidatos.find((c) => !bluMatched.has(c.nsu)) || candidatos[0];
       melhorCand = cand;
       motivo = "valor_e_mes_diferentes";
-      const mesErp = vErp.data ? `${String(vErp.data.getMonth() + 1).padStart(2, "0")}/${vErp.data.getFullYear()}` : "?";
-      const mesBlu = cand.dataVenda ? `${String(cand.dataVenda.getMonth() + 1).padStart(2, "0")}/${cand.dataVenda.getFullYear()}` : "?";
-      motivoDetalhe = `NSU bate, mas valor e mês são diferentes: ERP ${formatarMoeda(vErp.valor)} em ${mesErp} | Blu ${formatarMoeda(cand.valorBrutoTotal)} em ${mesBlu}.`;
+      motivoDetalhe = `NSU bate, mas valor e mês são diferentes: ERP ${formatarMoeda(vErp.valor)} em ${formatMesAno(vErp.data)} | Blu ${formatarMoeda(cand.valorBrutoTotal)} em ${formatMesAno(cand.dataVenda)}.`;
     }
 
     soNoErp.push({ ...vErp, motivo, motivoDetalhe, candidatoBlu: melhorCand });
@@ -1151,10 +1178,9 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01) {
     if (vBlu.status !== "Confirmada") continue;       // canceladas vão pra outra lista
     if (bluMatched.has(vBlu.nsu)) continue;           // já conciliada
 
-    // Se já foi "explicada" do lado do ERP (apareceu como divergência), não duplica
+    // Se já foi "explicada" do lado do ERP (apareceu como divergência), espelha aqui
     const explicado = bluExplicado.get(vBlu.nsu);
     if (explicado) {
-      // Espelha do lado da Blu, com motivo equivalente
       const candidatoErp = explicado.candidatoErp;
       let motivo = explicado.motivo;
       let motivoDetalhe = "";
@@ -1164,13 +1190,14 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01) {
         const sinal = diff > 0 ? "Blu maior" : "ERP maior";
         motivoDetalhe = `Valor diferente: Blu ${formatarMoeda(vBlu.valorBrutoTotal)} | ERP ${formatarMoeda(candidatoErp.valor)} (diferença ${diffStr}, ${sinal}).`;
       } else if (motivo === "mes_diferente") {
-        const mesErp = candidatoErp.data ? `${String(candidatoErp.data.getMonth() + 1).padStart(2, "0")}/${candidatoErp.data.getFullYear()}` : "?";
-        const mesBlu = vBlu.dataVenda ? `${String(vBlu.dataVenda.getMonth() + 1).padStart(2, "0")}/${vBlu.dataVenda.getFullYear()}` : "?";
-        motivoDetalhe = `Mês diferente: Blu ${mesBlu} | ERP ${mesErp} (mesmo valor e NSU).`;
+        motivoDetalhe = `Mês diferente: Blu ${formatMesAno(vBlu.dataVenda)} | ERP ${formatMesAno(candidatoErp.data)} (mesmo valor e NSU).`;
+      } else if (motivo === "nsu_divergente") {
+        motivoDetalhe =
+          `NSU divergente entre os dois arquivos: Blu registra "${vBlu.autorizacao}" e ERP registra "${candidatoErp.nsuErp}". ` +
+          `Os dois lançamentos têm mesmo valor (${formatarMoeda(vBlu.valorBrutoTotal)}) e mesmo mês (${formatMesAno(vBlu.dataVenda)}), ` +
+          `provável erro de digitação em um dos lados.`;
       } else {
-        const mesErp = candidatoErp.data ? `${String(candidatoErp.data.getMonth() + 1).padStart(2, "0")}/${candidatoErp.data.getFullYear()}` : "?";
-        const mesBlu = vBlu.dataVenda ? `${String(vBlu.dataVenda.getMonth() + 1).padStart(2, "0")}/${vBlu.dataVenda.getFullYear()}` : "?";
-        motivoDetalhe = `NSU bate, mas valor e mês são diferentes: Blu ${formatarMoeda(vBlu.valorBrutoTotal)} em ${mesBlu} | ERP ${formatarMoeda(candidatoErp.valor)} em ${mesErp}.`;
+        motivoDetalhe = `NSU bate, mas valor e mês são diferentes: Blu ${formatarMoeda(vBlu.valorBrutoTotal)} em ${formatMesAno(vBlu.dataVenda)} | ERP ${formatarMoeda(candidatoErp.valor)} em ${formatMesAno(candidatoErp.data)}.`;
       }
       soNaBlu.push({ ...vBlu, motivo, motivoDetalhe, candidatoErp });
       continue;
@@ -3413,6 +3440,11 @@ const MOTIVOS_DIVERGENCIA = {
     cor: "red",
     explicacao: "Esta venda da Blu não aparece no PDF do ERP.",
   },
+  nsu_divergente: {
+    label: "NSU divergente nos dois arquivos",
+    cor: "orange",
+    explicacao: "O valor e o mês batem, mas o NSU foi registrado diferente entre ERP e Blu (provável erro de digitação).",
+  },
   valor_diferente: {
     label: "Divergência de valor",
     cor: "amber",
@@ -3436,6 +3468,7 @@ function MotivoBadge({ motivo }) {
   const cores = {
     red: "bg-red-100 text-red-800 border-red-200",
     amber: "bg-amber-100 text-amber-900 border-amber-300",
+    orange: "bg-orange-100 text-orange-900 border-orange-300",
   };
   return (
     <span className={`text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded font-semibold border ${cores[info.cor]}`}>
@@ -3460,27 +3493,26 @@ function BluSoErpList({ items }) {
         <XCircle className="w-4 h-4 text-red-700 mt-0.5 flex-shrink-0" />
         <div className="text-xs text-red-900">
           <p className="font-semibold mb-1">Vendas registradas no ERP que não fecharam com a Blu.</p>
-          <p>Cada venda mostra o motivo da divergência: NSU não encontrado, valor diferente ou mês diferente.</p>
+          <p>Cada venda mostra o motivo da divergência: NSU divergente nos dois arquivos, NSU não encontrado, valor diferente ou mês diferente.</p>
         </div>
       </div>
 
       {items.map((v, i) => {
         const info = MOTIVOS_DIVERGENCIA[v.motivo] || MOTIVOS_DIVERGENCIA.sem_nsu;
-        const ehAviso = info.cor === "amber";
-        const corBorda = ehAviso ? "border-amber-200" : "border-red-200";
-        const corIconeBg = ehAviso ? "bg-amber-100" : "bg-red-100";
-        const corIcone = ehAviso ? "text-amber-700" : "text-red-700";
-        const corValor = ehAviso ? "text-amber-700" : "text-red-700";
+        // 3 paletas: red (crítico), amber (atenção), orange (NSU divergente)
+        const paletas = {
+          red: { borda: "border-red-200", bg: "bg-red-100", icone: "text-red-700", valor: "text-red-700", caixa: "bg-red-50 border-red-200 text-red-900" },
+          amber: { borda: "border-amber-200", bg: "bg-amber-100", icone: "text-amber-700", valor: "text-amber-700", caixa: "bg-amber-50 border-amber-200 text-amber-900" },
+          orange: { borda: "border-orange-300", bg: "bg-orange-100", icone: "text-orange-700", valor: "text-orange-700", caixa: "bg-orange-50 border-orange-200 text-orange-900" },
+        };
+        const p = paletas[info.cor] || paletas.red;
+        const Icone = info.cor === "red" ? XCircle : AlertCircle;
 
         return (
-          <div key={i} className={`border ${corBorda} bg-white rounded-lg p-4`}>
+          <div key={i} className={`border ${p.borda} bg-white rounded-lg p-4`}>
             <div className="flex items-start gap-4">
-              <div className={`w-10 h-10 rounded-md ${corIconeBg} flex items-center justify-center flex-shrink-0`}>
-                {ehAviso ? (
-                  <AlertCircle className={`w-5 h-5 ${corIcone}`} />
-                ) : (
-                  <XCircle className={`w-5 h-5 ${corIcone}`} />
-                )}
+              <div className={`w-10 h-10 rounded-md ${p.bg} flex items-center justify-center flex-shrink-0`}>
+                <Icone className={`w-5 h-5 ${p.icone}`} />
               </div>
               <div className="flex-1 min-w-0">
                 <div className="flex items-baseline gap-2 mb-1 flex-wrap">
@@ -3501,18 +3533,21 @@ function BluSoErpList({ items }) {
                   <span>Parc: <strong className="text-stone-900">{v.parcelasErp}x</strong></span>
                 </div>
                 {v.motivoDetalhe && (
-                  <div className={`mt-2 text-xs px-3 py-2 rounded border ${ehAviso ? "bg-amber-50 border-amber-200 text-amber-900" : "bg-red-50 border-red-200 text-red-900"}`}>
+                  <div className={`mt-2 text-xs px-3 py-2 rounded border ${p.caixa}`}>
                     <strong>Motivo:</strong> {v.motivoDetalhe}
                   </div>
                 )}
               </div>
               <div className="text-right flex-shrink-0">
-                <p className={`font-serif text-xl font-bold ${corValor}`}>
+                <p className={`font-serif text-xl font-bold ${p.valor}`}>
                   {formatarMoeda(v.valor)}
                 </p>
                 {v.candidatoBlu && (
                   <p className="text-xs text-stone-500 mt-0.5">
                     Blu: {formatarMoeda(v.candidatoBlu.valorBrutoTotal)}
+                    {v.motivo === "nsu_divergente" && (
+                      <span className="block">NSU Blu: <span className="font-mono">{v.candidatoBlu.autorizacao}</span></span>
+                    )}
                   </p>
                 )}
               </div>
@@ -3543,34 +3578,32 @@ function BluSoBluList({ items, canceladas = false }) {
           <AlertCircle className="w-4 h-4 text-amber-700 mt-0.5 flex-shrink-0" />
           <div className="text-xs text-amber-900">
             <p className="font-semibold mb-1">Vendas na Blu que não foram lançadas no ERP.</p>
-            <p>Cada venda mostra o motivo da divergência: sem correspondente no ERP, valor diferente ou mês diferente.</p>
+            <p>Cada venda mostra o motivo da divergência: NSU divergente nos dois arquivos, sem correspondente no ERP, valor diferente ou mês diferente.</p>
           </div>
         </div>
       )}
 
       {items.map((v, i) => {
         // Para canceladas: cor stone fixa. Para divergências: cor depende do motivo.
-        let corBorda, corBg, corIcone, corValor;
+        const paletas = {
+          red: { borda: "border-red-200", bg: "bg-red-100", icone: "text-red-700", valor: "text-red-700", caixa: "bg-red-50 border-red-200 text-red-900" },
+          amber: { borda: "border-amber-200", bg: "bg-amber-100", icone: "text-amber-700", valor: "text-amber-700", caixa: "bg-amber-50 border-amber-200 text-amber-900" },
+          orange: { borda: "border-orange-300", bg: "bg-orange-100", icone: "text-orange-700", valor: "text-orange-700", caixa: "bg-orange-50 border-orange-200 text-orange-900" },
+          stone: { borda: "border-stone-300", bg: "bg-stone-100", icone: "text-stone-700", valor: "text-stone-700", caixa: "bg-stone-50 border-stone-200 text-stone-900" },
+        };
+        let p;
         if (canceladas) {
-          corBorda = "border-stone-300";
-          corBg = "bg-stone-100";
-          corIcone = "text-stone-700";
-          corValor = "text-stone-700";
+          p = paletas.stone;
         } else {
           const info = MOTIVOS_DIVERGENCIA[v.motivo] || MOTIVOS_DIVERGENCIA.sem_no_erp;
-          const ehAviso = info.cor === "amber";
-          corBorda = ehAviso ? "border-amber-200" : "border-red-200";
-          corBg = ehAviso ? "bg-amber-100" : "bg-red-100";
-          corIcone = ehAviso ? "text-amber-700" : "text-red-700";
-          corValor = ehAviso ? "text-amber-700" : "text-red-700";
+          p = paletas[info.cor] || paletas.red;
         }
-        const ehAviso = !canceladas && (MOTIVOS_DIVERGENCIA[v.motivo]?.cor === "amber");
 
         return (
-          <div key={i} className={`border ${corBorda} bg-white rounded-lg p-4`}>
+          <div key={i} className={`border ${p.borda} bg-white rounded-lg p-4`}>
             <div className="flex items-start gap-4">
-              <div className={`w-10 h-10 rounded-md ${corBg} flex items-center justify-center flex-shrink-0`}>
-                <AlertTriangle className={`w-5 h-5 ${corIcone}`} />
+              <div className={`w-10 h-10 rounded-md ${p.bg} flex items-center justify-center flex-shrink-0`}>
+                <AlertTriangle className={`w-5 h-5 ${p.icone}`} />
               </div>
               <div className="flex-1 min-w-0">
                 <div className="flex items-baseline gap-2 mb-1 flex-wrap">
@@ -3598,13 +3631,13 @@ function BluSoBluList({ items, canceladas = false }) {
                   <span>Terminal: <strong className="font-mono text-stone-900">{v.terminal}</strong></span>
                 </div>
                 {!canceladas && v.motivoDetalhe && (
-                  <div className={`mt-2 text-xs px-3 py-2 rounded border ${ehAviso ? "bg-amber-50 border-amber-200 text-amber-900" : "bg-red-50 border-red-200 text-red-900"}`}>
+                  <div className={`mt-2 text-xs px-3 py-2 rounded border ${p.caixa}`}>
                     <strong>Motivo:</strong> {v.motivoDetalhe}
                   </div>
                 )}
               </div>
               <div className="text-right flex-shrink-0">
-                <p className={`font-serif text-xl font-bold ${corValor}`}>
+                <p className={`font-serif text-xl font-bold ${p.valor}`}>
                   {formatarMoeda(v.valorBrutoTotal)}
                 </p>
                 <p className="text-xs text-stone-500 mt-0.5">
@@ -3613,6 +3646,9 @@ function BluSoBluList({ items, canceladas = false }) {
                 {!canceladas && v.candidatoErp && (
                   <p className="text-xs text-stone-500 mt-0.5">
                     ERP: {formatarMoeda(v.candidatoErp.valor)}
+                    {v.motivo === "nsu_divergente" && (
+                      <span className="block">NSU ERP: <span className="font-mono">{v.candidatoErp.nsuErp}</span></span>
+                    )}
                   </p>
                 )}
               </div>
