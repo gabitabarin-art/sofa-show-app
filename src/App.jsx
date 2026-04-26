@@ -47,6 +47,120 @@ const DEFAULT_COLOR_TABLE = [
   { codigo: "33317", nome: "CINZA AZULADO" },
 ];
 
+// ============================================================
+// TABELA DE TAXAS BLU (negociadas no contrato)
+// Linhas = tipo de operação | Colunas = grupo de bandeiras
+// As mesmas taxas valem para Blu SS Express e Blu Lupe.
+// ============================================================
+
+const TAXAS_BLU_STORAGE_KEY = "sofashow:taxasBlu";
+
+// Identificadores estáveis das linhas (não mudar — usados em lookup)
+const TIPOS_OPERACAO_BLU = [
+  { id: "debito", nome: "Débito", parcMin: 1, parcMax: 1, ehDebito: true },
+  { id: "credito_a_vista", nome: "Crédito à vista", parcMin: 1, parcMax: 1, ehDebito: false },
+  { id: "credito_2_6", nome: "Crédito 2x a 6x", parcMin: 2, parcMax: 6, ehDebito: false },
+  { id: "credito_7_12", nome: "Crédito 7x a 12x", parcMin: 7, parcMax: 12, ehDebito: false },
+  { id: "credito_13_17", nome: "Crédito 13x a 17x", parcMin: 13, parcMax: 17, ehDebito: false },
+  { id: "credito_18_21", nome: "Crédito 18x a 21x", parcMin: 18, parcMax: 21, ehDebito: false },
+];
+
+// Grupos de bandeiras (colunas)
+const GRUPOS_BANDEIRA_BLU = [
+  { id: "visa_master", nome: "Visa e Master", bandeiras: ["VISA", "MASTER", "MASTERCARD", "MAESTRO"] },
+  { id: "amex_elo", nome: "Amex e Elo", bandeiras: ["AMEX", "AMERICAN EXPRESS", "ELO", "HIPERCARD"] },
+];
+
+// Taxas padrão (do print que a Blu disponibilizou)
+const DEFAULT_TAXAS_BLU = {
+  debito:           { visa_master: 0.99, amex_elo: 2.49 },
+  credito_a_vista:  { visa_master: 2.19, amex_elo: 3.69 },
+  credito_2_6:      { visa_master: 2.55, amex_elo: 4.05 },
+  credito_7_12:     { visa_master: 2.75, amex_elo: 4.25 },
+  credito_13_17:    { visa_master: 3.49, amex_elo: 4.99 },
+  credito_18_21:    { visa_master: 3.69, amex_elo: 5.19 },
+};
+
+// Identifica o tipo de operação a partir da venda da Blu
+// Retorna o id do tipo (ex: "credito_2_6") ou null se não conseguir identificar
+function identificarTipoOperacao(venda) {
+  if (!venda) return null;
+  const tipo = String(venda.tipo || "").toUpperCase();
+  const parc = parseInt(venda.qtdParcelas || 0);
+
+  // Detecta débito por palavra-chave (Blu usa "Débito" ou similares)
+  const ehDebito = /D[ÉE]BITO|DEBITO|DEBIT/i.test(tipo);
+
+  if (ehDebito) return "debito";
+
+  // Crédito: classifica pela faixa de parcelas
+  if (parc <= 1) return "credito_a_vista";
+  for (const t of TIPOS_OPERACAO_BLU) {
+    if (t.ehDebito) continue;
+    if (parc >= t.parcMin && parc <= t.parcMax) return t.id;
+  }
+  // Acima de 21x cai no último (caso surja)
+  return "credito_18_21";
+}
+
+// Identifica o grupo de bandeiras a partir do nome bruto
+// Retorna o id do grupo (ex: "visa_master") ou null se desconhecida
+function identificarGrupoBandeira(bandeiraRaw) {
+  if (!bandeiraRaw) return null;
+  const b = String(bandeiraRaw).toUpperCase().trim();
+  for (const g of GRUPOS_BANDEIRA_BLU) {
+    for (const nome of g.bandeiras) {
+      if (b.includes(nome)) return g.id;
+    }
+  }
+  return null;
+}
+
+// Calcula a taxa REAL cobrada na venda
+// Taxa = (valor_bruto - valor_liquido) / valor_bruto * 100
+// Retorna número (% — ex: 2.55) ou null se não dá pra calcular
+function calcularTaxaCobrada(valorBruto, valorLiquido) {
+  if (!valorBruto || valorBruto <= 0) return null;
+  if (typeof valorLiquido !== "number" || isNaN(valorLiquido)) return null;
+  const taxaCobrada = ((valorBruto - valorLiquido) / valorBruto) * 100;
+  return Math.round(taxaCobrada * 1000) / 1000; // arredonda para 3 casas
+}
+
+// Verifica a taxa de uma venda contra a tabela negociada.
+// Retorna: { tipoId, grupoId, taxaNegociada, taxaCobrada, diferenca, status }
+// status: "ok" | "acima" | "abaixo" | "indeterminado"
+function conferirTaxaVenda(venda, tabelaTaxas) {
+  const tipoId = identificarTipoOperacao(venda);
+  const grupoId = identificarGrupoBandeira(venda.bandeira);
+  const taxaCobrada = calcularTaxaCobrada(venda.valorBrutoTotal, venda.valorLiquidoTotal);
+
+  if (!tipoId || !grupoId || taxaCobrada == null) {
+    return { tipoId, grupoId, taxaNegociada: null, taxaCobrada, diferenca: null, status: "indeterminado" };
+  }
+
+  const taxaNegociada = tabelaTaxas?.[tipoId]?.[grupoId];
+  if (typeof taxaNegociada !== "number") {
+    return { tipoId, grupoId, taxaNegociada: null, taxaCobrada, diferenca: null, status: "indeterminado" };
+  }
+
+  // Tolerância pequena pra diferenças de arredondamento (0,02%)
+  const TOL = 0.02;
+  const diferenca = taxaCobrada - taxaNegociada; // positivo = cobrou MAIS
+  let status;
+  if (Math.abs(diferenca) <= TOL) status = "ok";
+  else if (diferenca > 0) status = "acima";
+  else status = "abaixo";
+
+  return {
+    tipoId,
+    grupoId,
+    taxaNegociada,
+    taxaCobrada,
+    diferenca: Math.round(diferenca * 1000) / 1000,
+    status,
+  };
+}
+
 // Normaliza nome de cor pra comparação (remove acentos, espaços extras, prefixos de material)
 // Lista de materiais que podem aparecer no nome do modelo ou da cor
 // Removidos para não confundir o matching
@@ -1040,7 +1154,8 @@ function parseErpBluTexto(texto, secaoNome) {
 }
 
 // Matcher Blu: chave (NSU normalizado) + mesmo mês/ano + valor com tolerância R$ 0,01
-function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01) {
+// Se receber `tabelaTaxas`, também confere a taxa cobrada vs negociada em cada venda conciliada.
+function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01, tabelaTaxas = null) {
   // Indexa Blu por chave de match (NSU normalizado)
   const bluPorChave = new Map();
   for (const v of vendasBlu) {
@@ -1061,6 +1176,7 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01) {
   const conciliados = [];
   const soNoErp = [];   // cada item: { ...vErp, motivo, motivoDetalhe, candidatoBlu? }
   const soNaBlu = [];   // cada item: { ...vBlu, motivo, motivoDetalhe, candidatoErp? }
+  const taxasForaNegociada = []; // cada item: { erp, blu, conferencia }
   const bluMatched = new Set();
   // Guarda quais NSUs da Blu foram "explicados" como divergência de valor/mês/NSU
   // (pra não duplicar do lado da Blu)
@@ -1082,7 +1198,16 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01) {
     }
 
     if (conciliado) {
-      conciliados.push({ erp: vErp, blu: conciliado });
+      // Confere a taxa contra a tabela negociada (se foi fornecida)
+      let conferencia = null;
+      if (tabelaTaxas) {
+        conferencia = conferirTaxaVenda(conciliado, tabelaTaxas);
+        // Só "acima" entra na lista de fora da negociada
+        if (conferencia.status === "acima") {
+          taxasForaNegociada.push({ erp: vErp, blu: conciliado, conferencia });
+        }
+      }
+      conciliados.push({ erp: vErp, blu: conciliado, conferencia });
       bluMatched.add(conciliado.nsu);
       continue;
     }
@@ -1213,7 +1338,7 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01) {
 
   const canceladas = vendasBlu.filter((v) => v.status !== "Confirmada");
 
-  return { conciliados, soNoErp, soNaBlu, canceladas };
+  return { conciliados, soNoErp, soNaBlu, canceladas, taxasForaNegociada };
 }
 
 // ============================================================
@@ -1331,6 +1456,55 @@ function useColorTable() {
   return { table, save, loaded };
 }
 
+// Hook idêntico ao useColorTable, mas pra tabela de taxas de cartões Blu
+function useTaxasBlu() {
+  const [taxas, setTaxas] = useState(DEFAULT_TAXAS_BLU);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const value = await storageGet(TAXAS_BLU_STORAGE_KEY);
+        if (cancelled) return;
+        if (value) {
+          const parsed = JSON.parse(value);
+          // Mescla com os defaults pra garantir que toda chave esteja presente
+          // (caso a estrutura cresça depois)
+          const merged = { ...DEFAULT_TAXAS_BLU };
+          for (const tipo of Object.keys(DEFAULT_TAXAS_BLU)) {
+            merged[tipo] = { ...DEFAULT_TAXAS_BLU[tipo], ...(parsed?.[tipo] || {}) };
+          }
+          setTaxas(merged);
+        } else {
+          setTaxas(DEFAULT_TAXAS_BLU);
+          try {
+            await storageSet(TAXAS_BLU_STORAGE_KEY, JSON.stringify(DEFAULT_TAXAS_BLU));
+          } catch {}
+        }
+      } catch (e) {
+        if (!cancelled) setTaxas(DEFAULT_TAXAS_BLU);
+      } finally {
+        if (!cancelled) setLoaded(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const save = useCallback(async (novas) => {
+    setTaxas(novas);
+    try {
+      await storageSet(TAXAS_BLU_STORAGE_KEY, JSON.stringify(novas));
+      return true;
+    } catch (e) {
+      console.error("Erro ao salvar tabela de taxas de cartões", e);
+      return false;
+    }
+  }, []);
+
+  return { taxas, save, loaded };
+}
+
 // ============================================================
 // UI COMPONENTS
 // ============================================================
@@ -1410,6 +1584,7 @@ function StatCard({ label, value, sublabel, accent, icon: Icon }) {
     amber: "border-amber-200 bg-amber-50/60",
     stone: "border-stone-200 bg-white",
     purple: "border-purple-200 bg-purple-50/60",
+    orange: "border-orange-200 bg-orange-50/60",
   };
   const textColors = {
     red: "text-red-900",
@@ -1417,6 +1592,7 @@ function StatCard({ label, value, sublabel, accent, icon: Icon }) {
     amber: "text-amber-900",
     stone: "text-stone-900",
     purple: "text-purple-900",
+    orange: "text-orange-900",
   };
   return (
     <div className={`border rounded-lg p-4 ${accentColors[accent]}`}>
@@ -2363,6 +2539,265 @@ function ColorTableModule({ table, onSave }) {
 }
 
 // ============================================================
+// MÓDULO: TABELA DE TAXAS (Blu / Pague Veloz)
+// ============================================================
+
+// Taxas Pague Veloz: estrutura igual à da Blu, mas começa vazia
+// (a Gabi vai preencher quando a gente tiver as taxas dela)
+const DEFAULT_TAXAS_VAZIAS = {
+  debito:           { visa_master: null, amex_elo: null },
+  credito_a_vista:  { visa_master: null, amex_elo: null },
+  credito_2_6:      { visa_master: null, amex_elo: null },
+  credito_7_12:     { visa_master: null, amex_elo: null },
+  credito_13_17:    { visa_master: null, amex_elo: null },
+  credito_18_21:    { visa_master: null, amex_elo: null },
+};
+
+function TaxasModule({ taxasBlu, onSaveTaxasBlu }) {
+  // Aba ativa (qual maquininha está sendo editada)
+  const [maquininhaAtiva, setMaquininhaAtiva] = useState("blu");
+  // Estado de "rascunho" — a usuária edita aqui antes de salvar
+  const [rascunho, setRascunho] = useState(taxasBlu);
+  const [saving, setSaving] = useState(false);
+  const [saveStatus, setSaveStatus] = useState("");
+
+  // Quando muda a tabela vinda do hook (ou troca de maquininha), atualiza o rascunho
+  useEffect(() => {
+    if (maquininhaAtiva === "blu") {
+      setRascunho(taxasBlu);
+    } else {
+      // Pague Veloz ainda não tem hook próprio — começa vazio
+      setRascunho(DEFAULT_TAXAS_VAZIAS);
+    }
+    setSaveStatus("");
+  }, [maquininhaAtiva, taxasBlu]);
+
+  // Detecta se houve mudança em relação ao salvo
+  const hasChanges = useMemo(() => {
+    if (maquininhaAtiva !== "blu") return false;
+    return JSON.stringify(rascunho) !== JSON.stringify(taxasBlu);
+  }, [rascunho, taxasBlu, maquininhaAtiva]);
+
+  const onChangeTaxa = (tipoId, grupoId, valor) => {
+    // valor vem como string ("2,55" ou "2.55") — converte pra número
+    let num = null;
+    if (valor !== "" && valor != null) {
+      const limpo = String(valor).replace(",", ".").trim();
+      const n = parseFloat(limpo);
+      if (!isNaN(n)) num = n;
+    }
+    setRascunho((prev) => ({
+      ...prev,
+      [tipoId]: { ...prev[tipoId], [grupoId]: num },
+    }));
+  };
+
+  const salvar = async () => {
+    if (maquininhaAtiva !== "blu") return; // só Blu salva por ora
+    setSaving(true);
+    setSaveStatus("");
+    const ok = await onSaveTaxasBlu(rascunho);
+    setSaving(false);
+    setSaveStatus(ok ? "Salvo" : "Erro ao salvar");
+    setTimeout(() => setSaveStatus(""), 2500);
+  };
+
+  const cancelar = () => {
+    if (maquininhaAtiva === "blu") {
+      setRascunho(taxasBlu);
+    } else {
+      setRascunho(DEFAULT_TAXAS_VAZIAS);
+    }
+    setSaveStatus("");
+  };
+
+  const restaurarPadrao = async () => {
+    if (maquininhaAtiva !== "blu") return;
+    if (!confirm("Restaurar as taxas Blu para os valores padrão (do print que a Blu disponibilizou)?\nSuas alterações serão perdidas.")) return;
+    setSaving(true);
+    const ok = await onSaveTaxasBlu(DEFAULT_TAXAS_BLU);
+    setSaving(false);
+    setSaveStatus(ok ? "Salvo" : "Erro ao salvar");
+    setTimeout(() => setSaveStatus(""), 2500);
+  };
+
+  return (
+    <div className="max-w-4xl mx-auto">
+      <div className="mb-8 border-b border-stone-200 pb-6">
+        <div className="flex items-baseline gap-3 mb-2">
+          <span className="text-xs uppercase tracking-[0.2em] text-amber-800 font-semibold">
+            Cadastro
+          </span>
+          <span className="text-stone-300">—</span>
+          <span className="text-xs uppercase tracking-wider text-stone-500">
+            Taxas Negociadas
+          </span>
+        </div>
+        <h1 className="font-serif text-4xl font-bold text-stone-900 tracking-tight">
+          Tabelas de Taxas de Cartões
+        </h1>
+        <p className="text-stone-600 mt-2 max-w-2xl">
+          Cadastre as taxas <strong>negociadas no contrato</strong> com cada maquininha.
+          Na Conciliação Financeira, o app vai comparar essas taxas com o que foi cobrado
+          de fato e te avisar se houver cobrança acima do acordado.
+        </p>
+        <div className="flex items-start gap-2 mt-3 text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
+          <Users className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+          <span>
+            <strong>Tabelas salvas no seu navegador.</strong> Quando o contrato mudar,
+            é só atualizar os valores aqui e salvar.
+          </span>
+        </div>
+      </div>
+
+      {/* Botões de seleção de maquininha */}
+      <div className="flex gap-2 mb-6">
+        <button
+          onClick={() => setMaquininhaAtiva("blu")}
+          className={`flex items-center gap-2 px-4 py-2 rounded-md font-medium transition-colors ${
+            maquininhaAtiva === "blu"
+              ? "bg-purple-700 text-white shadow-sm"
+              : "bg-white text-stone-700 border border-stone-300 hover:bg-stone-50"
+          }`}
+        >
+          <CreditCard className="w-4 h-4" />
+          Blu (SS Express e Lupe)
+        </button>
+        <button
+          onClick={() => setMaquininhaAtiva("pague_veloz")}
+          className={`flex items-center gap-2 px-4 py-2 rounded-md font-medium transition-colors ${
+            maquininhaAtiva === "pague_veloz"
+              ? "bg-blue-700 text-white shadow-sm"
+              : "bg-white text-stone-700 border border-stone-300 hover:bg-stone-50"
+          }`}
+        >
+          <Landmark className="w-4 h-4" />
+          Pague Veloz
+        </button>
+      </div>
+
+      {/* Aviso quando Pague Veloz */}
+      {maquininhaAtiva === "pague_veloz" && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6 flex items-start gap-3">
+          <AlertCircle className="w-5 h-5 text-blue-700 mt-0.5 flex-shrink-0" />
+          <div className="text-sm text-blue-900">
+            <p className="font-semibold mb-1">Cadastro da Pague Veloz em construção</p>
+            <p>
+              A conferência automática para Pague Veloz ainda não está ativa.
+              Ela ficará disponível assim que o módulo de Conciliação Financeira da Pague Veloz for liberado.
+              Por enquanto, você pode ir preenchendo os valores aqui — eles ficam salvos.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Tabela de taxas (linhas = tipos, colunas = grupos de bandeira) */}
+      <div className="bg-white border border-stone-200 rounded-lg overflow-hidden">
+        <div className="grid grid-cols-[1fr_180px_180px] gap-3 px-4 py-2.5 bg-stone-50 border-b border-stone-200 text-[11px] uppercase tracking-wider font-semibold text-stone-600">
+          <div>Tipo de Operação</div>
+          {GRUPOS_BANDEIRA_BLU.map((g) => (
+            <div key={g.id} className="text-center">{g.nome}</div>
+          ))}
+        </div>
+
+        {TIPOS_OPERACAO_BLU.map((tipo, idx) => {
+          const isLast = idx === TIPOS_OPERACAO_BLU.length - 1;
+          return (
+            <div
+              key={tipo.id}
+              className={`grid grid-cols-[1fr_180px_180px] gap-3 px-4 py-3 items-center ${
+                isLast ? "" : "border-b border-stone-100"
+              } ${idx % 2 === 1 ? "bg-stone-50/40" : ""}`}
+            >
+              <div className="text-sm font-medium text-stone-800">{tipo.nome}</div>
+              {GRUPOS_BANDEIRA_BLU.map((grupo) => {
+                const valorAtual = rascunho?.[tipo.id]?.[grupo.id];
+                const valorStr =
+                  valorAtual === null || valorAtual === undefined
+                    ? ""
+                    : String(valorAtual).replace(".", ",");
+                return (
+                  <div key={grupo.id} className="flex items-center justify-center">
+                    <div className="relative w-32">
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        value={valorStr}
+                        onChange={(e) => onChangeTaxa(tipo.id, grupo.id, e.target.value)}
+                        placeholder="—"
+                        className="w-full pl-3 pr-8 py-1.5 text-sm text-right border border-stone-300 rounded bg-white font-mono focus:outline-none focus:ring-2 focus:ring-amber-700/30 focus:border-amber-700"
+                      />
+                      <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-stone-400 text-sm pointer-events-none">
+                        %
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Botões de ação */}
+      <div className="flex flex-wrap items-center gap-2 mt-4">
+        <button
+          onClick={salvar}
+          disabled={!hasChanges || saving || maquininhaAtiva !== "blu"}
+          className="flex items-center gap-1.5 px-4 py-2 text-sm bg-emerald-700 text-white font-medium rounded-md hover:bg-emerald-800 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          {saving ? (
+            <Loader2 className="w-4 h-4 animate-spin" />
+          ) : (
+            <Save className="w-4 h-4" />
+          )}
+          Salvar alterações
+        </button>
+        <button
+          onClick={cancelar}
+          disabled={!hasChanges || saving}
+          className="px-3 py-2 text-sm text-stone-600 hover:text-stone-900 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          Descartar
+        </button>
+        {maquininhaAtiva === "blu" && (
+          <button
+            onClick={restaurarPadrao}
+            disabled={saving}
+            className="flex items-center gap-1.5 px-3 py-2 text-sm text-stone-600 border border-stone-300 rounded-md bg-white hover:bg-stone-50 ml-auto"
+            title="Restaura as taxas Blu padrão (do print que a Blu disponibilizou)"
+          >
+            <RotateCcw className="w-4 h-4" />
+            Restaurar padrão Blu
+          </button>
+        )}
+        {saveStatus && (
+          <div
+            className={`flex items-center gap-1.5 px-3 py-2 text-xs rounded-md ${
+              saveStatus === "Salvo"
+                ? "bg-emerald-50 text-emerald-800 border border-emerald-200"
+                : "bg-red-50 text-red-800 border border-red-200"
+            }`}
+          >
+            {saveStatus === "Salvo" ? (
+              <CheckCircle2 className="w-3.5 h-3.5" />
+            ) : (
+              <AlertTriangle className="w-3.5 h-3.5" />
+            )}
+            {saveStatus}
+          </div>
+        )}
+      </div>
+
+      <p className="text-xs text-stone-500 mt-6">
+        Use vírgula ou ponto para casas decimais (ex: <code>2,55</code> ou <code>2.55</code>).
+        Deixe em branco se não houver taxa cadastrada para essa combinação.
+      </p>
+    </div>
+  );
+}
+
+// ============================================================
 // MÓDULO: CONCILIAÇÃO FINANCEIRA
 // ============================================================
 
@@ -2898,6 +3333,7 @@ function BluFlow({ banco, onTrocar }) {
   const [error, setError] = useState("");
   const [activeView, setActiveView] = useState("conciliados");
   const [searchTerm, setSearchTerm] = useState("");
+  const { taxas: tabelaTaxas, loaded: taxasLoaded } = useTaxasBlu();
 
   const handleBlu = async (f) => {
     setError("");
@@ -2947,8 +3383,9 @@ function BluFlow({ banco, onTrocar }) {
 
   const result = useMemo(() => {
     if (!vendasBlu.length || !vendasErp.length) return null;
-    return conciliarBlu(vendasBlu, vendasErp);
-  }, [vendasBlu, vendasErp]);
+    if (!taxasLoaded) return null; // espera as taxas carregarem
+    return conciliarBlu(vendasBlu, vendasErp, 0.01, tabelaTaxas);
+  }, [vendasBlu, vendasErp, tabelaTaxas, taxasLoaded]);
 
   const filtrarLista = (items, getCampos) => {
     const t = searchTerm.toLowerCase().trim();
@@ -3000,6 +3437,17 @@ function BluFlow({ banco, onTrocar }) {
       it.autorizacao,
       it.status,
       it.valorBrutoTotal.toFixed(2),
+    ]);
+  }, [result, searchTerm]);
+
+  const filteredTaxasFora = useMemo(() => {
+    if (!result) return [];
+    return filtrarLista(result.taxasForaNegociada, (x) => [
+      x.erp.cliente,
+      x.erp.numVenda,
+      x.blu.autorizacao,
+      x.blu.bandeira,
+      x.blu.valorBrutoTotal.toFixed(2),
     ]);
   }, [result, searchTerm]);
 
@@ -3099,10 +3547,42 @@ function BluFlow({ banco, onTrocar }) {
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rowsCanc), "Canceladas");
     }
 
-    // Aba 5: Resumo
+    // Aba: Taxas fora da negociada (se houver)
+    if (result.taxasForaNegociada.length > 0) {
+      const nomesTipo = Object.fromEntries(TIPOS_OPERACAO_BLU.map((t) => [t.id, t.nome]));
+      const nomesGrupo = Object.fromEntries(GRUPOS_BANDEIRA_BLU.map((g) => [g.id, g.nome]));
+      const rowsTaxas = result.taxasForaNegociada.map((x) => {
+        const c = x.conferencia;
+        const prejuizo = (c.diferenca / 100) * x.blu.valorBrutoTotal;
+        return {
+          "Data Venda": formatarData(x.blu.dataVenda),
+          "Loja": x.erp.loja,
+          "Nº Venda": x.erp.numVenda,
+          "Cliente": x.erp.cliente,
+          "Bandeira": x.blu.bandeira,
+          "Tipo": x.blu.tipo,
+          "Parcelas": x.blu.qtdParcelas,
+          "Faixa Tabela": nomesTipo[c.tipoId] || "",
+          "Grupo Bandeira": nomesGrupo[c.grupoId] || "",
+          "Valor Bruto": x.blu.valorBrutoTotal,
+          "Valor Líquido": x.blu.valorLiquidoTotal,
+          "Taxa Negociada (%)": c.taxaNegociada,
+          "Taxa Cobrada (%)": c.taxaCobrada,
+          "Diferença (pp)": c.diferenca,
+          "Prejuízo Estimado (R$)": Math.round(prejuizo * 100) / 100,
+          "NSU": x.blu.autorizacao,
+        };
+      });
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rowsTaxas), "Taxas fora da negociada");
+    }
+
+    // Aba: Resumo
     const totalConcil = result.conciliados.reduce((s, c) => s + c.blu.valorBrutoTotal, 0);
     const totalSoErp = result.soNoErp.reduce((s, v) => s + v.valor, 0);
     const totalSoBlu = result.soNaBlu.reduce((s, v) => s + v.valorBrutoTotal, 0);
+    const totalPrejuizoTaxas = result.taxasForaNegociada.reduce(
+      (s, x) => s + (x.conferencia.diferenca / 100) * x.blu.valorBrutoTotal, 0
+    );
     const wsResumo = XLSX.utils.aoa_to_sheet([
       ["RESUMO DA CONCILIAÇÃO BLU"],
       [],
@@ -3120,6 +3600,9 @@ function BluFlow({ banco, onTrocar }) {
       [],
       ["Só na Blu (qtd)", result.soNaBlu.length],
       ["Só na Blu (valor total)", totalSoBlu],
+      [],
+      ["Taxas fora da negociada (qtd)", result.taxasForaNegociada.length],
+      ["Prejuízo estimado por taxas", Math.round(totalPrejuizoTaxas * 100) / 100],
       [],
       ["Canceladas/Estornadas (qtd)", result.canceladas.length],
     ]);
@@ -3140,10 +3623,17 @@ function BluFlow({ banco, onTrocar }) {
 
   const totais = useMemo(() => {
     if (!result) return null;
+    // Calcula o prejuízo total das taxas cobradas a mais:
+    // pra cada venda com taxa "acima", o prejuízo é (diferenca% / 100) * valorBruto
+    const prejuizoTaxas = result.taxasForaNegociada.reduce((s, x) => {
+      const dif = x.conferencia?.diferenca || 0;
+      return s + (dif / 100) * x.blu.valorBrutoTotal;
+    }, 0);
     return {
       conciliados: result.conciliados.reduce((s, c) => s + c.blu.valorBrutoTotal, 0),
       soErp: result.soNoErp.reduce((s, v) => s + v.valor, 0),
       soBlu: result.soNaBlu.reduce((s, v) => s + v.valorBrutoTotal, 0),
+      prejuizoTaxas,
     };
   }, [result]);
 
@@ -3221,7 +3711,7 @@ function BluFlow({ banco, onTrocar }) {
 
       {result && (
         <>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3 mb-6">
             <StatCard
               label="Conciliados"
               value={result.conciliados.length}
@@ -3241,6 +3731,15 @@ function BluFlow({ banco, onTrocar }) {
               value={result.soNaBlu.length}
               sublabel={formatarMoeda(totais.soBlu)}
               accent="amber"
+              icon={AlertCircle}
+            />
+            <StatCard
+              label="Taxas fora da negociada"
+              value={result.taxasForaNegociada.length}
+              sublabel={result.taxasForaNegociada.length > 0
+                ? `prejuízo ~${formatarMoeda(totais.prejuizoTaxas)}`
+                : "todas as taxas dentro do acordado"}
+              accent="orange"
               icon={AlertCircle}
             />
             <StatCard
@@ -3285,6 +3784,18 @@ function BluFlow({ banco, onTrocar }) {
               >
                 Só na Blu ({result.soNaBlu.length})
               </button>
+              {result.taxasForaNegociada.length > 0 && (
+                <button
+                  onClick={() => setActiveView("taxasFora")}
+                  className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
+                    activeView === "taxasFora"
+                      ? "bg-white text-orange-900 shadow-sm"
+                      : "text-stone-600 hover:text-stone-900"
+                  }`}
+                >
+                  Taxas fora da negociada ({result.taxasForaNegociada.length})
+                </button>
+              )}
               {result.canceladas.length > 0 && (
                 <button
                   onClick={() => setActiveView("canceladas")}
@@ -3337,6 +3848,9 @@ function BluFlow({ banco, onTrocar }) {
           )}
           {activeView === "soBlu" && (
             <BluSoBluList items={filteredSoBlu} />
+          )}
+          {activeView === "taxasFora" && (
+            <BluTaxasForaList items={filteredTaxasFora} tabelaTaxas={tabelaTaxas} />
           )}
           {activeView === "canceladas" && (
             <BluSoBluList items={filteredCanceladas} canceladas />
@@ -3660,6 +4174,93 @@ function BluSoBluList({ items, canceladas = false }) {
   );
 }
 
+// Lista de vendas com taxa cobrada acima da negociada
+function BluTaxasForaList({ items, tabelaTaxas }) {
+  if (!items.length) {
+    return (
+      <div className="text-center py-12">
+        <CheckCircle2 className="w-10 h-10 text-emerald-600 mx-auto mb-3" />
+        <p className="font-serif text-lg text-stone-800">Todas as taxas estão dentro do acordado</p>
+        <p className="text-sm text-stone-600 mt-1">
+          Não há nenhuma venda com taxa cobrada acima da negociada.
+        </p>
+      </div>
+    );
+  }
+
+  // Map dos nomes amigáveis dos tipos/grupos para legendar
+  const nomesTipo = Object.fromEntries(TIPOS_OPERACAO_BLU.map((t) => [t.id, t.nome]));
+  const nomesGrupo = Object.fromEntries(GRUPOS_BANDEIRA_BLU.map((g) => [g.id, g.nome]));
+
+  return (
+    <div className="space-y-2">
+      <div className="bg-orange-50 border border-orange-300 rounded-lg p-3 mb-3 flex items-start gap-2">
+        <AlertCircle className="w-4 h-4 text-orange-700 mt-0.5 flex-shrink-0" />
+        <div className="text-xs text-orange-900">
+          <p className="font-semibold mb-1">Vendas em que a Blu cobrou taxa MAIOR que a negociada.</p>
+          <p>A diferença está em <strong>pontos percentuais (pp)</strong>. Para corrigir os valores acordados, vá em <strong>Tabelas de Taxas de Cartões</strong> no menu lateral.</p>
+        </div>
+      </div>
+
+      {items.map((x, i) => {
+        const c = x.conferencia;
+        const tipoNome = nomesTipo[c.tipoId] || c.tipoId;
+        const grupoNome = nomesGrupo[c.grupoId] || c.grupoId;
+        const prejuizoVenda = (c.diferenca / 100) * x.blu.valorBrutoTotal;
+
+        return (
+          <div key={i} className="border border-orange-300 bg-white rounded-lg p-4">
+            <div className="flex items-start gap-4">
+              <div className="w-10 h-10 rounded-md bg-orange-100 flex items-center justify-center flex-shrink-0">
+                <AlertCircle className="w-5 h-5 text-orange-700" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-baseline gap-2 mb-1 flex-wrap">
+                  <span className="text-xs font-mono text-stone-500">{x.erp.dataStr}</span>
+                  <span className="text-[10px] uppercase tracking-wider bg-purple-100 text-purple-800 px-1.5 py-0.5 rounded font-semibold">
+                    {x.blu.bandeira}
+                  </span>
+                  <span className="text-[10px] uppercase tracking-wider bg-stone-100 text-stone-600 px-1.5 py-0.5 rounded">
+                    {x.blu.qtdParcelas}x {x.blu.tipo}
+                  </span>
+                  <span className="text-[10px] uppercase tracking-wider bg-orange-100 text-orange-900 px-1.5 py-0.5 rounded font-semibold border border-orange-300">
+                    +{c.diferenca.toFixed(2).replace(".", ",")}pp
+                  </span>
+                </div>
+                <h3 className="font-serif font-semibold text-stone-900 truncate">
+                  {x.erp.cliente}
+                </h3>
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-600 mt-1">
+                  <span>Loja: <strong className="text-stone-900">{x.erp.loja}</strong></span>
+                  <span>Nº Venda: <strong className="text-stone-900">{x.erp.numVenda}</strong></span>
+                  <span>NSU: <strong className="font-mono text-stone-900">{x.blu.autorizacao}</strong></span>
+                </div>
+                <div className="mt-2 text-xs px-3 py-2 rounded border bg-orange-50 border-orange-200 text-orange-900">
+                  <strong>Taxa cobrada: {c.taxaCobrada.toFixed(2).replace(".", ",")}%</strong>
+                  {" — "}
+                  Tabela negociada para <strong>{tipoNome} / {grupoNome}</strong>: {c.taxaNegociada.toFixed(2).replace(".", ",")}%.
+                  {" "}
+                  Diferença de <strong>+{c.diferenca.toFixed(2).replace(".", ",")} pp</strong>
+                  {" "}
+                  (prejuízo nesta venda ≈ <strong>{formatarMoeda(prejuizoVenda)}</strong>).
+                </div>
+              </div>
+              <div className="text-right flex-shrink-0">
+                <p className="font-serif text-xl font-bold text-orange-700">
+                  {formatarMoeda(x.blu.valorBrutoTotal)}
+                </p>
+                <p className="text-xs text-stone-500 mt-0.5">
+                  Líquido: {formatarMoeda(x.blu.valorLiquidoTotal)}
+                </p>
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function ConciliadosFinanceirosList({ items }) {
   const [expanded, setExpanded] = useState(null);
 
@@ -3882,6 +4483,7 @@ function PlaceholderModule({ title, description }) {
 export default function App() {
   const [activeModule, setActiveModule] = useState("conciliacao");
   const { table: colorTable, save: saveColorTable, loaded: colorsLoaded } = useColorTable();
+  const { taxas: taxasBlu, save: saveTaxasBlu, loaded: taxasBluLoaded } = useTaxasBlu();
 
   const modules = [
     {
@@ -3900,6 +4502,12 @@ export default function App() {
       id: "financeiro",
       label: "Conciliação Financeira",
       icon: CircleDollarSign,
+      available: true,
+    },
+    {
+      id: "taxas",
+      label: "Tabelas de Taxas de Cartões",
+      icon: CreditCard,
       available: true,
     },
     {
@@ -4018,6 +4626,15 @@ export default function App() {
             </div>
           )}
           {activeModule === "financeiro" && <FinanceiroModule />}
+          {activeModule === "taxas" && taxasBluLoaded && (
+            <TaxasModule taxasBlu={taxasBlu} onSaveTaxasBlu={saveTaxasBlu} />
+          )}
+          {activeModule === "taxas" && !taxasBluLoaded && (
+            <div className="flex items-center gap-2 text-stone-500 justify-center py-20">
+              <Loader2 className="w-5 h-5 animate-spin" />
+              Carregando taxas…
+            </div>
+          )}
           {activeModule === "estoque" && (
             <PlaceholderModule
               title="Gestão de Estoque"
