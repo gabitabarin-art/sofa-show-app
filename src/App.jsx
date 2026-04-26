@@ -958,19 +958,56 @@ async function readErpBluPdf(file, secaoNome) {
 
 // Extrai vendas de uma seção do PDF do ERP.
 // Cada linha: "4 02/03/2026 6544 78454 (068982) MAGALI...  3,500.00 MASTER CRÉDITO/302427/1"
+//
+// Tolerante a variações que o pdf.js produz: espaços múltiplos, quebras de linha
+// no meio, e seção com nome ligeiramente diferente.
 function parseErpBluTexto(texto, secaoNome) {
-  const inicio = texto.indexOf(`Forma de Pagamento: ${secaoNome}`);
-  if (inicio === -1) return [];
-  const fim = texto.indexOf(`Total: ${secaoNome}`, inicio);
-  const secao = fim === -1 ? texto.slice(inicio) : texto.slice(inicio, fim);
+  // 1. Tenta achar o início da seção com regex flexível (espaços/quebras tolerados)
+  // Escapa o nome da seção para usar em regex e troca espaços por \s+
+  const secaoEscapada = secaoNome
+    .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    .replace(/\s+/g, "\\s+");
+  const reInicio = new RegExp(`Forma\\s+de\\s+Pagamento\\s*:\\s*${secaoEscapada}`, "i");
+  const reFim = new RegExp(`Total\\s*:\\s*${secaoEscapada}`, "i");
 
-  const re = /(\d+)\s+(\d{2}\/\d{2}\/\d{4})\s+(\d+)\s+(\d+)\s+\((\d+)\)\s*([^\n\r]+?)\s+([\d.,]+)\s+([^/\n]+?)\/([^/\s]+)\/(\d+)/g;
+  const matchInicio = texto.match(reInicio);
+  let secao;
+  if (matchInicio) {
+    const inicio = matchInicio.index + matchInicio[0].length;
+    const restante = texto.slice(inicio);
+    const matchFim = restante.match(reFim);
+    secao = matchFim ? restante.slice(0, matchFim.index) : restante;
+  } else {
+    // Fallback: se não encontrou a seção, vai escanear o texto inteiro
+    // (o filtro por palavra-chave acontece linha a linha mais abaixo)
+    secao = texto;
+  }
 
+  // 2. Quebra em linhas e tenta extrair venda de cada uma
+  // O pdf.js às vezes embaralha linhas longas, então tratamos cada bloco separadamente
   const vendas = [];
+  // O pdf.js às vezes une o valor com a rede sem espaço (ex: "2,108.00MASTER CREDITO/...")
+  // e às vezes com espaço. Por isso usamos \s* (zero ou mais) entre valor e rede.
+  // O valor termina sempre com 2 decimais (\.\d{2}), o que serve de âncora segura.
+  const reLinhaVenda = /(\d+)\s+(\d{2}\/\d{2}\/\d{4})\s+(\d+)\s+(\d+)\s+\((\d+)\)\s*([^\n\r]+?)\s+([\d.,]+\.\d{2})\s*([A-ZÀ-Ÿa-zà-ÿ][A-ZÀ-Ÿa-zà-ÿ\s]*?)\/([^/\s]+)\/(\d+)/g;
+
   let m;
-  while ((m = re.exec(secao)) !== null) {
+  while ((m = reLinhaVenda.exec(secao)) !== null) {
     const [, loja, data, numVenda, numPedido, codCliente, cliente, valor, rede, nsuErp, parcelasErp] = m;
     const dataObj = parseData(data);
+
+    // Filtro extra de segurança no fallback: se não achou a seção,
+    // verifica se a linha tem palavra-chave da seção alvo (evita pegar venda de outra forma)
+    if (!matchInicio) {
+      // Linha completa pra contexto: achar a linha original que contém esse match
+      const linhaCompleta = m[0];
+      // Esse match não tem como nos dizer se é da seção certa, então no fallback,
+      // pegamos só linhas onde "BLU" aparece no campo "rede" (último campo)
+      if (!/BLU/i.test(rede) && !/BLU/i.test(linhaCompleta)) {
+        continue;
+      }
+    }
+
     vendas.push({
       origem: "erp_blu",
       loja: loja.trim(),
@@ -987,6 +1024,18 @@ function parseErpBluTexto(texto, secaoNome) {
       parcelasErp: parseInt(parcelasErp),
     });
   }
+
+  // 3. Log de debug pra console do navegador (F12 → Console)
+  if (typeof console !== "undefined") {
+    console.log(`[BLU] Procurando seção "${secaoNome}":`, {
+      secaoEncontrada: !!matchInicio,
+      tamanhoSecao: secao.length,
+      vendasExtraidas: vendas.length,
+      primeira: vendas[0]?.cliente?.substring(0, 30),
+      ultima: vendas[vendas.length - 1]?.cliente?.substring(0, 30),
+    });
+  }
+
   return vendas;
 }
 
@@ -2751,7 +2800,9 @@ function BluFlow({ banco, onTrocar }) {
       const items = await readErpBluPdf(f, banco.secaoPdf);
       if (!items.length) {
         setError(
-          `Nenhuma venda foi encontrada na seção "${banco.secaoPdf}" do PDF do ERP. Verifique se o relatório é "Vendas Por Finalizadores" e tem essa forma de pagamento.`
+          `Nenhuma venda foi encontrada na seção "${banco.secaoPdf}" do PDF do ERP. ` +
+          `Verifique se o relatório é "Vendas Por Finalizadores" e contém essa forma de pagamento. ` +
+          `Se o relatório está correto, abra o Console do navegador (F12 → aba Console) e procure por mensagens "[BLU]" pra ver detalhes.`
         );
         setErpFile(null);
       } else {
