@@ -2482,10 +2482,10 @@ function FinanceiroModule() {
             <ConciliadosFinanceirosList items={filteredConciliados} />
           )}
           {activeView === "soErp" && (
-            <DivergenciaSimplesList items={filteredSoErp} cor="red" titulo="No ERP, sem extrato bancário" descricao="Lançamentos no sistema que não foram encontrados no extrato. Pode ser pagamento agendado que ainda não saiu do banco, ou erro no lançamento." />
+            <DivergenciaSimplesList items={filteredSoErp} cor="red" />
           )}
           {activeView === "soBanco" && (
-            <DivergenciaSimplesList items={filteredSoBanco} cor="amber" titulo="No banco, sem ERP" descricao="Lançamentos no extrato que não foram encontrados no ERP. Pode ser lançamento esquecido no sistema, débito automático não cadastrado ou tarifa." />
+            <DivergenciaSimplesList items={filteredSoBanco} cor="amber" />
           )}
         </>
       )}
@@ -2626,68 +2626,88 @@ function ConciliadosFinanceirosList({ items }) {
   );
 }
 
-function DivergenciaSimplesList({ items, cor, titulo, descricao }) {
+function DivergenciaSimplesList({ items, cor }) {
   const cores = {
-    red: { borda: "border-red-200", bg: "bg-red-50/30", icone: "text-red-700", iconeBg: "bg-red-100", aviso: "bg-red-50 border-red-200 text-red-900" },
-    amber: { borda: "border-amber-200", bg: "bg-amber-50/30", icone: "text-amber-700", iconeBg: "bg-amber-100", aviso: "bg-amber-50 border-amber-200 text-amber-900" },
+    red: { borda: "border-red-200", bg: "bg-red-50/30", icone: "text-red-700", iconeBg: "bg-red-100" },
+    amber: { borda: "border-amber-200", bg: "bg-amber-50/30", icone: "text-amber-700", iconeBg: "bg-amber-100" },
   };
   const c = cores[cor] || cores.red;
 
-  return (
-    <div>
-      <div className={`flex items-start gap-2 ${c.aviso} border rounded-lg p-3 mb-4`}>
-        <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
-        <div className="text-xs">
-          <p className="font-semibold mb-0.5">{titulo}</p>
-          <p>{descricao}</p>
-        </div>
+  if (!items.length) {
+    return (
+      <div className="text-center py-12">
+        <CheckCircle2 className="w-10 h-10 text-emerald-600 mx-auto mb-3" />
+        <p className="font-serif text-lg text-stone-800">
+          Nenhuma divergência aqui
+        </p>
       </div>
+    );
+  }
 
-      {!items.length ? (
-        <div className="text-center py-12">
-          <CheckCircle2 className="w-10 h-10 text-emerald-600 mx-auto mb-3" />
-          <p className="font-serif text-lg text-stone-800">
-            Nenhuma divergência aqui
-          </p>
-        </div>
-      ) : (
-        <div className="space-y-2">
-          {items.map((it, i) => (
+  return (
+    <div className="space-y-2">
+      {items.map((it, i) => (
+        <div
+          key={i}
+          className={`border ${c.borda} bg-white rounded-lg p-4`}
+        >
+          <div className="flex items-start gap-4 mb-3">
             <div
-              key={i}
-              className={`border ${c.borda} bg-white rounded-lg p-4 flex items-start gap-4`}
+              className={`w-10 h-10 rounded-md ${c.iconeBg} flex items-center justify-center flex-shrink-0`}
             >
-              <div
-                className={`w-10 h-10 rounded-md ${c.iconeBg} flex items-center justify-center flex-shrink-0`}
-              >
-                <AlertTriangle className={`w-5 h-5 ${c.icone}`} />
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="flex items-baseline gap-2 mb-1">
-                  <span className="text-xs font-mono text-stone-500">
-                    {it.dataStr}
-                  </span>
-                  {it.documento && (
-                    <span className="text-xs font-mono text-stone-400">
-                      {it.documento}
-                    </span>
-                  )}
-                </div>
-                <h3 className="font-serif font-semibold text-stone-900 break-words">
-                  {it.historico}
-                </h3>
-              </div>
-              <p
-                className={`font-serif text-xl font-bold flex-shrink-0 ${
-                  it.valor < 0 ? "text-red-700" : "text-emerald-700"
-                }`}
-              >
+              <AlertTriangle className={`w-5 h-5 ${c.icone}`} />
+            </div>
+            <div className="flex-1 min-w-0">
+              <h3 className="font-serif font-semibold text-stone-900 break-words mb-1">
+                {it.historico}
+              </h3>
+              <p className="text-xs text-stone-500">
+                {it.dataStr}
+                {it.documento && (
+                  <span className="ml-2 font-mono">· Doc: {it.documento}</span>
+                )}
+              </p>
+            </div>
+            <p
+              className={`font-serif text-xl font-bold flex-shrink-0 ${
+                it.valor < 0 ? "text-red-700" : "text-emerald-700"
+              }`}
+            >
+              {formatarMoeda(it.valor)}
+            </p>
+          </div>
+
+          {/* Detalhes completos */}
+          <div className="bg-stone-50 border border-stone-200 rounded p-3 grid sm:grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
+            <div>
+              <span className="text-stone-500 uppercase tracking-wider text-[10px] font-semibold">Data</span>
+              <p className="text-stone-900 font-mono">{it.dataStr}</p>
+            </div>
+            <div>
+              <span className="text-stone-500 uppercase tracking-wider text-[10px] font-semibold">Valor</span>
+              <p className={`font-mono font-semibold ${it.valor < 0 ? "text-red-700" : "text-emerald-700"}`}>
                 {formatarMoeda(it.valor)}
               </p>
             </div>
-          ))}
+            <div className="sm:col-span-2">
+              <span className="text-stone-500 uppercase tracking-wider text-[10px] font-semibold">Histórico</span>
+              <p className="text-stone-900 break-words">{it.historico || "—"}</p>
+            </div>
+            <div className="sm:col-span-2">
+              <span className="text-stone-500 uppercase tracking-wider text-[10px] font-semibold">Documento</span>
+              <p className="text-stone-900 font-mono break-words">{it.documento || "—"}</p>
+            </div>
+            {it.raw && (
+              <div className="sm:col-span-2">
+                <span className="text-stone-500 uppercase tracking-wider text-[10px] font-semibold">Linha original do extrato</span>
+                <p className="text-stone-700 font-mono break-words text-[11px] mt-0.5">
+                  {typeof it.raw === "string" ? it.raw : JSON.stringify(it.raw)}
+                </p>
+              </div>
+            )}
+          </div>
         </div>
-      )}
+      ))}
     </div>
   );
 }
