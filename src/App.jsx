@@ -81,6 +81,106 @@ const DEFAULT_TAXAS_BLU = {
   credito_18_21:    { visa_master: 3.69, amex_elo: 5.19 },
 };
 
+// ============================================================
+// TABELA DE TAXAS PAGUE VELOZ (negociadas no contrato)
+// Estrutura totalmente diferente da Blu:
+//   - Linhas = número EXATO de parcelas (Débito + 1x até 21x)
+//   - Sem distinção por bandeira (uma única taxa por linha)
+//   - Comparamos a "Taxa Pagar" (que é a taxa efetivamente paga pelo lojista)
+// ============================================================
+
+const TAXAS_PV_STORAGE_KEY = "sofashow:taxasPagueVeloz";
+
+// Linhas da tabela PV — id estável + label + nº de parcelas
+// (debito é tratado separado; pra crédito, parc = número da linha)
+const LINHAS_TAXAS_PV = [
+  { id: "debito", nome: "Débito", parc: 0, ehDebito: true },
+  ...Array.from({ length: 21 }, (_, i) => ({
+    id: `parc_${i + 1}`,
+    nome: `${i + 1}x`,
+    parc: i + 1,
+    ehDebito: false,
+  })),
+];
+
+// Taxas "Taxa Pagar" da Pague Veloz, copiadas do print
+// (4ª coluna do print — última)
+const DEFAULT_TAXAS_PV = {
+  debito:  1.79,
+  parc_1:  3.98,
+  parc_2:  4.77,
+  parc_3:  5.40,
+  parc_4:  5.89,
+  parc_5:  6.48,
+  parc_6:  7.03,
+  parc_7:  7.92,
+  parc_8:  8.44,
+  parc_9:  9.04,
+  parc_10: 9.50,
+  parc_11: 9.94,
+  parc_12: 10.45,
+  parc_13: 11.29,
+  parc_14: 11.85,
+  parc_15: 12.47,
+  parc_16: 12.94,
+  parc_17: 13.52,
+  parc_18: 14.02,
+  parc_19: 15.52,
+  parc_20: 16.11,
+  parc_21: 16.77,
+};
+
+// Identifica a linha da tabela PV a partir de uma venda.
+// No CSV PV, parc=0 indica DÉBITO (validamos com dados reais: 96 vendas com parc=0
+// todas têm taxa exata de 1,79% que é a taxa de débito do contrato).
+// parc=1..21 indica crédito parcelado (1x a 21x).
+function identificarLinhaTaxaPV(venda) {
+  if (!venda) return null;
+  const parc = parseInt(venda.qtdParcelas || 0);
+
+  // Parcelas = 0 OU bandeira Maestro → débito
+  const bandeira = String(venda.bandeira || "").toUpperCase();
+  if (parc <= 0 || bandeira.includes("MAESTRO")) return "debito";
+
+  // Crédito 1x a 21x
+  if (parc >= 1 && parc <= 21) return `parc_${parc}`;
+
+  // Acima de 21x: cai no último (não esperado)
+  return "parc_21";
+}
+
+// Confere a taxa PV de uma venda contra a tabela negociada.
+// Retorna formato compatível com conferirTaxaVenda da Blu.
+function conferirTaxaVendaPV(venda, tabelaTaxasPV) {
+  const linhaId = identificarLinhaTaxaPV(venda);
+  const taxaCobrada = calcularTaxaCobrada(venda.valorBrutoTotal, venda.valorLiquidoTotal);
+
+  if (!linhaId || taxaCobrada == null) {
+    return { tipoId: linhaId, grupoId: null, taxaNegociada: null, taxaCobrada, diferenca: null, status: "indeterminado" };
+  }
+
+  const taxaNegociada = tabelaTaxasPV?.[linhaId];
+  if (typeof taxaNegociada !== "number") {
+    return { tipoId: linhaId, grupoId: null, taxaNegociada: null, taxaCobrada, diferenca: null, status: "indeterminado" };
+  }
+
+  const TOL = 0.02;
+  const diferenca = taxaCobrada - taxaNegociada;
+  let status;
+  if (Math.abs(diferenca) <= TOL) status = "ok";
+  else if (diferenca > 0) status = "acima";
+  else status = "abaixo";
+
+  return {
+    tipoId: linhaId,
+    grupoId: null,           // PV não tem grupo de bandeira
+    taxaNegociada,
+    taxaCobrada,
+    diferenca: Math.round(diferenca * 1000) / 1000,
+    status,
+  };
+}
+
 // Identifica o tipo de operação a partir da venda da Blu
 // Retorna o id do tipo (ex: "credito_2_6") ou null se não conseguir identificar
 function identificarTipoOperacao(venda) {
@@ -566,11 +666,12 @@ const TOLERANCIA_DIAS = 4;
 // Lista de bancos suportados
 // Bancos do tipo "extrato" usam o fluxo Sicredi (ERP + extrato).
 // Bancos do tipo "blu" usam o fluxo Blu (Excel da Blu + PDF do ERP por seção, match por NSU).
+// Bancos do tipo "pague_veloz" usam o fluxo PV (CSV PV + PDF do ERP por seção, match por NSU/Cod.Autorização).
 const BANCOS_SUPORTADOS = [
   { id: "sicredi", nome: "Sicredi", tipo: "extrato", cor: "emerald" },
-  { id: "pague_veloz", nome: "Pague Veloz", tipo: "extrato", cor: "blue", emBreve: true },
   { id: "blu_ss", nome: "Blu SS Express", tipo: "blu", secaoPdf: "BLU SS EXPRESS", cor: "purple" },
   { id: "blu_lupe", nome: "Blu Lupe", tipo: "blu", secaoPdf: "BLU LUPE", cor: "purple" },
+  { id: "pague_veloz_express", nome: "Pague Veloz Express", tipo: "pague_veloz", secaoPdf: "CARTÃO VELOZ EXP", cor: "blue" },
 ];
 
 // Converte "R$ -1.234,56" ou "1234,56" ou "-1,234.56" em número
@@ -1044,6 +1145,81 @@ async function readBluExcel(file) {
   return Array.from(vendasPorNsu.values());
 }
 
+// Lê o CSV da Pague Veloz (relatorio-operacoes.csv) e devolve as vendas
+// no MESMO formato que readBluExcel — pra reaproveitar o conciliarBlu.
+// Cada linha do CSV é uma venda (não há agrupamento por parcela como na Blu).
+async function readPagueVelozCsv(file) {
+  const texto = await file.text();
+  // O arquivo é separado por ponto-e-vírgula. Quebra em linhas, ignora vazias.
+  const linhas = texto.split(/\r?\n/).filter((l) => l.trim());
+  if (linhas.length < 2) return [];
+
+  // Cabeçalho
+  const cabecalho = linhas[0].split(";").map((h) => h.trim());
+  const idx = (nome) => cabecalho.findIndex((h) => h.toLowerCase() === nome.toLowerCase());
+
+  const iCodPv         = idx("Cod PagueVeloz");
+  const iNsuEmissor    = idx("NSU Emissor");
+  const iAutorizacao   = idx("Cod. Autorizacao");
+  const iEquipamento   = idx("Equipamento");
+  const iPagante       = idx("Pagante");
+  const iDataVenda     = idx("Data Venda");
+  const iCartao        = idx("Cartao");
+  const iBandeira      = idx("Bandeira");
+  const iParcelas      = idx("Qtde. Parcelas");
+  const iValorBruto    = idx("Valor Bruto");
+  const iValorLiquido  = idx("Valor Liquido");
+  const iStatus        = idx("Status");
+
+  const vendas = [];
+  for (let i = 1; i < linhas.length; i++) {
+    const cols = linhas[i].split(";");
+    if (cols.length < 5) continue;
+
+    const codPv         = (cols[iCodPv] || "").trim();
+    const nsuEmissor    = (cols[iNsuEmissor] || "").trim();
+    const autorizacao   = (cols[iAutorizacao] || "").trim().toUpperCase();
+    if (!autorizacao) continue;
+
+    const valorBruto    = parseValor(cols[iValorBruto]);
+    const valorLiquido  = parseValor(cols[iValorLiquido]);
+    const dataVenda     = parseData((cols[iDataVenda] || "").trim());
+    const parc          = parseInt(cols[iParcelas] || "0", 10) || 0;
+    // Parcelas = 0 na PV significa débito ou crédito à vista (1x).
+    // Usamos 1 como base pra identificarTipoOperacao funcionar.
+    const qtdParcelas = parc <= 0 ? 1 : parc;
+    const status = (cols[iStatus] || "").trim();
+    const bandeira = (cols[iBandeira] || "").trim();
+
+    // Detecta débito: PV não tem campo "tipo" como Blu, então olhamos parc=0 como pista
+    // mas é mais seguro ler a partir de palavras-chave do plano/cartão se necessário.
+    // Por hora, qtdParcelas=0 + bandeiras de débito (MAESTRO, ELO Débito) = débito.
+    // Mas o CSV não distingue claro. Mantemos o tipo vazio e deixamos qtdParcelas guiar.
+    const tipo = parc <= 0 ? "Débito/À vista" : "Crédito";
+
+    vendas.push({
+      // Identificador único: Cod PagueVeloz é único e estável
+      nsu: codPv,                                 // ID interno PV (equivalente a codigo_nsu da Blu)
+      autorizacao,                                // Cod. Autorizacao = "NSU" pra a Sofá Show
+      chaveMatch: normalizarChaveBlu(autorizacao),
+      dataVenda,
+      bandeira,
+      tipo,
+      qtdParcelas,
+      status: status === "Pago" ? "Confirmada" : status, // Normaliza pra usar mesma flag da Blu
+      valorBrutoTotal: isNaN(valorBruto) ? 0 : valorBruto,
+      valorLiquidoTotal: isNaN(valorLiquido) ? 0 : valorLiquido,
+      parcelasNoExtrato: 1,
+      terminal: (cols[iEquipamento] || "").trim(), // PV chama de "Equipamento"
+      pagante: (cols[iPagante] || "").trim(),
+      cartao: (cols[iCartao] || "").trim(),
+      nsuEmissor,                                  // guarda separado, vai pro Excel exportado
+    });
+  }
+
+  return vendas;
+}
+
 // Lê o PDF do ERP (Vendas Por Finalizadores) e extrai vendas de uma seção
 // específica (BLU SS EXPRESS ou BLU LUPE).
 async function readErpBluPdf(file, secaoNome) {
@@ -1153,15 +1329,19 @@ function parseErpBluTexto(texto, secaoNome) {
   return vendas;
 }
 
-// Matcher Blu: chave (NSU normalizado) + mesmo mês/ano + valor com tolerância R$ 0,01
+// Matcher Blu/PV: chave (NSU normalizado) + mesmo mês/ano + valor com tolerância R$ 0,01
 // Se receber `tabelaTaxas`, também confere a taxa cobrada vs negociada em cada venda conciliada.
-function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01, tabelaTaxas = null) {
+// `tipoMaquininha` define qual conferidor usar: "blu" (default) ou "pague_veloz".
+function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01, tabelaTaxas = null, tipoMaquininha = "blu") {
   // Indexa Blu por chave de match (NSU normalizado)
   const bluPorChave = new Map();
   for (const v of vendasBlu) {
     if (!bluPorChave.has(v.chaveMatch)) bluPorChave.set(v.chaveMatch, []);
     bluPorChave.get(v.chaveMatch).push(v);
   }
+
+  // Escolhe o conferidor de taxa apropriado
+  const conferirTaxa = tipoMaquininha === "pague_veloz" ? conferirTaxaVendaPV : conferirTaxaVenda;
 
   // Helper: mesmo mês entre 2 datas
   const mesmoMes = (d1, d2) =>
@@ -1201,7 +1381,7 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01, tabelaTaxas 
       // Confere a taxa contra a tabela negociada (se foi fornecida)
       let conferencia = null;
       if (tabelaTaxas) {
-        conferencia = conferirTaxaVenda(conciliado, tabelaTaxas);
+        conferencia = conferirTaxa(conciliado, tabelaTaxas);
         // Só "acima" entra na lista de fora da negociada
         if (conferencia.status === "acima") {
           taxasForaNegociada.push({ erp: vErp, blu: conciliado, conferencia });
@@ -1498,6 +1678,51 @@ function useTaxasBlu() {
       return true;
     } catch (e) {
       console.error("Erro ao salvar tabela de taxas de cartões", e);
+      return false;
+    }
+  }, []);
+
+  return { taxas, save, loaded };
+}
+
+// Hook idêntico ao useTaxasBlu, mas pra Pague Veloz (estrutura diferente: 22 linhas, sem grupo)
+function useTaxasPagueVeloz() {
+  const [taxas, setTaxas] = useState(DEFAULT_TAXAS_PV);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const value = await storageGet(TAXAS_PV_STORAGE_KEY);
+        if (cancelled) return;
+        if (value) {
+          const parsed = JSON.parse(value);
+          // Mescla com defaults pra garantir todas as linhas presentes
+          const merged = { ...DEFAULT_TAXAS_PV, ...(parsed || {}) };
+          setTaxas(merged);
+        } else {
+          setTaxas(DEFAULT_TAXAS_PV);
+          try {
+            await storageSet(TAXAS_PV_STORAGE_KEY, JSON.stringify(DEFAULT_TAXAS_PV));
+          } catch {}
+        }
+      } catch (e) {
+        if (!cancelled) setTaxas(DEFAULT_TAXAS_PV);
+      } finally {
+        if (!cancelled) setLoaded(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const save = useCallback(async (novas) => {
+    setTaxas(novas);
+    try {
+      await storageSet(TAXAS_PV_STORAGE_KEY, JSON.stringify(novas));
+      return true;
+    } catch (e) {
+      console.error("Erro ao salvar tabela de taxas Pague Veloz", e);
       return false;
     }
   }, []);
@@ -2542,18 +2767,7 @@ function ColorTableModule({ table, onSave }) {
 // MÓDULO: TABELA DE TAXAS (Blu / Pague Veloz)
 // ============================================================
 
-// Taxas Pague Veloz: estrutura igual à da Blu, mas começa vazia
-// (a Gabi vai preencher quando a gente tiver as taxas dela)
-const DEFAULT_TAXAS_VAZIAS = {
-  debito:           { visa_master: null, amex_elo: null },
-  credito_a_vista:  { visa_master: null, amex_elo: null },
-  credito_2_6:      { visa_master: null, amex_elo: null },
-  credito_7_12:     { visa_master: null, amex_elo: null },
-  credito_13_17:    { visa_master: null, amex_elo: null },
-  credito_18_21:    { visa_master: null, amex_elo: null },
-};
-
-function TaxasModule({ taxasBlu, onSaveTaxasBlu }) {
+function TaxasModule({ taxasBlu, onSaveTaxasBlu, taxasPV, onSaveTaxasPV }) {
   // Aba ativa (qual maquininha está sendo editada)
   const [maquininhaAtiva, setMaquininhaAtiva] = useState("blu");
   // Estado de "rascunho" — a usuária edita aqui antes de salvar
@@ -2566,20 +2780,19 @@ function TaxasModule({ taxasBlu, onSaveTaxasBlu }) {
     if (maquininhaAtiva === "blu") {
       setRascunho(taxasBlu);
     } else {
-      // Pague Veloz ainda não tem hook próprio — começa vazio
-      setRascunho(DEFAULT_TAXAS_VAZIAS);
+      setRascunho(taxasPV);
     }
     setSaveStatus("");
-  }, [maquininhaAtiva, taxasBlu]);
+  }, [maquininhaAtiva, taxasBlu, taxasPV]);
 
   // Detecta se houve mudança em relação ao salvo
   const hasChanges = useMemo(() => {
-    if (maquininhaAtiva !== "blu") return false;
-    return JSON.stringify(rascunho) !== JSON.stringify(taxasBlu);
-  }, [rascunho, taxasBlu, maquininhaAtiva]);
+    const original = maquininhaAtiva === "blu" ? taxasBlu : taxasPV;
+    return JSON.stringify(rascunho) !== JSON.stringify(original);
+  }, [rascunho, taxasBlu, taxasPV, maquininhaAtiva]);
 
-  const onChangeTaxa = (tipoId, grupoId, valor) => {
-    // valor vem como string ("2,55" ou "2.55") — converte pra número
+  // Onchange Blu (estrutura 2 níveis: tipo.grupo)
+  const onChangeTaxaBlu = (tipoId, grupoId, valor) => {
     let num = null;
     if (valor !== "" && valor != null) {
       const limpo = String(valor).replace(",", ".").trim();
@@ -2592,11 +2805,23 @@ function TaxasModule({ taxasBlu, onSaveTaxasBlu }) {
     }));
   };
 
+  // Onchange PV (estrutura 1 nível: linha)
+  const onChangeTaxaPV = (linhaId, valor) => {
+    let num = null;
+    if (valor !== "" && valor != null) {
+      const limpo = String(valor).replace(",", ".").trim();
+      const n = parseFloat(limpo);
+      if (!isNaN(n)) num = n;
+    }
+    setRascunho((prev) => ({ ...prev, [linhaId]: num }));
+  };
+
   const salvar = async () => {
-    if (maquininhaAtiva !== "blu") return; // só Blu salva por ora
     setSaving(true);
     setSaveStatus("");
-    const ok = await onSaveTaxasBlu(rascunho);
+    const ok = maquininhaAtiva === "blu"
+      ? await onSaveTaxasBlu(rascunho)
+      : await onSaveTaxasPV(rascunho);
     setSaving(false);
     setSaveStatus(ok ? "Salvo" : "Erro ao salvar");
     setTimeout(() => setSaveStatus(""), 2500);
@@ -2606,16 +2831,19 @@ function TaxasModule({ taxasBlu, onSaveTaxasBlu }) {
     if (maquininhaAtiva === "blu") {
       setRascunho(taxasBlu);
     } else {
-      setRascunho(DEFAULT_TAXAS_VAZIAS);
+      setRascunho(taxasPV);
     }
     setSaveStatus("");
   };
 
   const restaurarPadrao = async () => {
-    if (maquininhaAtiva !== "blu") return;
-    if (!confirm("Restaurar as taxas Blu para os valores padrão (do print que a Blu disponibilizou)?\nSuas alterações serão perdidas.")) return;
+    const nomeMaquininha = maquininhaAtiva === "blu" ? "Blu" : "Pague Veloz";
+    const padrao = maquininhaAtiva === "blu" ? DEFAULT_TAXAS_BLU : DEFAULT_TAXAS_PV;
+    if (!confirm(`Restaurar as taxas ${nomeMaquininha} para os valores padrão?\nSuas alterações serão perdidas.`)) return;
     setSaving(true);
-    const ok = await onSaveTaxasBlu(DEFAULT_TAXAS_BLU);
+    const ok = maquininhaAtiva === "blu"
+      ? await onSaveTaxasBlu(padrao)
+      : await onSaveTaxasPV(padrao);
     setSaving(false);
     setSaveStatus(ok ? "Salvo" : "Erro ao salvar");
     setTimeout(() => setSaveStatus(""), 2500);
@@ -2672,58 +2900,103 @@ function TaxasModule({ taxasBlu, onSaveTaxasBlu }) {
           }`}
         >
           <Landmark className="w-4 h-4" />
-          Pague Veloz
+          Pague Veloz Express
         </button>
       </div>
 
-      {/* Aviso quando Pague Veloz */}
-      {maquininhaAtiva === "pague_veloz" && (
-        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6 flex items-start gap-3">
-          <AlertCircle className="w-5 h-5 text-blue-700 mt-0.5 flex-shrink-0" />
-          <div className="text-sm text-blue-900">
-            <p className="font-semibold mb-1">Cadastro da Pague Veloz em construção</p>
-            <p>
-              A conferência automática para Pague Veloz ainda não está ativa.
-              Ela ficará disponível assim que o módulo de Conciliação Financeira da Pague Veloz for liberado.
-              Por enquanto, você pode ir preenchendo os valores aqui — eles ficam salvos.
-            </p>
+      {/* === TABELA BLU (6 linhas × 2 colunas: Visa/Master, Amex/Elo) === */}
+      {maquininhaAtiva === "blu" && (
+        <div className="bg-white border border-stone-200 rounded-lg overflow-hidden">
+          <div className="grid grid-cols-[1fr_180px_180px] gap-3 px-4 py-2.5 bg-stone-50 border-b border-stone-200 text-[11px] uppercase tracking-wider font-semibold text-stone-600">
+            <div>Tipo de Operação</div>
+            {GRUPOS_BANDEIRA_BLU.map((g) => (
+              <div key={g.id} className="text-center">{g.nome}</div>
+            ))}
           </div>
+
+          {TIPOS_OPERACAO_BLU.map((tipo, idx) => {
+            const isLast = idx === TIPOS_OPERACAO_BLU.length - 1;
+            return (
+              <div
+                key={tipo.id}
+                className={`grid grid-cols-[1fr_180px_180px] gap-3 px-4 py-3 items-center ${
+                  isLast ? "" : "border-b border-stone-100"
+                } ${idx % 2 === 1 ? "bg-stone-50/40" : ""}`}
+              >
+                <div className="text-sm font-medium text-stone-800">{tipo.nome}</div>
+                {GRUPOS_BANDEIRA_BLU.map((grupo) => {
+                  const valorAtual = rascunho?.[tipo.id]?.[grupo.id];
+                  const valorStr =
+                    valorAtual === null || valorAtual === undefined
+                      ? ""
+                      : String(valorAtual).replace(".", ",");
+                  return (
+                    <div key={grupo.id} className="flex items-center justify-center">
+                      <div className="relative w-32">
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={valorStr}
+                          onChange={(e) => onChangeTaxaBlu(tipo.id, grupo.id, e.target.value)}
+                          placeholder="—"
+                          className="w-full pl-3 pr-8 py-1.5 text-sm text-right border border-stone-300 rounded bg-white font-mono focus:outline-none focus:ring-2 focus:ring-amber-700/30 focus:border-amber-700"
+                        />
+                        <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-stone-400 text-sm pointer-events-none">
+                          %
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })}
         </div>
       )}
 
-      {/* Tabela de taxas (linhas = tipos, colunas = grupos de bandeira) */}
-      <div className="bg-white border border-stone-200 rounded-lg overflow-hidden">
-        <div className="grid grid-cols-[1fr_180px_180px] gap-3 px-4 py-2.5 bg-stone-50 border-b border-stone-200 text-[11px] uppercase tracking-wider font-semibold text-stone-600">
-          <div>Tipo de Operação</div>
-          {GRUPOS_BANDEIRA_BLU.map((g) => (
-            <div key={g.id} className="text-center">{g.nome}</div>
-          ))}
-        </div>
+      {/* === TABELA PAGUE VELOZ (22 linhas × 1 coluna: Taxa Pagar) === */}
+      {maquininhaAtiva === "pague_veloz" && (
+        <>
+          <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4 flex items-start gap-2 text-xs text-blue-900">
+            <AlertCircle className="w-4 h-4 text-blue-700 mt-0.5 flex-shrink-0" />
+            <div>
+              <p className="font-semibold mb-0.5">Como a Pague Veloz funciona</p>
+              <p>
+                A taxa cadastrada aqui é a <strong>"Taxa Pagar"</strong> (4ª coluna do print da PV) —
+                é a taxa final descontada do lojista. Como a PV não distingue por bandeira,
+                há uma única taxa por número de parcelas.
+              </p>
+            </div>
+          </div>
 
-        {TIPOS_OPERACAO_BLU.map((tipo, idx) => {
-          const isLast = idx === TIPOS_OPERACAO_BLU.length - 1;
-          return (
-            <div
-              key={tipo.id}
-              className={`grid grid-cols-[1fr_180px_180px] gap-3 px-4 py-3 items-center ${
-                isLast ? "" : "border-b border-stone-100"
-              } ${idx % 2 === 1 ? "bg-stone-50/40" : ""}`}
-            >
-              <div className="text-sm font-medium text-stone-800">{tipo.nome}</div>
-              {GRUPOS_BANDEIRA_BLU.map((grupo) => {
-                const valorAtual = rascunho?.[tipo.id]?.[grupo.id];
-                const valorStr =
-                  valorAtual === null || valorAtual === undefined
-                    ? ""
-                    : String(valorAtual).replace(".", ",");
-                return (
-                  <div key={grupo.id} className="flex items-center justify-center">
-                    <div className="relative w-32">
+          <div className="bg-white border border-stone-200 rounded-lg overflow-hidden">
+            <div className="grid grid-cols-[1fr_220px] gap-3 px-4 py-2.5 bg-stone-50 border-b border-stone-200 text-[11px] uppercase tracking-wider font-semibold text-stone-600">
+              <div>Parcelas</div>
+              <div className="text-center">Taxa Pagar</div>
+            </div>
+
+            {LINHAS_TAXAS_PV.map((linha, idx) => {
+              const isLast = idx === LINHAS_TAXAS_PV.length - 1;
+              const valorAtual = rascunho?.[linha.id];
+              const valorStr =
+                valorAtual === null || valorAtual === undefined
+                  ? ""
+                  : String(valorAtual).replace(".", ",");
+              return (
+                <div
+                  key={linha.id}
+                  className={`grid grid-cols-[1fr_220px] gap-3 px-4 py-2 items-center ${
+                    isLast ? "" : "border-b border-stone-100"
+                  } ${idx % 2 === 1 ? "bg-stone-50/40" : ""}`}
+                >
+                  <div className="text-sm font-medium text-stone-800">{linha.nome}</div>
+                  <div className="flex items-center justify-center">
+                    <div className="relative w-40">
                       <input
                         type="text"
                         inputMode="decimal"
                         value={valorStr}
-                        onChange={(e) => onChangeTaxa(tipo.id, grupo.id, e.target.value)}
+                        onChange={(e) => onChangeTaxaPV(linha.id, e.target.value)}
                         placeholder="—"
                         className="w-full pl-3 pr-8 py-1.5 text-sm text-right border border-stone-300 rounded bg-white font-mono focus:outline-none focus:ring-2 focus:ring-amber-700/30 focus:border-amber-700"
                       />
@@ -2732,18 +3005,18 @@ function TaxasModule({ taxasBlu, onSaveTaxasBlu }) {
                       </span>
                     </div>
                   </div>
-                );
-              })}
-            </div>
-          );
-        })}
-      </div>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
 
       {/* Botões de ação */}
       <div className="flex flex-wrap items-center gap-2 mt-4">
         <button
           onClick={salvar}
-          disabled={!hasChanges || saving || maquininhaAtiva !== "blu"}
+          disabled={!hasChanges || saving}
           className="flex items-center gap-1.5 px-4 py-2 text-sm bg-emerald-700 text-white font-medium rounded-md hover:bg-emerald-800 disabled:opacity-40 disabled:cursor-not-allowed"
         >
           {saving ? (
@@ -2760,17 +3033,15 @@ function TaxasModule({ taxasBlu, onSaveTaxasBlu }) {
         >
           Descartar
         </button>
-        {maquininhaAtiva === "blu" && (
-          <button
-            onClick={restaurarPadrao}
-            disabled={saving}
-            className="flex items-center gap-1.5 px-3 py-2 text-sm text-stone-600 border border-stone-300 rounded-md bg-white hover:bg-stone-50 ml-auto"
-            title="Restaura as taxas Blu padrão (do print que a Blu disponibilizou)"
-          >
-            <RotateCcw className="w-4 h-4" />
-            Restaurar padrão Blu
-          </button>
-        )}
+        <button
+          onClick={restaurarPadrao}
+          disabled={saving}
+          className="flex items-center gap-1.5 px-3 py-2 text-sm text-stone-600 border border-stone-300 rounded-md bg-white hover:bg-stone-50 ml-auto"
+          title={`Restaura as taxas ${maquininhaAtiva === "blu" ? "Blu" : "Pague Veloz"} para os valores padrão`}
+        >
+          <RotateCcw className="w-4 h-4" />
+          Restaurar padrão {maquininhaAtiva === "blu" ? "Blu" : "Pague Veloz"}
+        </button>
         {saveStatus && (
           <div
             className={`flex items-center gap-1.5 px-3 py-2 text-xs rounded-md ${
@@ -2902,8 +3173,8 @@ function FinanceiroModule() {
     );
   }
 
-  // === FLUXO BLU (maquininha) ===
-  if (bancoSelecionado.tipo === "blu") {
+  // === FLUXO MAQUININHA (Blu / Pague Veloz) ===
+  if (bancoSelecionado.tipo === "blu" || bancoSelecionado.tipo === "pague_veloz") {
     return <BluFlow banco={bancoSelecionado} onTrocar={trocarBanco} />;
   }
 
@@ -3333,24 +3604,32 @@ function BluFlow({ banco, onTrocar }) {
   const [error, setError] = useState("");
   const [activeView, setActiveView] = useState("conciliados");
   const [searchTerm, setSearchTerm] = useState("");
-  const { taxas: tabelaTaxas, loaded: taxasLoaded } = useTaxasBlu();
+  const { taxas: tabelaTaxasBlu, loaded: taxasBluLoaded } = useTaxasBlu();
+  const { taxas: tabelaTaxasPV, loaded: taxasPVLoaded } = useTaxasPagueVeloz();
+
+  // Identifica se estamos no fluxo Blu (Excel) ou Pague Veloz (CSV)
+  const ehPagueVeloz = banco.tipo === "pague_veloz";
+  const tabelaTaxas = ehPagueVeloz ? tabelaTaxasPV : tabelaTaxasBlu;
+  const taxasLoaded = ehPagueVeloz ? taxasPVLoaded : taxasBluLoaded;
 
   const handleBlu = async (f) => {
     setError("");
     setLoading(true);
     setBluFile(f);
     try {
-      const items = await readBluExcel(f);
+      const items = ehPagueVeloz ? await readPagueVelozCsv(f) : await readBluExcel(f);
       if (!items.length) {
         setError(
-          "Nenhuma venda foi extraída do Excel da Blu. Verifique se o arquivo é o extrato de vendas (extrato-vendas-completo-XXXX.xlsx)."
+          ehPagueVeloz
+            ? "Nenhuma venda foi extraída do CSV da Pague Veloz. Verifique se o arquivo é o relatório de operações (relatorio-operacoes.csv)."
+            : "Nenhuma venda foi extraída do Excel da Blu. Verifique se o arquivo é o extrato de vendas (extrato-vendas-completo-XXXX.xlsx)."
         );
         setBluFile(null);
       } else {
         setVendasBlu(items);
       }
     } catch (e) {
-      setError("Erro ao ler Excel da Blu: " + e.message);
+      setError(`Erro ao ler ${ehPagueVeloz ? "CSV da Pague Veloz" : "Excel da Blu"}: ` + e.message);
       setBluFile(null);
     } finally {
       setLoading(false);
@@ -3384,8 +3663,9 @@ function BluFlow({ banco, onTrocar }) {
   const result = useMemo(() => {
     if (!vendasBlu.length || !vendasErp.length) return null;
     if (!taxasLoaded) return null; // espera as taxas carregarem
-    return conciliarBlu(vendasBlu, vendasErp, 0.01, tabelaTaxas);
-  }, [vendasBlu, vendasErp, tabelaTaxas, taxasLoaded]);
+    const tipoMaq = ehPagueVeloz ? "pague_veloz" : "blu";
+    return conciliarBlu(vendasBlu, vendasErp, 0.01, tabelaTaxas, tipoMaq);
+  }, [vendasBlu, vendasErp, tabelaTaxas, taxasLoaded, ehPagueVeloz]);
 
   const filtrarLista = (items, getCampos) => {
     const t = searchTerm.toLowerCase().trim();
@@ -3584,12 +3864,12 @@ function BluFlow({ banco, onTrocar }) {
       (s, x) => s + (x.conferencia.diferenca / 100) * x.blu.valorBrutoTotal, 0
     );
     const wsResumo = XLSX.utils.aoa_to_sheet([
-      ["RESUMO DA CONCILIAÇÃO BLU"],
+      [`RESUMO DA CONCILIAÇÃO ${ehPagueVeloz ? "PAGUE VELOZ" : "BLU"}`],
       [],
       ["Maquininha", banco.nome],
       ["Data da conciliação", hoje],
       [],
-      ["Vendas no Excel da Blu", vendasBlu.length],
+      [`Vendas no ${ehPagueVeloz ? "CSV da Pague Veloz" : "Excel da Blu"}`, vendasBlu.length],
       ["Linhas no PDF do ERP", vendasErp.length],
       [],
       ["Conciliados (qtd)", result.conciliados.length],
@@ -3598,8 +3878,8 @@ function BluFlow({ banco, onTrocar }) {
       ["Só no ERP (qtd)", result.soNoErp.length],
       ["Só no ERP (valor total)", totalSoErp],
       [],
-      ["Só na Blu (qtd)", result.soNaBlu.length],
-      ["Só na Blu (valor total)", totalSoBlu],
+      [`Só na ${ehPagueVeloz ? "Pague Veloz" : "Blu"} (qtd)`, result.soNaBlu.length],
+      [`Só na ${ehPagueVeloz ? "Pague Veloz" : "Blu"} (valor total)`, totalSoBlu],
       [],
       ["Taxas fora da negociada (qtd)", result.taxasForaNegociada.length],
       ["Prejuízo estimado por taxas", Math.round(totalPrejuizoTaxas * 100) / 100],
@@ -3661,17 +3941,18 @@ function BluFlow({ banco, onTrocar }) {
         <p className="text-stone-600 mt-2 max-w-2xl">
           Compara as vendas registradas no <strong>ERP</strong> (forma de pagamento{" "}
           <strong>{banco.secaoPdf}</strong>) com o extrato de vendas da{" "}
-          <strong>maquininha Blu</strong>. O match é feito pelo NSU do cartão.
+          <strong>{ehPagueVeloz ? "maquininha Pague Veloz" : "maquininha Blu"}</strong>.
+          O match é feito pelo NSU do cartão.
         </p>
       </div>
 
       {/* Upload */}
       <div className="grid md:grid-cols-2 gap-4 mb-6">
         <FileDropZone
-          label="Excel da Blu"
-          sublabel="extrato-vendas-completo-XXXX.xlsx"
+          label={ehPagueVeloz ? "CSV da Pague Veloz" : "Excel da Blu"}
+          sublabel={ehPagueVeloz ? "relatorio-operacoes.csv" : "extrato-vendas-completo-XXXX.xlsx"}
           icon={CreditCard}
-          accept=".xlsx,.xls"
+          accept={ehPagueVeloz ? ".csv,.txt" : ".xlsx,.xls"}
           file={bluFile}
           onFile={handleBlu}
           onClear={() => {
@@ -3727,7 +4008,7 @@ function BluFlow({ banco, onTrocar }) {
               icon={XCircle}
             />
             <StatCard
-              label="Só na Blu"
+              label={ehPagueVeloz ? "Só na Pague Veloz" : "Só na Blu"}
               value={result.soNaBlu.length}
               sublabel={formatarMoeda(totais.soBlu)}
               accent="amber"
@@ -3782,7 +4063,7 @@ function BluFlow({ banco, onTrocar }) {
                     : "text-stone-600 hover:text-stone-900"
                 }`}
               >
-                Só na Blu ({result.soNaBlu.length})
+                {ehPagueVeloz ? "Só na Pague Veloz" : "Só na Blu"} ({result.soNaBlu.length})
               </button>
               {result.taxasForaNegociada.length > 0 && (
                 <button
@@ -3850,7 +4131,11 @@ function BluFlow({ banco, onTrocar }) {
             <BluSoBluList items={filteredSoBlu} />
           )}
           {activeView === "taxasFora" && (
-            <BluTaxasForaList items={filteredTaxasFora} tabelaTaxas={tabelaTaxas} />
+            <BluTaxasForaList
+              items={filteredTaxasFora}
+              tabelaTaxas={tabelaTaxas}
+              tipoMaquininha={ehPagueVeloz ? "pague_veloz" : "blu"}
+            />
           )}
           {activeView === "canceladas" && (
             <BluSoBluList items={filteredCanceladas} canceladas />
@@ -4073,13 +4358,13 @@ function BluSoErpList({ items }) {
   );
 }
 
-function BluSoBluList({ items, canceladas = false }) {
+function BluSoBluList({ items, canceladas = false, nomeMaquininha = "Blu" }) {
   if (!items.length) {
     return (
       <div className="text-center py-12">
         <CheckCircle2 className="w-10 h-10 text-emerald-600 mx-auto mb-3" />
         <p className="font-serif text-lg text-stone-800">
-          {canceladas ? "Nenhuma venda cancelada" : "Nenhuma venda só na Blu"}
+          {canceladas ? "Nenhuma venda cancelada" : `Nenhuma venda só na ${nomeMaquininha}`}
         </p>
       </div>
     );
@@ -4091,7 +4376,7 @@ function BluSoBluList({ items, canceladas = false }) {
         <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-3 flex items-start gap-2">
           <AlertCircle className="w-4 h-4 text-amber-700 mt-0.5 flex-shrink-0" />
           <div className="text-xs text-amber-900">
-            <p className="font-semibold mb-1">Vendas na Blu que não foram lançadas no ERP.</p>
+            <p className="font-semibold mb-1">Vendas na {nomeMaquininha} que não foram lançadas no ERP.</p>
             <p>Cada venda mostra o motivo da divergência: NSU divergente nos dois arquivos, sem correspondente no ERP, valor diferente ou mês diferente.</p>
           </div>
         </div>
@@ -4141,7 +4426,7 @@ function BluSoBluList({ items, canceladas = false }) {
                   NSU: <span className="font-mono">{v.autorizacao}</span>
                 </h3>
                 <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-600 mt-1">
-                  <span>NSU interno Blu: <strong className="font-mono text-stone-900">{v.nsu}</strong></span>
+                  <span>ID interno {nomeMaquininha}: <strong className="font-mono text-stone-900">{v.nsu}</strong></span>
                   <span>Terminal: <strong className="font-mono text-stone-900">{v.terminal}</strong></span>
                 </div>
                 {!canceladas && v.motivoDetalhe && (
@@ -4175,7 +4460,7 @@ function BluSoBluList({ items, canceladas = false }) {
 }
 
 // Lista de vendas com taxa cobrada acima da negociada
-function BluTaxasForaList({ items, tabelaTaxas }) {
+function BluTaxasForaList({ items, tabelaTaxas, tipoMaquininha = "blu" }) {
   if (!items.length) {
     return (
       <div className="text-center py-12">
@@ -4189,15 +4474,22 @@ function BluTaxasForaList({ items, tabelaTaxas }) {
   }
 
   // Map dos nomes amigáveis dos tipos/grupos para legendar
-  const nomesTipo = Object.fromEntries(TIPOS_OPERACAO_BLU.map((t) => [t.id, t.nome]));
-  const nomesGrupo = Object.fromEntries(GRUPOS_BANDEIRA_BLU.map((g) => [g.id, g.nome]));
+  // Blu: 6 tipos × 2 grupos. PV: 22 linhas, sem grupo.
+  const ehPV = tipoMaquininha === "pague_veloz";
+  const nomesTipo = ehPV
+    ? Object.fromEntries(LINHAS_TAXAS_PV.map((l) => [l.id, l.nome]))
+    : Object.fromEntries(TIPOS_OPERACAO_BLU.map((t) => [t.id, t.nome]));
+  const nomesGrupo = ehPV
+    ? {}
+    : Object.fromEntries(GRUPOS_BANDEIRA_BLU.map((g) => [g.id, g.nome]));
+  const nomeMaquininha = ehPV ? "Pague Veloz" : "Blu";
 
   return (
     <div className="space-y-2">
       <div className="bg-orange-50 border border-orange-300 rounded-lg p-3 mb-3 flex items-start gap-2">
         <AlertCircle className="w-4 h-4 text-orange-700 mt-0.5 flex-shrink-0" />
         <div className="text-xs text-orange-900">
-          <p className="font-semibold mb-1">Vendas em que a Blu cobrou taxa MAIOR que a negociada.</p>
+          <p className="font-semibold mb-1">Vendas em que a {nomeMaquininha} cobrou taxa MAIOR que a negociada.</p>
           <p>A diferença está em <strong>pontos percentuais (pp)</strong>. Para corrigir os valores acordados, vá em <strong>Tabelas de Taxas de Cartões</strong> no menu lateral.</p>
         </div>
       </div>
@@ -4205,7 +4497,8 @@ function BluTaxasForaList({ items, tabelaTaxas }) {
       {items.map((x, i) => {
         const c = x.conferencia;
         const tipoNome = nomesTipo[c.tipoId] || c.tipoId;
-        const grupoNome = nomesGrupo[c.grupoId] || c.grupoId;
+        const grupoNome = nomesGrupo[c.grupoId] || "";
+        const faixaTexto = ehPV ? tipoNome : `${tipoNome} / ${grupoNome}`;
         const prejuizoVenda = (c.diferenca / 100) * x.blu.valorBrutoTotal;
 
         return (
@@ -4238,7 +4531,7 @@ function BluTaxasForaList({ items, tabelaTaxas }) {
                 <div className="mt-2 text-xs px-3 py-2 rounded border bg-orange-50 border-orange-200 text-orange-900">
                   <strong>Taxa cobrada: {c.taxaCobrada.toFixed(2).replace(".", ",")}%</strong>
                   {" — "}
-                  Tabela negociada para <strong>{tipoNome} / {grupoNome}</strong>: {c.taxaNegociada.toFixed(2).replace(".", ",")}%.
+                  Tabela negociada para <strong>{faixaTexto}</strong>: {c.taxaNegociada.toFixed(2).replace(".", ",")}%.
                   {" "}
                   Diferença de <strong>+{c.diferenca.toFixed(2).replace(".", ",")} pp</strong>
                   {" "}
@@ -4484,6 +4777,7 @@ export default function App() {
   const [activeModule, setActiveModule] = useState("conciliacao");
   const { table: colorTable, save: saveColorTable, loaded: colorsLoaded } = useColorTable();
   const { taxas: taxasBlu, save: saveTaxasBlu, loaded: taxasBluLoaded } = useTaxasBlu();
+  const { taxas: taxasPV, save: saveTaxasPV, loaded: taxasPVLoaded } = useTaxasPagueVeloz();
 
   const modules = [
     {
@@ -4626,10 +4920,15 @@ export default function App() {
             </div>
           )}
           {activeModule === "financeiro" && <FinanceiroModule />}
-          {activeModule === "taxas" && taxasBluLoaded && (
-            <TaxasModule taxasBlu={taxasBlu} onSaveTaxasBlu={saveTaxasBlu} />
+          {activeModule === "taxas" && taxasBluLoaded && taxasPVLoaded && (
+            <TaxasModule
+              taxasBlu={taxasBlu}
+              onSaveTaxasBlu={saveTaxasBlu}
+              taxasPV={taxasPV}
+              onSaveTaxasPV={saveTaxasPV}
+            />
           )}
-          {activeModule === "taxas" && !taxasBluLoaded && (
+          {activeModule === "taxas" && (!taxasBluLoaded || !taxasPVLoaded) && (
             <div className="flex items-center gap-2 text-stone-500 justify-center py-20">
               <Loader2 className="w-5 h-5 animate-spin" />
               Carregando taxas…
