@@ -2061,7 +2061,134 @@ function useTaxasPagueVeloz() {
 }
 
 // ============================================================
-// HASH ROUTING
+// HOOK: Contexto do usuário (grupo + lojas + permissões)
+// ============================================================
+//
+// ETAPA C: Carrega informações do usuário logado:
+//   • É admin? (campo is_admin em user_permissions)
+//   • Em qual grupo está? (tabela usuarios_grupos)
+//   • Em quais lojas tem acesso? (tabela usuarios_lojas)
+//   • Tem acesso ao Escritório? (uma das lojas dele tem eh_escritorio=true)
+//
+// Tudo isso é usado pra decidir o que mostrar pro usuário no menu e
+// quais botões habilitar/bloquear nos módulos.
+// ============================================================
+
+function useUserContext(user) {
+  const [ctx, setCtx] = useState({
+    loading: true,
+    isAdmin: false,
+    grupoId: null,
+    grupoNome: null,
+    permissoes: { conciliacao: "sem_acesso", cores: "sem_acesso", taxas: "sem_acesso", financeiro: "sem_acesso" },
+    lojas: [],            // [{ id, nome, eh_escritorio }, ...]
+    estaNoEscritorio: false,
+    error: null,
+  });
+
+  const carregar = useCallback(async () => {
+    if (!user) {
+      setCtx((c) => ({ ...c, loading: false }));
+      return;
+    }
+    try {
+      // 1) Verifica se é admin
+      const { data: permRow } = await supabase
+        .from("user_permissions")
+        .select("is_admin")
+        .eq("user_id", user.id)
+        .maybeSingle();
+      const isAdmin = !!permRow?.is_admin;
+
+      // 2) Busca grupo do usuário (se houver)
+      const { data: grupoRow } = await supabase
+        .from("usuarios_grupos")
+        .select("grupo_id, grupos ( id, nome, permissoes )")
+        .eq("user_id", user.id)
+        .maybeSingle();
+
+      const grupoId = grupoRow?.grupos?.id || null;
+      const grupoNome = grupoRow?.grupos?.nome || null;
+      const permissoesGrupo = grupoRow?.grupos?.permissoes || {};
+
+      // Permissões finais: admin sempre vê tudo; senão, usa as do grupo
+      const permissoes = isAdmin
+        ? { conciliacao: "editar", cores: "editar", taxas: "editar", financeiro: "editar" }
+        : {
+            conciliacao: permissoesGrupo.conciliacao || "sem_acesso",
+            cores:       permissoesGrupo.cores       || "sem_acesso",
+            taxas:       permissoesGrupo.taxas       || "sem_acesso",
+            financeiro:  permissoesGrupo.financeiro  || "sem_acesso",
+          };
+
+      // 3) Busca lojas do usuário
+      // Admin: vê todas as lojas ativas. Senão: só as cadastradas
+      let lojas = [];
+      if (isAdmin) {
+        const { data } = await supabase
+          .from("lojas")
+          .select("id, nome, eh_escritorio")
+          .eq("ativa", true)
+          .order("nome");
+        lojas = data || [];
+      } else {
+        const { data } = await supabase
+          .from("usuarios_lojas")
+          .select("loja_id, lojas ( id, nome, eh_escritorio, ativa )")
+          .eq("user_id", user.id);
+        lojas = (data || [])
+          .map((r) => r.lojas)
+          .filter((l) => l && l.ativa)
+          .map((l) => ({ id: l.id, nome: l.nome, eh_escritorio: l.eh_escritorio }))
+          .sort((a, b) => a.nome.localeCompare(b.nome));
+      }
+
+      const estaNoEscritorio = isAdmin || lojas.some((l) => l.eh_escritorio);
+
+      setCtx({
+        loading: false,
+        isAdmin,
+        grupoId,
+        grupoNome,
+        permissoes,
+        lojas,
+        estaNoEscritorio,
+        error: null,
+      });
+
+      console.log("[UserContext] Carregado:", {
+        email: user.email,
+        isAdmin,
+        grupoNome,
+        permissoes,
+        lojas: lojas.map((l) => l.nome),
+        estaNoEscritorio,
+      });
+    } catch (e) {
+      console.error("[UserContext] Erro:", e);
+      setCtx((c) => ({ ...c, loading: false, error: e.message }));
+    }
+  }, [user]);
+
+  useEffect(() => {
+    carregar();
+  }, [carregar]);
+
+  const reload = useCallback(() => carregar(), [carregar]);
+
+  return { ...ctx, reload };
+}
+
+// Helpers pra interpretar permissões
+function podeVerModulo(permissoes, modulo) {
+  return permissoes?.[modulo] === "visualizar" || permissoes?.[modulo] === "editar";
+}
+
+function podeEditarModulo(permissoes, modulo) {
+  return permissoes?.[modulo] === "editar";
+}
+
+
 // Converte a URL hash em { module, bancoId } e vice-versa.
 // Formato: #/<module>[/<bancoId>]
 // Exemplos:
@@ -2072,7 +2199,7 @@ function useTaxasPagueVeloz() {
 //   #/taxas                              → tabelas de taxas
 // ============================================================
 
-const ROTAS_VALIDAS = ["conciliacao", "cores", "financeiro", "taxas", "estoque", "relatorios", "config"];
+const ROTAS_VALIDAS = ["conciliacao", "cores", "financeiro", "taxas", "permissoes", "estoque", "relatorios", "config"];
 const BANCOS_VALIDOS = ["sicredi", "blu_ss", "blu_lupe", "pague_veloz_express", "pague_veloz_pix"];
 
 function parseHashRoute(hash) {
@@ -5906,6 +6033,922 @@ function DivergenciaSimplesList({ items, cor }) {
   );
 }
 
+function PermissoesModule() {
+  // Aba ativa: "grupos" | "lojas" | "usuarios"
+  const [aba, setAba] = useState("usuarios");
+  const [loadingInicial, setLoadingInicial] = useState(true);
+  const [error, setError] = useState(null);
+
+  // Dados carregados do servidor
+  const [grupos, setGrupos] = useState([]);
+  const [lojas, setLojas] = useState([]);
+  const [usuariosCadastrados, setUsuariosCadastrados] = useState([]); // já têm grupo
+  const [usuariosDisponiveis, setUsuariosDisponiveis] = useState([]); // novos cadastros sem grupo
+
+  // Carrega tudo
+  const carregar = useCallback(async () => {
+    setError(null);
+    try {
+      const [resGrupos, resLojas, resUsuariosCom, resUsuariosSem] = await Promise.all([
+        supabase.from("grupos").select("id, nome, descricao, permissoes").order("nome"),
+        supabase.from("lojas").select("id, nome, eh_escritorio, ativa").order("nome"),
+        supabase.from("vw_usuarios_completo").select("user_id, email, grupo_id, grupo_nome, lojas_ids, lojas_nomes"),
+        supabase.from("vw_usuarios_disponiveis").select("user_id, email, cadastrado_em"),
+      ]);
+
+      if (resGrupos.error) throw resGrupos.error;
+      if (resLojas.error) throw resLojas.error;
+      if (resUsuariosCom.error) throw resUsuariosCom.error;
+      if (resUsuariosSem.error) throw resUsuariosSem.error;
+
+      setGrupos(resGrupos.data || []);
+      setLojas(resLojas.data || []);
+      setUsuariosCadastrados(resUsuariosCom.data || []);
+      setUsuariosDisponiveis(resUsuariosSem.data || []);
+    } catch (e) {
+      console.error("[Permissoes] Erro ao carregar:", e);
+      setError("Erro ao carregar dados: " + e.message);
+    } finally {
+      setLoadingInicial(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    carregar();
+  }, [carregar]);
+
+  if (loadingInicial) {
+    return (
+      <div className="flex items-center gap-2 text-stone-500 justify-center py-20">
+        <Loader2 className="w-5 h-5 animate-spin" />
+        Carregando permissões…
+      </div>
+    );
+  }
+
+  return (
+    <div className="max-w-6xl mx-auto">
+      <div className="mb-8 border-b border-stone-200 pb-6">
+        <div className="flex items-baseline gap-3 mb-2">
+          <span className="text-xs uppercase tracking-[0.2em] text-red-700 font-semibold">
+            Administração
+          </span>
+          <span className="text-stone-300">—</span>
+          <span className="text-xs uppercase tracking-wider text-stone-500">
+            Acessos e Permissões
+          </span>
+        </div>
+        <h1 className="font-serif text-4xl font-bold text-stone-900 tracking-tight">
+          Gerenciar Permissões
+        </h1>
+        <p className="text-stone-600 mt-2 max-w-2xl">
+          Controle quem pode acessar cada módulo do app. Crie grupos, defina o que cada
+          grupo pode fazer e atribua usuários a grupos e lojas.
+        </p>
+      </div>
+
+      {error && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-4 flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 text-red-700 mt-0.5 flex-shrink-0" />
+          <p className="text-sm text-red-900">{error}</p>
+        </div>
+      )}
+
+      {/* Abas */}
+      <div className="flex bg-stone-100 rounded-md p-1 mb-6 inline-flex">
+        <button
+          onClick={() => setAba("usuarios")}
+          className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
+            aba === "usuarios" ? "bg-white text-red-800 shadow-sm" : "text-stone-600 hover:text-stone-900"
+          }`}
+        >
+          Usuários ({usuariosCadastrados.length})
+          {usuariosDisponiveis.length > 0 && (
+            <span className="ml-2 inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 text-[10px] font-bold rounded-full bg-red-600 text-white">
+              {usuariosDisponiveis.length}
+            </span>
+          )}
+        </button>
+        <button
+          onClick={() => setAba("grupos")}
+          className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
+            aba === "grupos" ? "bg-white text-red-800 shadow-sm" : "text-stone-600 hover:text-stone-900"
+          }`}
+        >
+          Grupos ({grupos.length})
+        </button>
+        <button
+          onClick={() => setAba("lojas")}
+          className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
+            aba === "lojas" ? "bg-white text-red-800 shadow-sm" : "text-stone-600 hover:text-stone-900"
+          }`}
+        >
+          Lojas ({lojas.length})
+        </button>
+      </div>
+
+      {aba === "usuarios" && (
+        <UsuariosTab
+          usuariosCadastrados={usuariosCadastrados}
+          usuariosDisponiveis={usuariosDisponiveis}
+          grupos={grupos}
+          lojas={lojas}
+          onChange={carregar}
+        />
+      )}
+
+      {aba === "grupos" && (
+        <GruposTab grupos={grupos} onChange={carregar} />
+      )}
+
+      {aba === "lojas" && (
+        <LojasTab lojas={lojas} onChange={carregar} />
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// Aba USUÁRIOS — atribuir grupo + lojas a cada usuário cadastrado
+// ============================================================
+
+function UsuariosTab({ usuariosCadastrados, usuariosDisponiveis, grupos, lojas, onChange }) {
+  const [editando, setEditando] = useState(null); // user_id sendo editado
+  const [draftGrupoId, setDraftGrupoId] = useState(null);
+  const [draftLojasIds, setDraftLojasIds] = useState([]);
+  const [salvando, setSalvando] = useState(false);
+  const [erroLinha, setErroLinha] = useState(null);
+
+  const iniciarEdicao = (u, ehNovo) => {
+    setEditando(u.user_id);
+    setErroLinha(null);
+    if (ehNovo) {
+      setDraftGrupoId(grupos[0]?.id || null);
+      setDraftLojasIds([]);
+    } else {
+      setDraftGrupoId(u.grupo_id);
+      setDraftLojasIds(u.lojas_ids || []);
+    }
+  };
+
+  const cancelarEdicao = () => {
+    setEditando(null);
+    setDraftGrupoId(null);
+    setDraftLojasIds([]);
+    setErroLinha(null);
+  };
+
+  const toggleLoja = (lojaId) => {
+    setDraftLojasIds((prev) =>
+      prev.includes(lojaId) ? prev.filter((id) => id !== lojaId) : [...prev, lojaId]
+    );
+  };
+
+  const salvar = async (userId) => {
+    setSalvando(true);
+    setErroLinha(null);
+    try {
+      // 1) Define o grupo (upsert na tabela usuarios_grupos)
+      const { error: errGrupo } = await supabase
+        .from("usuarios_grupos")
+        .upsert({ user_id: userId, grupo_id: draftGrupoId, updated_at: new Date().toISOString() });
+      if (errGrupo) throw errGrupo;
+
+      // 2) Reseta as lojas: apaga as antigas e insere as novas
+      const { error: errDel } = await supabase
+        .from("usuarios_lojas")
+        .delete()
+        .eq("user_id", userId);
+      if (errDel) throw errDel;
+
+      if (draftLojasIds.length > 0) {
+        const linhas = draftLojasIds.map((lojaId) => ({ user_id: userId, loja_id: lojaId }));
+        const { error: errIns } = await supabase.from("usuarios_lojas").insert(linhas);
+        if (errIns) throw errIns;
+      }
+
+      cancelarEdicao();
+      onChange();
+    } catch (e) {
+      console.error("[UsuariosTab] Erro ao salvar:", e);
+      if (e.message?.includes("policy") || e.code === "42501") {
+        setErroLinha("Sem permissão. Apenas admin pode alterar permissões.");
+      } else {
+        setErroLinha("Erro ao salvar: " + e.message);
+      }
+    } finally {
+      setSalvando(false);
+    }
+  };
+
+  const remover = async (userId, email) => {
+    if (!confirm(`Remover acesso de ${email}?\n\nO usuário não vai poder mais usar o app até ser adicionado a um grupo de novo.`)) return;
+    setSalvando(true);
+    try {
+      await supabase.from("usuarios_lojas").delete().eq("user_id", userId);
+      const { error } = await supabase.from("usuarios_grupos").delete().eq("user_id", userId);
+      if (error) throw error;
+      onChange();
+    } catch (e) {
+      alert("Erro ao remover: " + e.message);
+    } finally {
+      setSalvando(false);
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* Usuários novos esperando atribuição */}
+      {usuariosDisponiveis.length > 0 && (
+        <div>
+          <h2 className="font-serif text-lg font-semibold text-stone-900 mb-3 flex items-center gap-2">
+            <span className="inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 text-[10px] font-bold rounded-full bg-red-600 text-white">
+              {usuariosDisponiveis.length}
+            </span>
+            Esperando liberação de acesso
+          </h2>
+          <p className="text-xs text-stone-600 mb-3">
+            Estes usuários se cadastraram e ainda não têm grupo. Atribua um grupo + lojas pra liberar o acesso.
+          </p>
+          <div className="space-y-2">
+            {usuariosDisponiveis.map((u) => (
+              <UsuarioCard
+                key={u.user_id}
+                u={u}
+                ehNovo={true}
+                grupos={grupos}
+                lojas={lojas}
+                editando={editando === u.user_id}
+                draftGrupoId={draftGrupoId}
+                draftLojasIds={draftLojasIds}
+                erroLinha={erroLinha}
+                salvando={salvando}
+                onChangeGrupo={setDraftGrupoId}
+                onToggleLoja={toggleLoja}
+                onIniciarEdicao={() => iniciarEdicao(u, true)}
+                onCancelar={cancelarEdicao}
+                onSalvar={() => salvar(u.user_id)}
+                onRemover={null}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Usuários já cadastrados */}
+      <div>
+        <h2 className="font-serif text-lg font-semibold text-stone-900 mb-3">
+          Usuários com acesso
+        </h2>
+        {usuariosCadastrados.length === 0 ? (
+          <div className="text-center py-12 bg-stone-50 rounded-lg text-stone-500 text-sm">
+            Nenhum usuário com acesso ainda.
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {usuariosCadastrados.map((u) => (
+              <UsuarioCard
+                key={u.user_id}
+                u={u}
+                ehNovo={false}
+                grupos={grupos}
+                lojas={lojas}
+                editando={editando === u.user_id}
+                draftGrupoId={draftGrupoId}
+                draftLojasIds={draftLojasIds}
+                erroLinha={erroLinha}
+                salvando={salvando}
+                onChangeGrupo={setDraftGrupoId}
+                onToggleLoja={toggleLoja}
+                onIniciarEdicao={() => iniciarEdicao(u, false)}
+                onCancelar={cancelarEdicao}
+                onSalvar={() => salvar(u.user_id)}
+                onRemover={() => remover(u.user_id, u.email)}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function UsuarioCard({
+  u, ehNovo, grupos, lojas, editando,
+  draftGrupoId, draftLojasIds, erroLinha, salvando,
+  onChangeGrupo, onToggleLoja, onIniciarEdicao, onCancelar, onSalvar, onRemover,
+}) {
+  return (
+    <div className={`border rounded-lg bg-white overflow-hidden ${editando ? "border-red-300 shadow-md" : "border-stone-200"}`}>
+      <div className="p-4">
+        <div className="flex items-start justify-between gap-3 mb-2">
+          <div className="flex-1 min-w-0">
+            <p className="font-serif text-sm font-semibold text-stone-900 truncate">{u.email}</p>
+            {!editando && !ehNovo && (
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-600 mt-1">
+                <span>Grupo: <strong className="text-red-800">{u.grupo_nome}</strong></span>
+                {u.lojas_nomes ? (
+                  <span>Lojas: <strong className="text-stone-900">{u.lojas_nomes}</strong></span>
+                ) : (
+                  <span className="text-amber-700">⚠ Sem lojas atribuídas</span>
+                )}
+              </div>
+            )}
+            {ehNovo && !editando && (
+              <p className="text-xs text-stone-500 mt-0.5">Aguardando atribuição</p>
+            )}
+          </div>
+          {!editando && (
+            <div className="flex gap-2 flex-shrink-0">
+              <button
+                onClick={onIniciarEdicao}
+                className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-red-800 border border-red-200 rounded-md hover:bg-red-50"
+              >
+                <Pencil className="w-3 h-3" />
+                {ehNovo ? "Atribuir" : "Editar"}
+              </button>
+              {onRemover && (
+                <button
+                  onClick={onRemover}
+                  disabled={salvando}
+                  className="p-1.5 text-stone-500 hover:bg-red-50 hover:text-red-700 rounded-md"
+                  title="Remover acesso"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+
+        {editando && (
+          <div className="space-y-3 mt-3 pt-3 border-t border-stone-100">
+            {/* Seleção de grupo */}
+            <div>
+              <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+                Grupo
+              </label>
+              <select
+                value={draftGrupoId || ""}
+                onChange={(e) => onChangeGrupo(parseInt(e.target.value) || null)}
+                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-red-700/30 focus:border-red-700"
+              >
+                {grupos.map((g) => (
+                  <option key={g.id} value={g.id}>{g.nome}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Seleção de lojas */}
+            <div>
+              <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+                Lojas (selecione uma ou mais)
+              </label>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                {lojas.filter((l) => l.ativa).map((l) => (
+                  <label
+                    key={l.id}
+                    className={`flex items-center gap-2 px-3 py-2 text-sm border rounded cursor-pointer transition-colors ${
+                      draftLojasIds.includes(l.id)
+                        ? "bg-red-50 border-red-300 text-red-900"
+                        : "bg-white border-stone-200 text-stone-700 hover:bg-stone-50"
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={draftLojasIds.includes(l.id)}
+                      onChange={() => onToggleLoja(l.id)}
+                      className="w-3.5 h-3.5 accent-red-700"
+                    />
+                    <span className="flex-1">
+                      {l.nome}
+                      {l.eh_escritorio && (
+                        <span className="ml-1 text-[10px] text-red-700 font-semibold">★</span>
+                      )}
+                    </span>
+                  </label>
+                ))}
+              </div>
+              <p className="text-xs text-stone-500 mt-2">
+                <span className="text-red-700 font-semibold">★</span> Escritório libera os módulos administrativos
+              </p>
+            </div>
+
+            {erroLinha && (
+              <div className="bg-red-50 border border-red-200 rounded-md p-2 text-xs text-red-900">
+                {erroLinha}
+              </div>
+            )}
+
+            <div className="flex gap-2 pt-2">
+              <button
+                onClick={onSalvar}
+                disabled={salvando || !draftGrupoId}
+                className="flex items-center gap-1.5 px-4 py-2 text-sm bg-emerald-700 text-white font-medium rounded-md hover:bg-emerald-800 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {salvando ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                Salvar
+              </button>
+              <button
+                onClick={onCancelar}
+                disabled={salvando}
+                className="px-3 py-2 text-sm text-stone-600 hover:text-stone-900"
+              >
+                Cancelar
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// Aba GRUPOS — criar/editar grupos e configurar permissões
+// ============================================================
+
+const MODULOS_PERMISSAO = [
+  { id: "conciliacao", nome: "Conciliação dos Pedidos" },
+  { id: "cores",       nome: "Tabela de Cores" },
+  { id: "taxas",       nome: "Tabelas de Taxas" },
+  { id: "financeiro",  nome: "Conciliação Financeira" },
+];
+
+const NIVEIS_PERMISSAO = [
+  { id: "sem_acesso", nome: "Sem acesso", cor: "stone" },
+  { id: "visualizar", nome: "Visualizar", cor: "amber" },
+  { id: "editar",     nome: "Editar",     cor: "emerald" },
+];
+
+function GruposTab({ grupos, onChange }) {
+  const [editando, setEditando] = useState(null); // grupo.id sendo editado
+  const [draft, setDraft] = useState(null);
+  const [adicionando, setAdicionando] = useState(false);
+  const [salvando, setSalvando] = useState(false);
+  const [erroLinha, setErroLinha] = useState(null);
+
+  const iniciarEdicao = (g) => {
+    setEditando(g.id);
+    setErroLinha(null);
+    setDraft({
+      id: g.id,
+      nome: g.nome,
+      descricao: g.descricao || "",
+      permissoes: { ...g.permissoes },
+    });
+  };
+
+  const iniciarAdicao = () => {
+    setAdicionando(true);
+    setErroLinha(null);
+    setDraft({
+      nome: "",
+      descricao: "",
+      permissoes: { conciliacao: "sem_acesso", cores: "sem_acesso", taxas: "sem_acesso", financeiro: "sem_acesso" },
+    });
+  };
+
+  const cancelar = () => {
+    setEditando(null);
+    setAdicionando(false);
+    setDraft(null);
+    setErroLinha(null);
+  };
+
+  const setPermissao = (modulo, nivel) => {
+    setDraft((d) => ({ ...d, permissoes: { ...d.permissoes, [modulo]: nivel } }));
+  };
+
+  const salvar = async () => {
+    if (!draft.nome.trim()) return;
+    setSalvando(true);
+    setErroLinha(null);
+    try {
+      if (adicionando) {
+        const { error } = await supabase
+          .from("grupos")
+          .insert({ nome: draft.nome.trim(), descricao: draft.descricao.trim() || null, permissoes: draft.permissoes });
+        if (error) throw error;
+      } else {
+        const { error } = await supabase
+          .from("grupos")
+          .update({
+            nome: draft.nome.trim(),
+            descricao: draft.descricao.trim() || null,
+            permissoes: draft.permissoes,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", draft.id);
+        if (error) throw error;
+      }
+      cancelar();
+      onChange();
+    } catch (e) {
+      if (e.message?.includes("policy") || e.code === "42501") {
+        setErroLinha("Sem permissão. Apenas admin pode alterar grupos.");
+      } else if (e.code === "23505") {
+        setErroLinha("Já existe um grupo com esse nome.");
+      } else {
+        setErroLinha("Erro ao salvar: " + e.message);
+      }
+    } finally {
+      setSalvando(false);
+    }
+  };
+
+  const remover = async (g) => {
+    if (!confirm(`Remover o grupo "${g.nome}"?\n\nUsuários neste grupo perderão acesso. Não pode desfazer.`)) return;
+    setSalvando(true);
+    try {
+      const { error } = await supabase.from("grupos").delete().eq("id", g.id);
+      if (error) {
+        if (error.code === "23503") {
+          alert("Não é possível remover este grupo porque há usuários nele. Remova os usuários primeiro.");
+        } else {
+          alert("Erro ao remover: " + error.message);
+        }
+        return;
+      }
+      onChange();
+    } finally {
+      setSalvando(false);
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      {!adicionando && !editando && (
+        <button
+          onClick={iniciarAdicao}
+          className="flex items-center gap-2 px-4 py-2 text-sm font-medium bg-red-700 text-white rounded-md hover:bg-red-800 transition-colors"
+        >
+          <Plus className="w-4 h-4" />
+          Novo grupo
+        </button>
+      )}
+
+      {(adicionando || editando) && draft && (
+        <GrupoEditor
+          draft={draft}
+          ehNovo={adicionando}
+          erroLinha={erroLinha}
+          salvando={salvando}
+          onChangeNome={(v) => setDraft({ ...draft, nome: v })}
+          onChangeDescricao={(v) => setDraft({ ...draft, descricao: v })}
+          onSetPermissao={setPermissao}
+          onSalvar={salvar}
+          onCancelar={cancelar}
+        />
+      )}
+
+      <div className="space-y-2">
+        {grupos.map((g) => (
+          <div key={g.id} className="border border-stone-200 bg-white rounded-lg p-4">
+            <div className="flex items-start justify-between gap-3 mb-2">
+              <div className="flex-1 min-w-0">
+                <h3 className="font-serif text-base font-semibold text-stone-900">{g.nome}</h3>
+                {g.descricao && <p className="text-xs text-stone-600 mt-0.5">{g.descricao}</p>}
+              </div>
+              <div className="flex gap-2 flex-shrink-0">
+                <button
+                  onClick={() => iniciarEdicao(g)}
+                  disabled={editando || adicionando}
+                  className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-red-800 border border-red-200 rounded-md hover:bg-red-50 disabled:opacity-40"
+                >
+                  <Pencil className="w-3 h-3" />
+                  Editar
+                </button>
+                <button
+                  onClick={() => remover(g)}
+                  disabled={editando || adicionando || salvando}
+                  className="p-1.5 text-stone-500 hover:bg-red-50 hover:text-red-700 rounded-md disabled:opacity-40"
+                  title="Remover grupo"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 mt-3">
+              {MODULOS_PERMISSAO.map((m) => {
+                const nivel = g.permissoes?.[m.id] || "sem_acesso";
+                const corBg = nivel === "editar" ? "bg-emerald-50 border-emerald-200 text-emerald-800"
+                            : nivel === "visualizar" ? "bg-amber-50 border-amber-200 text-amber-800"
+                            : "bg-stone-50 border-stone-200 text-stone-500";
+                const labelNivel = nivel === "editar" ? "Editar"
+                                 : nivel === "visualizar" ? "Visualizar" : "Sem acesso";
+                return (
+                  <div key={m.id} className={`text-xs border rounded px-2 py-1.5 ${corBg}`}>
+                    <p className="font-medium truncate">{m.nome}</p>
+                    <p className="text-[10px] opacity-80">{labelNivel}</p>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function GrupoEditor({ draft, ehNovo, erroLinha, salvando, onChangeNome, onChangeDescricao, onSetPermissao, onSalvar, onCancelar }) {
+  return (
+    <div className="border-2 border-red-300 bg-red-50/30 rounded-lg p-4 space-y-4">
+      <h3 className="font-serif text-lg font-semibold text-stone-900">
+        {ehNovo ? "Novo grupo" : "Editar grupo"}
+      </h3>
+
+      <div>
+        <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+          Nome do grupo
+        </label>
+        <input
+          type="text"
+          value={draft.nome}
+          onChange={(e) => onChangeNome(e.target.value)}
+          placeholder="Ex: GERENTES"
+          autoFocus
+          className="w-full px-3 py-2 text-sm border border-stone-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-red-700/30 focus:border-red-700"
+        />
+      </div>
+
+      <div>
+        <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+          Descrição (opcional)
+        </label>
+        <input
+          type="text"
+          value={draft.descricao}
+          onChange={(e) => onChangeDescricao(e.target.value)}
+          placeholder="Ex: Equipe de gerentes"
+          className="w-full px-3 py-2 text-sm border border-stone-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-red-700/30 focus:border-red-700"
+        />
+      </div>
+
+      <div>
+        <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-2 block">
+          Permissões por módulo
+        </label>
+        <div className="space-y-2">
+          {MODULOS_PERMISSAO.map((m) => (
+            <div key={m.id} className="flex items-center gap-3 bg-white border border-stone-200 rounded-md p-2">
+              <span className="flex-1 text-sm text-stone-800">{m.nome}</span>
+              <div className="flex gap-1">
+                {NIVEIS_PERMISSAO.map((n) => {
+                  const ativo = draft.permissoes[m.id] === n.id;
+                  return (
+                    <button
+                      key={n.id}
+                      onClick={() => onSetPermissao(m.id, n.id)}
+                      className={`px-2.5 py-1 text-xs font-medium rounded transition-colors ${
+                        ativo
+                          ? n.id === "editar" ? "bg-emerald-700 text-white"
+                            : n.id === "visualizar" ? "bg-amber-600 text-white"
+                            : "bg-stone-600 text-white"
+                          : "bg-stone-100 text-stone-600 hover:bg-stone-200"
+                      }`}
+                    >
+                      {n.nome}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {erroLinha && (
+        <div className="bg-red-50 border border-red-200 rounded-md p-2 text-xs text-red-900">
+          {erroLinha}
+        </div>
+      )}
+
+      <div className="flex gap-2">
+        <button
+          onClick={onSalvar}
+          disabled={salvando || !draft.nome.trim()}
+          className="flex items-center gap-1.5 px-4 py-2 text-sm bg-emerald-700 text-white font-medium rounded-md hover:bg-emerald-800 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          {salvando ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+          Salvar
+        </button>
+        <button
+          onClick={onCancelar}
+          disabled={salvando}
+          className="px-3 py-2 text-sm text-stone-600 hover:text-stone-900"
+        >
+          Cancelar
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// Aba LOJAS — criar/editar lojas
+// ============================================================
+
+function LojasTab({ lojas, onChange }) {
+  const [editando, setEditando] = useState(null);
+  const [draft, setDraft] = useState(null);
+  const [adicionando, setAdicionando] = useState(false);
+  const [salvando, setSalvando] = useState(false);
+  const [erroLinha, setErroLinha] = useState(null);
+
+  const iniciarEdicao = (l) => {
+    setEditando(l.id);
+    setErroLinha(null);
+    setDraft({ id: l.id, nome: l.nome, eh_escritorio: l.eh_escritorio, ativa: l.ativa });
+  };
+
+  const iniciarAdicao = () => {
+    setAdicionando(true);
+    setErroLinha(null);
+    setDraft({ nome: "", eh_escritorio: false, ativa: true });
+  };
+
+  const cancelar = () => {
+    setEditando(null);
+    setAdicionando(false);
+    setDraft(null);
+    setErroLinha(null);
+  };
+
+  const salvar = async () => {
+    if (!draft.nome.trim()) return;
+    setSalvando(true);
+    setErroLinha(null);
+    try {
+      if (adicionando) {
+        const { error } = await supabase
+          .from("lojas")
+          .insert({ nome: draft.nome.trim(), eh_escritorio: draft.eh_escritorio, ativa: draft.ativa });
+        if (error) throw error;
+      } else {
+        const { error } = await supabase
+          .from("lojas")
+          .update({
+            nome: draft.nome.trim(),
+            eh_escritorio: draft.eh_escritorio,
+            ativa: draft.ativa,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", draft.id);
+        if (error) throw error;
+      }
+      cancelar();
+      onChange();
+    } catch (e) {
+      if (e.message?.includes("policy") || e.code === "42501") {
+        setErroLinha("Sem permissão. Apenas admin pode alterar lojas.");
+      } else if (e.code === "23505") {
+        setErroLinha("Já existe uma loja com esse nome.");
+      } else {
+        setErroLinha("Erro ao salvar: " + e.message);
+      }
+    } finally {
+      setSalvando(false);
+    }
+  };
+
+  const remover = async (l) => {
+    if (!confirm(`Remover a loja "${l.nome}"?\n\nUsuários ligados a esta loja perderão a associação.`)) return;
+    setSalvando(true);
+    try {
+      const { error } = await supabase.from("lojas").delete().eq("id", l.id);
+      if (error) {
+        alert("Erro ao remover: " + error.message);
+        return;
+      }
+      onChange();
+    } finally {
+      setSalvando(false);
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      {!adicionando && !editando && (
+        <button
+          onClick={iniciarAdicao}
+          className="flex items-center gap-2 px-4 py-2 text-sm font-medium bg-red-700 text-white rounded-md hover:bg-red-800 transition-colors"
+        >
+          <Plus className="w-4 h-4" />
+          Nova loja
+        </button>
+      )}
+
+      {(adicionando || editando) && draft && (
+        <div className="border-2 border-red-300 bg-red-50/30 rounded-lg p-4 space-y-3">
+          <h3 className="font-serif text-lg font-semibold text-stone-900">
+            {adicionando ? "Nova loja" : "Editar loja"}
+          </h3>
+          <div>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              Nome da loja
+            </label>
+            <input
+              type="text"
+              value={draft.nome}
+              onChange={(e) => setDraft({ ...draft, nome: e.target.value })}
+              placeholder="Ex: Loja de Bauru"
+              autoFocus
+              className="w-full px-3 py-2 text-sm border border-stone-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-red-700/30 focus:border-red-700"
+            />
+          </div>
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={draft.eh_escritorio}
+              onChange={(e) => setDraft({ ...draft, eh_escritorio: e.target.checked })}
+              className="w-4 h-4 accent-red-700"
+            />
+            <span>É o Escritório (libera módulos administrativos)</span>
+          </label>
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={draft.ativa}
+              onChange={(e) => setDraft({ ...draft, ativa: e.target.checked })}
+              className="w-4 h-4 accent-red-700"
+            />
+            <span>Loja ativa (desmarque pra desativar sem apagar)</span>
+          </label>
+
+          {erroLinha && (
+            <div className="bg-red-50 border border-red-200 rounded-md p-2 text-xs text-red-900">
+              {erroLinha}
+            </div>
+          )}
+
+          <div className="flex gap-2 pt-1">
+            <button
+              onClick={salvar}
+              disabled={salvando || !draft.nome.trim()}
+              className="flex items-center gap-1.5 px-4 py-2 text-sm bg-emerald-700 text-white font-medium rounded-md hover:bg-emerald-800 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {salvando ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+              Salvar
+            </button>
+            <button
+              onClick={cancelar}
+              disabled={salvando}
+              className="px-3 py-2 text-sm text-stone-600 hover:text-stone-900"
+            >
+              Cancelar
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="bg-white border border-stone-200 rounded-lg overflow-hidden">
+        <div className="grid grid-cols-[1fr_120px_120px_auto] gap-3 px-4 py-2.5 bg-stone-50 border-b border-stone-200 text-[11px] uppercase tracking-wider font-semibold text-stone-600">
+          <div>Nome</div>
+          <div className="text-center">Escritório?</div>
+          <div className="text-center">Ativa?</div>
+          <div className="pr-2">Ações</div>
+        </div>
+        {lojas.map((l) => (
+          <div key={l.id} className="grid grid-cols-[1fr_120px_120px_auto] gap-3 px-4 py-2.5 border-b border-stone-100 items-center">
+            <div className="text-sm text-stone-800 font-medium">
+              {l.nome}
+              {l.eh_escritorio && (
+                <span className="ml-2 text-[10px] text-red-700 font-semibold">★</span>
+              )}
+            </div>
+            <div className="text-center text-xs">
+              {l.eh_escritorio ? <span className="text-red-700 font-semibold">SIM</span> : <span className="text-stone-400">—</span>}
+            </div>
+            <div className="text-center text-xs">
+              {l.ativa ? <span className="text-emerald-700 font-semibold">SIM</span> : <span className="text-red-700">NÃO</span>}
+            </div>
+            <div className="flex items-center gap-1 pr-1">
+              <button
+                onClick={() => iniciarEdicao(l)}
+                disabled={editando || adicionando}
+                className="p-1.5 text-stone-500 hover:bg-stone-100 hover:text-stone-900 rounded disabled:opacity-40"
+                title="Editar"
+              >
+                <Pencil className="w-3.5 h-3.5" />
+              </button>
+              <button
+                onClick={() => remover(l)}
+                disabled={editando || adicionando || salvando}
+                className="p-1.5 text-stone-500 hover:bg-red-50 hover:text-red-700 rounded disabled:opacity-40"
+                title="Remover"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function PlaceholderModule({ title, description }) {
   return (
     <div className="max-w-3xl mx-auto text-center py-20">
@@ -5937,6 +6980,8 @@ export default function App() {
   const { table: colorTable, save: saveColorTable, loaded: colorsLoaded, error: errorCores, reload: reloadCores } = useColorTable();
   const { taxas: taxasBlu, save: saveTaxasBlu, loaded: taxasBluLoaded, error: errorTaxasBlu, reload: reloadTaxasBlu } = useTaxasBlu();
   const { taxas: taxasPV, save: saveTaxasPV, loaded: taxasPVLoaded, error: errorTaxasPV, reload: reloadTaxasPV } = useTaxasPagueVeloz();
+  // ETAPA C: contexto do usuário (grupo + lojas + permissões)
+  const userCtx = useUserContext(user);
 
   // Recarrega automaticamente os dados do Supabase quando o usuário entra
   // numa tela. Assim, se outra loja editou enquanto a tela estava aberta
@@ -5967,52 +7012,86 @@ export default function App() {
   if (!user) {
     return <LoginScreen />;
   }
+  // ETAPA C: enquanto carrega o contexto do usuário (grupo, permissões, lojas)
+  if (userCtx.loading) {
+    return (
+      <div className="min-h-screen bg-stone-50 flex items-center justify-center">
+        <div className="flex items-center gap-3 text-stone-600">
+          <Loader2 className="w-5 h-5 animate-spin" />
+          <span className="text-sm">Carregando suas permissões...</span>
+        </div>
+      </div>
+    );
+  }
   // Se está logado, segue pro app normal abaixo
 
+  // ETAPA C: Lista de módulos respeitando permissões + lojas
+  // Os 4 módulos administrativos só aparecem se:
+  //   • o usuário está no Escritório (ou é admin) E
+  //   • o grupo dele dá permissão (visualizar ou editar) no módulo
+  const podeVerAdmin = userCtx.estaNoEscritorio;
   const modules = [
     {
       id: "conciliacao",
       label: "Conciliação dos Pedidos com os Negativos do Sistema",
       icon: GitCompare,
       available: true,
+      visible: podeVerAdmin && podeVerModulo(userCtx.permissoes, "conciliacao"),
     },
     {
       id: "cores",
       label: "Tabela de Cores",
       icon: Palette,
       available: true,
+      visible: podeVerAdmin && podeVerModulo(userCtx.permissoes, "cores"),
     },
     {
       id: "financeiro",
       label: "Conciliação Financeira",
       icon: CircleDollarSign,
       available: true,
+      visible: podeVerAdmin && podeVerModulo(userCtx.permissoes, "financeiro"),
     },
     {
       id: "taxas",
       label: "Tabelas de Taxas de Cartões",
       icon: CreditCard,
       available: true,
+      visible: podeVerAdmin && podeVerModulo(userCtx.permissoes, "taxas"),
+    },
+    {
+      id: "permissoes",
+      label: "Gerenciar Permissões",
+      icon: Users,
+      available: true,
+      visible: userCtx.isAdmin, // só admin
+      adminOnly: true,
     },
     {
       id: "estoque",
       label: "Gestão de Estoque",
       icon: Package,
       available: false,
+      visible: false, // futuro
     },
     {
       id: "relatorios",
       label: "Relatórios",
       icon: BarChart3,
       available: false,
+      visible: false, // futuro
     },
     {
       id: "config",
       label: "Configurações",
       icon: Settings,
       available: false,
+      visible: false, // futuro
     },
   ];
+
+  // Filtra só os módulos visíveis pra esse usuário
+  const modulesVisiveis = modules.filter((m) => m.visible);
 
   return (
     <div className="min-h-screen bg-stone-50" style={{ fontFamily: "'Inter', system-ui, sans-serif" }}>
@@ -6058,7 +7137,7 @@ export default function App() {
               Módulos
             </p>
             <nav className="space-y-1">
-              {modules.map((m) => (
+              {modulesVisiveis.map((m) => (
                 <button
                   key={m.id}
                   onClick={() => m.available && setActiveModule(m.id)}
@@ -6073,6 +7152,11 @@ export default function App() {
                 >
                   <m.icon className="w-4 h-4 flex-shrink-0" />
                   <span className="flex-1">{m.label}</span>
+                  {m.adminOnly && (
+                    <span className="text-[9px] uppercase tracking-wider bg-red-700 text-white px-1.5 py-0.5 rounded">
+                      Admin
+                    </span>
+                  )}
                   {!m.available && (
                     <span className="text-[9px] uppercase tracking-wider bg-stone-200 text-stone-600 px-1.5 py-0.5 rounded">
                       Em breve
@@ -6080,6 +7164,12 @@ export default function App() {
                   )}
                 </button>
               ))}
+              {modulesVisiveis.length === 0 && (
+                <div className="px-3 py-4 text-xs text-stone-500 italic">
+                  Você ainda não tem módulos liberados.<br />
+                  Fale com a administradora.
+                </div>
+              )}
             </nav>
           </div>
 
@@ -6106,7 +7196,7 @@ export default function App() {
 
         {/* Mobile tabs */}
         <div className="md:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-stone-200 flex z-10">
-          {modules
+          {modulesVisiveis
             .filter((m) => m.available)
             .map((m) => (
               <button
@@ -6126,30 +7216,70 @@ export default function App() {
 
         {/* Main */}
         <main className="flex-1 p-6 md:p-10 pb-24 md:pb-10">
-          {activeModule === "conciliacao" && (
+          {/* Se o usuário tentou acessar um módulo a que não tem permissão (via URL),
+              mostra mensagem ao invés de renderizar o módulo */}
+          {activeModule !== "permissoes" &&
+            !modulesVisiveis.find((m) => m.id === activeModule) && (
+            <div className="max-w-2xl mx-auto text-center py-20">
+              <div className="inline-block p-4 bg-red-50 rounded-full mb-4">
+                <Armchair className="w-8 h-8 text-red-700" />
+              </div>
+              <h1 className="font-serif text-3xl font-bold text-stone-900 mb-2">
+                Bem-vinda à Sofá Show
+              </h1>
+              <p className="text-stone-600 mb-1">
+                {userCtx.grupoNome
+                  ? <>Você faz parte do grupo <strong className="text-red-800">{userCtx.grupoNome}</strong>.</>
+                  : <>Você ainda não foi atribuída a nenhum grupo.</>
+                }
+              </p>
+              {userCtx.lojas.length > 0 ? (
+                <p className="text-stone-600 mb-4 text-sm">
+                  Lojas: <strong>{userCtx.lojas.map((l) => l.nome).join(", ")}</strong>
+                </p>
+              ) : (
+                <p className="text-stone-600 mb-4 text-sm">
+                  Você ainda não tem lojas atribuídas.
+                </p>
+              )}
+              {modulesVisiveis.length === 0 && (
+                <p className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-md p-3 mt-4">
+                  Você não tem nenhum módulo liberado ainda.<br />
+                  Fale com a administradora para liberar acessos.
+                </p>
+              )}
+              {modulesVisiveis.length > 0 && (
+                <p className="text-sm text-stone-600 mt-4">
+                  Use o menu à esquerda pra acessar os módulos disponíveis.
+                </p>
+              )}
+            </div>
+          )}
+
+          {activeModule === "conciliacao" && modulesVisiveis.find((m) => m.id === "conciliacao") && (
             <ConciliacaoModule colorTable={colorTable} />
           )}
-          {activeModule === "cores" && colorsLoaded && (
+          {activeModule === "cores" && modulesVisiveis.find((m) => m.id === "cores") && colorsLoaded && (
             <ColorTableModule
               table={colorTable}
               onSave={saveColorTable}
               supabaseError={errorCores}
             />
           )}
-          {activeModule === "cores" && !colorsLoaded && (
+          {activeModule === "cores" && modulesVisiveis.find((m) => m.id === "cores") && !colorsLoaded && (
             <div className="flex items-center gap-2 text-stone-500 justify-center py-20">
               <Loader2 className="w-5 h-5 animate-spin" />
               Carregando tabela…
             </div>
           )}
-          {activeModule === "financeiro" && (
+          {activeModule === "financeiro" && modulesVisiveis.find((m) => m.id === "financeiro") && (
             <FinanceiroModule
               bancoSelecionadoId={bancoSelecionadoId}
               onSelecionarBanco={(id) => navigate("financeiro", id)}
               onTrocarBanco={() => navigate("financeiro", null)}
             />
           )}
-          {activeModule === "taxas" && taxasBluLoaded && taxasPVLoaded && (
+          {activeModule === "taxas" && modulesVisiveis.find((m) => m.id === "taxas") && taxasBluLoaded && taxasPVLoaded && (
             <TaxasModule
               taxasBlu={taxasBlu}
               onSaveTaxasBlu={saveTaxasBlu}
@@ -6159,11 +7289,20 @@ export default function App() {
               supabaseErrorPV={errorTaxasPV}
             />
           )}
-          {activeModule === "taxas" && (!taxasBluLoaded || !taxasPVLoaded) && (
+          {activeModule === "taxas" && modulesVisiveis.find((m) => m.id === "taxas") && (!taxasBluLoaded || !taxasPVLoaded) && (
             <div className="flex items-center gap-2 text-stone-500 justify-center py-20">
               <Loader2 className="w-5 h-5 animate-spin" />
               Carregando taxas…
             </div>
+          )}
+          {activeModule === "permissoes" && userCtx.isAdmin && (
+            <PermissoesModule />
+          )}
+          {activeModule === "permissoes" && !userCtx.isAdmin && (
+            <PlaceholderModule
+              title="Acesso negado"
+              description="Apenas administradores podem acessar esta tela."
+            />
           )}
           {activeModule === "estoque" && (
             <PlaceholderModule
