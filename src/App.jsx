@@ -1716,47 +1716,50 @@ function useColorTable() {
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState(null);
 
+  // Função de carregamento (extraída pra poder ser chamada também via reload())
+  const carregar = useCallback(async () => {
+    try {
+      console.log("[Cores] Carregando do Supabase...");
+      const { data, error: err } = await supabase
+        .from("cores")
+        .select("codigo, nome")
+        .order("codigo", { ascending: true });
+
+      if (err) {
+        console.error("[Cores] Erro ao carregar:", err);
+        setError("Erro ao carregar cores do servidor: " + err.message);
+        // Em caso de erro, usa o padrão local pra não bloquear o uso do app
+        setTable(DEFAULT_COLOR_TABLE);
+      } else if (data && data.length > 0) {
+        console.log(`[Cores] Carregadas ${data.length} cores do Supabase`);
+        setTable(data.map((c) => ({ codigo: c.codigo, nome: c.nome })));
+        setError(null);
+      } else {
+        // Tabela vazia no Supabase — usa padrão local (não tenta inserir
+        // pra não dar erro se o usuário não tiver permissão de escrita)
+        console.log("[Cores] Tabela 'cores' vazia no Supabase, exibindo padrão");
+        setTable(DEFAULT_COLOR_TABLE);
+        setError(null);
+      }
+    } catch (e) {
+      console.error("[Cores] Erro inesperado:", e);
+      setError("Erro inesperado ao carregar cores: " + e.message);
+      setTable(DEFAULT_COLOR_TABLE);
+    } finally {
+      setLoaded(true);
+    }
+  }, []);
+
   // Carrega ao montar
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        console.log("[Cores] Carregando do Supabase...");
-        const { data, error: err } = await supabase
-          .from("cores")
-          .select("codigo, nome")
-          .order("codigo", { ascending: true });
+    carregar();
+  }, [carregar]);
 
-        if (cancelled) return;
-
-        if (err) {
-          console.error("[Cores] Erro ao carregar:", err);
-          setError("Erro ao carregar cores do servidor: " + err.message);
-          // Em caso de erro, usa o padrão local pra não bloquear o uso do app
-          setTable(DEFAULT_COLOR_TABLE);
-        } else if (data && data.length > 0) {
-          console.log(`[Cores] Carregadas ${data.length} cores do Supabase`);
-          setTable(data.map((c) => ({ codigo: c.codigo, nome: c.nome })));
-        } else {
-          // Tabela vazia no Supabase — usa padrão local (não tenta inserir
-          // pra não dar erro se o usuário não tiver permissão de escrita)
-          console.log("[Cores] Tabela 'cores' vazia no Supabase, exibindo padrão");
-          setTable(DEFAULT_COLOR_TABLE);
-        }
-      } catch (e) {
-        console.error("[Cores] Erro inesperado:", e);
-        if (!cancelled) {
-          setError("Erro inesperado ao carregar cores: " + e.message);
-          setTable(DEFAULT_COLOR_TABLE);
-        }
-      } finally {
-        if (!cancelled) setLoaded(true);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  // Recarrega manualmente (usado quando o usuário entra na tela)
+  const reload = useCallback(() => {
+    console.log("[Cores] Recarregando manualmente...");
+    return carregar();
+  }, [carregar]);
 
   // Salva a tabela inteira no Supabase usando estratégia "replace all":
   // 1. Apaga todas as linhas existentes
@@ -1821,7 +1824,7 @@ function useColorTable() {
     }
   }, []);
 
-  return { table, save, loaded, error };
+  return { table, save, loaded, error, reload };
 }
 
 // ============================================================
@@ -1841,53 +1844,57 @@ function useTaxasBlu() {
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        console.log("[TaxasBlu] Carregando do Supabase...");
-        const { data, error: err } = await supabase
-          .from("taxas_blu")
-          .select("taxas")
-          .eq("id", 1)
-          .single();
+  const carregar = useCallback(async () => {
+    try {
+      console.log("[TaxasBlu] Carregando do Supabase...");
+      const { data, error: err } = await supabase
+        .from("taxas_blu")
+        .select("taxas")
+        .eq("id", 1)
+        .single();
 
-        if (cancelled) return;
-
-        if (err) {
-          console.error("[TaxasBlu] Erro ao carregar:", err);
-          // PGRST116 = "no rows" (linha não existe ainda)
-          if (err.code === "PGRST116") {
-            console.log("[TaxasBlu] Linha id=1 não existe ainda — usando padrão");
-            setTaxas(DEFAULT_TAXAS_BLU);
-          } else {
-            setError("Erro ao carregar taxas Blu do servidor: " + err.message);
-            setTaxas(DEFAULT_TAXAS_BLU);
-          }
-        } else if (data?.taxas) {
-          // Mescla com defaults pra garantir que toda chave esteja presente
-          const merged = { ...DEFAULT_TAXAS_BLU };
-          for (const tipo of Object.keys(DEFAULT_TAXAS_BLU)) {
-            merged[tipo] = { ...DEFAULT_TAXAS_BLU[tipo], ...(data.taxas?.[tipo] || {}) };
-          }
-          console.log("[TaxasBlu] Carregadas do Supabase");
-          setTaxas(merged);
+      if (err) {
+        console.error("[TaxasBlu] Erro ao carregar:", err);
+        // PGRST116 = "no rows" (linha não existe ainda)
+        if (err.code === "PGRST116") {
+          console.log("[TaxasBlu] Linha id=1 não existe ainda — usando padrão");
+          setTaxas(DEFAULT_TAXAS_BLU);
+          setError(null);
         } else {
-          console.log("[TaxasBlu] Linha existe mas campo 'taxas' está vazio — usando padrão");
+          setError("Erro ao carregar taxas Blu do servidor: " + err.message);
           setTaxas(DEFAULT_TAXAS_BLU);
         }
-      } catch (e) {
-        console.error("[TaxasBlu] Erro inesperado:", e);
-        if (!cancelled) {
-          setError("Erro inesperado ao carregar taxas Blu: " + e.message);
-          setTaxas(DEFAULT_TAXAS_BLU);
+      } else if (data?.taxas) {
+        // Mescla com defaults pra garantir que toda chave esteja presente
+        const merged = { ...DEFAULT_TAXAS_BLU };
+        for (const tipo of Object.keys(DEFAULT_TAXAS_BLU)) {
+          merged[tipo] = { ...DEFAULT_TAXAS_BLU[tipo], ...(data.taxas?.[tipo] || {}) };
         }
-      } finally {
-        if (!cancelled) setLoaded(true);
+        console.log("[TaxasBlu] Carregadas do Supabase");
+        setTaxas(merged);
+        setError(null);
+      } else {
+        console.log("[TaxasBlu] Linha existe mas campo 'taxas' está vazio — usando padrão");
+        setTaxas(DEFAULT_TAXAS_BLU);
+        setError(null);
       }
-    })();
-    return () => { cancelled = true; };
+    } catch (e) {
+      console.error("[TaxasBlu] Erro inesperado:", e);
+      setError("Erro inesperado ao carregar taxas Blu: " + e.message);
+      setTaxas(DEFAULT_TAXAS_BLU);
+    } finally {
+      setLoaded(true);
+    }
   }, []);
+
+  useEffect(() => {
+    carregar();
+  }, [carregar]);
+
+  const reload = useCallback(() => {
+    console.log("[TaxasBlu] Recarregando manualmente...");
+    return carregar();
+  }, [carregar]);
 
   const save = useCallback(async (novas) => {
     console.log("[TaxasBlu] Salvando no Supabase...");
@@ -1940,7 +1947,7 @@ function useTaxasBlu() {
     }
   }, []);
 
-  return { taxas, save, loaded, error };
+  return { taxas, save, loaded, error, reload };
 }
 
 // ============================================================
@@ -1956,48 +1963,52 @@ function useTaxasPagueVeloz() {
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        console.log("[TaxasPV] Carregando do Supabase...");
-        const { data, error: err } = await supabase
-          .from("taxas_pague_veloz")
-          .select("taxas")
-          .eq("id", 1)
-          .single();
+  const carregar = useCallback(async () => {
+    try {
+      console.log("[TaxasPV] Carregando do Supabase...");
+      const { data, error: err } = await supabase
+        .from("taxas_pague_veloz")
+        .select("taxas")
+        .eq("id", 1)
+        .single();
 
-        if (cancelled) return;
-
-        if (err) {
-          console.error("[TaxasPV] Erro ao carregar:", err);
-          if (err.code === "PGRST116") {
-            console.log("[TaxasPV] Linha id=1 não existe ainda — usando padrão");
-            setTaxas(DEFAULT_TAXAS_PV);
-          } else {
-            setError("Erro ao carregar taxas Pague Veloz do servidor: " + err.message);
-            setTaxas(DEFAULT_TAXAS_PV);
-          }
-        } else if (data?.taxas) {
-          const merged = { ...DEFAULT_TAXAS_PV, ...(data.taxas || {}) };
-          console.log("[TaxasPV] Carregadas do Supabase");
-          setTaxas(merged);
+      if (err) {
+        console.error("[TaxasPV] Erro ao carregar:", err);
+        if (err.code === "PGRST116") {
+          console.log("[TaxasPV] Linha id=1 não existe ainda — usando padrão");
+          setTaxas(DEFAULT_TAXAS_PV);
+          setError(null);
         } else {
-          console.log("[TaxasPV] Linha existe mas campo 'taxas' está vazio — usando padrão");
+          setError("Erro ao carregar taxas Pague Veloz do servidor: " + err.message);
           setTaxas(DEFAULT_TAXAS_PV);
         }
-      } catch (e) {
-        console.error("[TaxasPV] Erro inesperado:", e);
-        if (!cancelled) {
-          setError("Erro inesperado ao carregar taxas Pague Veloz: " + e.message);
-          setTaxas(DEFAULT_TAXAS_PV);
-        }
-      } finally {
-        if (!cancelled) setLoaded(true);
+      } else if (data?.taxas) {
+        const merged = { ...DEFAULT_TAXAS_PV, ...(data.taxas || {}) };
+        console.log("[TaxasPV] Carregadas do Supabase");
+        setTaxas(merged);
+        setError(null);
+      } else {
+        console.log("[TaxasPV] Linha existe mas campo 'taxas' está vazio — usando padrão");
+        setTaxas(DEFAULT_TAXAS_PV);
+        setError(null);
       }
-    })();
-    return () => { cancelled = true; };
+    } catch (e) {
+      console.error("[TaxasPV] Erro inesperado:", e);
+      setError("Erro inesperado ao carregar taxas Pague Veloz: " + e.message);
+      setTaxas(DEFAULT_TAXAS_PV);
+    } finally {
+      setLoaded(true);
+    }
   }, []);
+
+  useEffect(() => {
+    carregar();
+  }, [carregar]);
+
+  const reload = useCallback(() => {
+    console.log("[TaxasPV] Recarregando manualmente...");
+    return carregar();
+  }, [carregar]);
 
   const save = useCallback(async (novas) => {
     console.log("[TaxasPV] Salvando no Supabase...");
@@ -2046,7 +2057,7 @@ function useTaxasPagueVeloz() {
     }
   }, []);
 
-  return { taxas, save, loaded, error };
+  return { taxas, save, loaded, error, reload };
 }
 
 // ============================================================
@@ -3667,10 +3678,6 @@ function FinanceiroModule({ bancoSelecionadoId, onSelecionarBanco, onTrocarBanco
           <ul className="list-disc list-inside space-y-1 text-xs">
             <li>Suba o relatório de lançamentos do ERP (PDF ou Excel).</li>
             <li>Suba o extrato bancário do mesmo período (PDF, Excel ou CSV).</li>
-            <li>
-              O app casa lançamentos pelo <strong>valor</strong> e{" "}
-              <strong>data</strong> (com tolerância de {TOLERANCIA_DIAS} dias).
-            </li>
             <li>
               Identifica: lançamentos esquecidos no ERP, lançamentos só no banco e
               divergências de data.
@@ -5926,9 +5933,23 @@ export default function App() {
   const { module: activeModule, bancoId: bancoSelecionadoId, navigate } = useHashRoute();
   const setActiveModule = (m) => navigate(m, null);
   // ETAPA B: agora também recebemos o `error` de cada hook pra mostrar na UI
-  const { table: colorTable, save: saveColorTable, loaded: colorsLoaded, error: errorCores } = useColorTable();
-  const { taxas: taxasBlu, save: saveTaxasBlu, loaded: taxasBluLoaded, error: errorTaxasBlu } = useTaxasBlu();
-  const { taxas: taxasPV, save: saveTaxasPV, loaded: taxasPVLoaded, error: errorTaxasPV } = useTaxasPagueVeloz();
+  // E `reload` pra atualizar quando o usuário entra na tela
+  const { table: colorTable, save: saveColorTable, loaded: colorsLoaded, error: errorCores, reload: reloadCores } = useColorTable();
+  const { taxas: taxasBlu, save: saveTaxasBlu, loaded: taxasBluLoaded, error: errorTaxasBlu, reload: reloadTaxasBlu } = useTaxasBlu();
+  const { taxas: taxasPV, save: saveTaxasPV, loaded: taxasPVLoaded, error: errorTaxasPV, reload: reloadTaxasPV } = useTaxasPagueVeloz();
+
+  // Recarrega automaticamente os dados do Supabase quando o usuário entra
+  // numa tela. Assim, se outra loja editou enquanto a tela estava aberta
+  // em outro lugar, ao voltar pra essa tela, a versão mais nova aparece.
+  useEffect(() => {
+    if (!user) return; // só recarrega se estiver logado
+    if (activeModule === "cores") {
+      reloadCores();
+    } else if (activeModule === "taxas") {
+      reloadTaxasBlu();
+      reloadTaxasPV();
+    }
+  }, [activeModule, user, reloadCores, reloadTaxasBlu, reloadTaxasPV]);
 
   // === PROTEÇÃO DE LOGIN ===
   // Enquanto verifica se está logado, mostra um carregamento simples
@@ -6006,7 +6027,11 @@ export default function App() {
         style={{ background: "linear-gradient(90deg, #7f1d1d 0%, #b91c1c 100%)" }}
       >
         <div className="max-w-7xl mx-auto px-6 py-4 flex items-center gap-4">
-          <div className="flex items-center gap-3">
+          <button
+            onClick={() => setActiveModule("conciliacao")}
+            title="Voltar para a tela inicial"
+            className="flex items-center gap-3 rounded-md p-1 -m-1 hover:bg-white/10 active:bg-white/20 transition-colors cursor-pointer text-left"
+          >
             <div className="w-10 h-10 rounded-md bg-white/15 border border-white/25 flex items-center justify-center">
               <Armchair className="w-5 h-5 text-white" />
             </div>
@@ -6018,7 +6043,7 @@ export default function App() {
                 App exclusivo da empresa
               </p>
             </div>
-          </div>
+          </button>
           <div className="ml-auto text-xs text-white/70 hidden md:block">
             21/04/2026
           </div>
