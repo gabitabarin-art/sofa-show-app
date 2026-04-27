@@ -37,10 +37,8 @@ import { supabase } from "./supabaseClient";
 import LoginScreen from "./LoginScreen";
 
 // ============================================================
-// TABELA DE CORES (persistência compartilhada)
+// TABELA DE CORES (persistência no Supabase — tabela "cores")
 // ============================================================
-
-const COLOR_STORAGE_KEY = "sofashow:colorTable";
 
 const DEFAULT_COLOR_TABLE = [
   { codigo: "33302", nome: "MARROM" },
@@ -55,9 +53,8 @@ const DEFAULT_COLOR_TABLE = [
 // TABELA DE TAXAS BLU (negociadas no contrato)
 // Linhas = tipo de operação | Colunas = grupo de bandeiras
 // As mesmas taxas valem para Blu SS Express e Blu Lupe.
+// Persistida no Supabase na tabela "taxas_blu" (linha id=1, JSONB).
 // ============================================================
-
-const TAXAS_BLU_STORAGE_KEY = "sofashow:taxasBlu";
 
 // Identificadores estáveis das linhas (não mudar — usados em lookup)
 const TIPOS_OPERACAO_BLU = [
@@ -91,9 +88,8 @@ const DEFAULT_TAXAS_BLU = {
 //   - Linhas = número EXATO de parcelas (Débito + 1x até 21x)
 //   - Sem distinção por bandeira (uma única taxa por linha)
 //   - Comparamos a "Taxa Pagar" (que é a taxa efetivamente paga pelo lojista)
+// Persistida no Supabase na tabela "taxas_pague_veloz" (linha id=1, JSONB).
 // ============================================================
-
-const TAXAS_PV_STORAGE_KEY = "sofashow:taxasPagueVeloz";
 
 // Linhas da tabela PV — id estável + label + nº de parcelas
 // (debito é tratado separado; pra crédito, parc = número da linha)
@@ -1701,91 +1697,58 @@ function conciliar(sifatItems, pedidoItems, colorTable = []) {
 }
 
 // ============================================================
-// HOOK: Tabela de Cores (persistência compartilhada)
+// HOOK: Tabela de Cores (persistência no Supabase)
 // ============================================================
-
-// Detecta se window.storage existe (ambiente Claude). Caso contrário, usa localStorage.
-const hasClaudeStorage = typeof window !== "undefined" && window.storage && typeof window.storage.get === "function";
-
-async function storageGet(key) {
-  if (hasClaudeStorage) {
-    try {
-      const result = await window.storage.get(key, true);
-      return result && result.value ? result.value : null;
-    } catch (e) {
-      console.error(`Erro ao ler ${key} do Claude storage:`, e);
-      // Não cai pro localStorage aqui — se Claude storage existe, ele é o sistema oficial
-      return null;
-    }
-  }
-  // Fallback: localStorage
-  if (typeof window !== "undefined" && window.localStorage) {
-    try {
-      return window.localStorage.getItem(key);
-    } catch (e) {
-      console.error(`Erro ao ler ${key} do localStorage:`, e);
-      return null;
-    }
-  }
-  return null;
-}
-
-async function storageSet(key, value) {
-  if (hasClaudeStorage) {
-    await window.storage.set(key, value, true);
-    return;
-  }
-  // Fallback: localStorage
-  if (typeof window !== "undefined" && window.localStorage) {
-    try {
-      window.localStorage.setItem(key, value);
-      return;
-    } catch (e) {
-      // localStorage pode falhar em modo privado, quota cheia, etc.
-      throw new Error(`Não foi possível salvar no navegador: ${e.message}`);
-    }
-  }
-  throw new Error("Nenhum sistema de armazenamento disponível");
-}
+//
+// MUDANÇA DA ETAPA B: Antes salvava no localStorage do navegador,
+// agora lê e escreve direto na tabela "cores" do Supabase pra
+// que todos os usuários logados vejam os mesmos dados.
+//
+// Estratégia ao salvar: estratégia "replace all" — apaga todas as cores
+// e insere de novo. É simples, confiável e a tabela tem poucas linhas.
+//
+// Permissões: ler é livre pra qualquer usuário logado. Escrever exige
+// perm_cores='editar' ou is_admin=true (controlado pelo RLS no Supabase).
+// ============================================================
 
 function useColorTable() {
   const [table, setTable] = useState([]);
   const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState(null);
 
   // Carrega ao montar
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        console.log("[Cores] Carregando do storage...");
-        const value = await storageGet(COLOR_STORAGE_KEY);
-        console.log("[Cores] Valor lido do storage:", value ? `${value.length} chars` : "VAZIO");
+        console.log("[Cores] Carregando do Supabase...");
+        const { data, error: err } = await supabase
+          .from("cores")
+          .select("codigo, nome")
+          .order("codigo", { ascending: true });
+
         if (cancelled) return;
-        // Tenta parsear o que está salvo
-        let parsed = null;
-        if (value) {
-          try {
-            parsed = JSON.parse(value);
-          } catch (e) {
-            console.error("[Cores] Tabela corrompida no storage:", e);
-            parsed = null;
-          }
-        }
-        if (Array.isArray(parsed)) {
-          console.log(`[Cores] Carregadas ${parsed.length} cores do storage`);
-          setTable(parsed);
-        } else {
-          console.log("[Cores] Sem dados salvos, usando padrão (e persistindo)");
+
+        if (err) {
+          console.error("[Cores] Erro ao carregar:", err);
+          setError("Erro ao carregar cores do servidor: " + err.message);
+          // Em caso de erro, usa o padrão local pra não bloquear o uso do app
           setTable(DEFAULT_COLOR_TABLE);
-          try {
-            await storageSet(COLOR_STORAGE_KEY, JSON.stringify(DEFAULT_COLOR_TABLE));
-          } catch (e) {
-            console.error("[Cores] Não foi possível persistir padrão:", e);
-          }
+        } else if (data && data.length > 0) {
+          console.log(`[Cores] Carregadas ${data.length} cores do Supabase`);
+          setTable(data.map((c) => ({ codigo: c.codigo, nome: c.nome })));
+        } else {
+          // Tabela vazia no Supabase — usa padrão local (não tenta inserir
+          // pra não dar erro se o usuário não tiver permissão de escrita)
+          console.log("[Cores] Tabela 'cores' vazia no Supabase, exibindo padrão");
+          setTable(DEFAULT_COLOR_TABLE);
         }
       } catch (e) {
-        console.error("[Cores] Erro ao ler:", e);
-        if (!cancelled) setTable(DEFAULT_COLOR_TABLE);
+        console.error("[Cores] Erro inesperado:", e);
+        if (!cancelled) {
+          setError("Erro inesperado ao carregar cores: " + e.message);
+          setTable(DEFAULT_COLOR_TABLE);
+        }
       } finally {
         if (!cancelled) setLoaded(true);
       }
@@ -1795,57 +1758,130 @@ function useColorTable() {
     };
   }, []);
 
+  // Salva a tabela inteira no Supabase usando estratégia "replace all":
+  // 1. Apaga todas as linhas existentes
+  // 2. Insere as novas linhas
+  // Retorna true se deu certo, false se falhou.
+  // Em caso de falha de permissão (RLS), seta uma mensagem clara em error.
   const save = useCallback(async (newTable) => {
-    console.log(`[Cores] Salvando ${newTable.length} cores...`);
-    setTable(newTable);
+    console.log(`[Cores] Salvando ${newTable.length} cores no Supabase...`);
+    setError(null);
+
     try {
-      await storageSet(COLOR_STORAGE_KEY, JSON.stringify(newTable));
-      console.log("[Cores] Salvo no storage. Verificando...");
-      const verify = await storageGet(COLOR_STORAGE_KEY);
-      if (!verify) {
-        console.error("[Cores] FALHA: storage retornou vazio após salvar!");
+      // 1. Apaga tudo. O .neq('codigo', '__nunca__') é um truque pra "deletar todas
+      // as linhas" — o Supabase exige um filtro em delete pra evitar acidentes.
+      const { error: errDel } = await supabase
+        .from("cores")
+        .delete()
+        .neq("codigo", "__nunca_existira_essa_string__");
+
+      if (errDel) {
+        console.error("[Cores] Erro no delete:", errDel);
+        // Detecta erro de permissão por mensagem ou status
+        if (errDel.message?.includes("policy") || errDel.code === "42501") {
+          setError("Sem permissão para editar a tabela de cores. Peça para o administrador liberar a permissão 'Cores' pra você.");
+        } else {
+          setError("Erro ao salvar cores: " + errDel.message);
+        }
         return false;
       }
-      const verifyParsed = JSON.parse(verify);
-      console.log(`[Cores] Verificado: ${verifyParsed.length} cores no storage`);
+
+      // 2. Insere as novas linhas (se houver)
+      if (newTable.length > 0) {
+        const linhasParaInserir = newTable.map((c) => ({
+          codigo: c.codigo,
+          nome: c.nome,
+        }));
+
+        const { error: errIns } = await supabase
+          .from("cores")
+          .insert(linhasParaInserir);
+
+        if (errIns) {
+          console.error("[Cores] Erro no insert:", errIns);
+          if (errIns.message?.includes("policy") || errIns.code === "42501") {
+            setError("Sem permissão para editar a tabela de cores. Peça para o administrador liberar a permissão 'Cores' pra você.");
+          } else if (errIns.code === "23505") {
+            setError("Erro ao salvar: existem códigos de cor duplicados.");
+          } else {
+            setError("Erro ao salvar cores: " + errIns.message);
+          }
+          return false;
+        }
+      }
+
+      // 3. Atualiza o estado local depois do sucesso
+      setTable(newTable);
+      console.log(`[Cores] Salvo com sucesso. ${newTable.length} cores no Supabase.`);
       return true;
     } catch (e) {
-      console.error("[Cores] Erro ao salvar:", e);
+      console.error("[Cores] Erro inesperado ao salvar:", e);
+      setError("Erro inesperado ao salvar: " + e.message);
       return false;
     }
   }, []);
 
-  return { table, save, loaded };
+  return { table, save, loaded, error };
 }
 
-// Hook idêntico ao useColorTable, mas pra tabela de taxas de cartões Blu
+// ============================================================
+// HOOK: Tabela de Taxas Blu (persistência no Supabase)
+// ============================================================
+//
+// MUDANÇA DA ETAPA B: lê e escreve na tabela "taxas_blu" do Supabase.
+// A tabela tem estrutura simples: uma única linha (id=1) com um campo
+// JSONB chamado "taxas" que guarda o objeto inteiro.
+//
+// Permissões: ler é livre pra qualquer usuário logado. Escrever exige
+// perm_taxas='editar' ou is_admin=true (controlado pelo RLS no Supabase).
+// ============================================================
+
 function useTaxasBlu() {
   const [taxas, setTaxas] = useState(DEFAULT_TAXAS_BLU);
   const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const value = await storageGet(TAXAS_BLU_STORAGE_KEY);
+        console.log("[TaxasBlu] Carregando do Supabase...");
+        const { data, error: err } = await supabase
+          .from("taxas_blu")
+          .select("taxas")
+          .eq("id", 1)
+          .single();
+
         if (cancelled) return;
-        if (value) {
-          const parsed = JSON.parse(value);
-          // Mescla com os defaults pra garantir que toda chave esteja presente
-          // (caso a estrutura cresça depois)
+
+        if (err) {
+          console.error("[TaxasBlu] Erro ao carregar:", err);
+          // PGRST116 = "no rows" (linha não existe ainda)
+          if (err.code === "PGRST116") {
+            console.log("[TaxasBlu] Linha id=1 não existe ainda — usando padrão");
+            setTaxas(DEFAULT_TAXAS_BLU);
+          } else {
+            setError("Erro ao carregar taxas Blu do servidor: " + err.message);
+            setTaxas(DEFAULT_TAXAS_BLU);
+          }
+        } else if (data?.taxas) {
+          // Mescla com defaults pra garantir que toda chave esteja presente
           const merged = { ...DEFAULT_TAXAS_BLU };
           for (const tipo of Object.keys(DEFAULT_TAXAS_BLU)) {
-            merged[tipo] = { ...DEFAULT_TAXAS_BLU[tipo], ...(parsed?.[tipo] || {}) };
+            merged[tipo] = { ...DEFAULT_TAXAS_BLU[tipo], ...(data.taxas?.[tipo] || {}) };
           }
+          console.log("[TaxasBlu] Carregadas do Supabase");
           setTaxas(merged);
         } else {
+          console.log("[TaxasBlu] Linha existe mas campo 'taxas' está vazio — usando padrão");
           setTaxas(DEFAULT_TAXAS_BLU);
-          try {
-            await storageSet(TAXAS_BLU_STORAGE_KEY, JSON.stringify(DEFAULT_TAXAS_BLU));
-          } catch {}
         }
       } catch (e) {
-        if (!cancelled) setTaxas(DEFAULT_TAXAS_BLU);
+        console.error("[TaxasBlu] Erro inesperado:", e);
+        if (!cancelled) {
+          setError("Erro inesperado ao carregar taxas Blu: " + e.message);
+          setTaxas(DEFAULT_TAXAS_BLU);
+        }
       } finally {
         if (!cancelled) setLoaded(true);
       }
@@ -1854,43 +1890,108 @@ function useTaxasBlu() {
   }, []);
 
   const save = useCallback(async (novas) => {
-    setTaxas(novas);
+    console.log("[TaxasBlu] Salvando no Supabase...");
+    setError(null);
+
     try {
-      await storageSet(TAXAS_BLU_STORAGE_KEY, JSON.stringify(novas));
+      // Usamos UPDATE em id=1 (a linha já foi pré-criada pelo SQL inicial).
+      // Se não existir ainda, o update vai retornar 0 linhas afetadas mas
+      // sem erro — nesse caso fazemos um upsert pra criar.
+      const { error: errUpd, data } = await supabase
+        .from("taxas_blu")
+        .update({ taxas: novas, updated_at: new Date().toISOString() })
+        .eq("id", 1)
+        .select();
+
+      if (errUpd) {
+        console.error("[TaxasBlu] Erro no update:", errUpd);
+        if (errUpd.message?.includes("policy") || errUpd.code === "42501") {
+          setError("Sem permissão para editar as taxas. Peça para o administrador liberar a permissão 'Taxas' pra você.");
+        } else {
+          setError("Erro ao salvar taxas Blu: " + errUpd.message);
+        }
+        return false;
+      }
+
+      // Se nenhuma linha foi atualizada, faz upsert (insere a linha id=1)
+      if (!data || data.length === 0) {
+        const { error: errIns } = await supabase
+          .from("taxas_blu")
+          .upsert({ id: 1, taxas: novas, updated_at: new Date().toISOString() });
+
+        if (errIns) {
+          console.error("[TaxasBlu] Erro no upsert:", errIns);
+          if (errIns.message?.includes("policy") || errIns.code === "42501") {
+            setError("Sem permissão para editar as taxas. Peça para o administrador liberar a permissão 'Taxas' pra você.");
+          } else {
+            setError("Erro ao salvar taxas Blu: " + errIns.message);
+          }
+          return false;
+        }
+      }
+
+      setTaxas(novas);
+      console.log("[TaxasBlu] Salvo com sucesso");
       return true;
     } catch (e) {
-      console.error("Erro ao salvar tabela de taxas de cartões", e);
+      console.error("[TaxasBlu] Erro inesperado ao salvar:", e);
+      setError("Erro inesperado ao salvar taxas Blu: " + e.message);
       return false;
     }
   }, []);
 
-  return { taxas, save, loaded };
+  return { taxas, save, loaded, error };
 }
 
-// Hook idêntico ao useTaxasBlu, mas pra Pague Veloz (estrutura diferente: 22 linhas, sem grupo)
+// ============================================================
+// HOOK: Tabela de Taxas Pague Veloz (persistência no Supabase)
+// ============================================================
+//
+// MUDANÇA DA ETAPA B: idêntico ao useTaxasBlu mas usa a tabela
+// "taxas_pague_veloz" (estrutura também é id=1, taxas JSONB).
+// ============================================================
+
 function useTaxasPagueVeloz() {
   const [taxas, setTaxas] = useState(DEFAULT_TAXAS_PV);
   const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const value = await storageGet(TAXAS_PV_STORAGE_KEY);
+        console.log("[TaxasPV] Carregando do Supabase...");
+        const { data, error: err } = await supabase
+          .from("taxas_pague_veloz")
+          .select("taxas")
+          .eq("id", 1)
+          .single();
+
         if (cancelled) return;
-        if (value) {
-          const parsed = JSON.parse(value);
-          // Mescla com defaults pra garantir todas as linhas presentes
-          const merged = { ...DEFAULT_TAXAS_PV, ...(parsed || {}) };
+
+        if (err) {
+          console.error("[TaxasPV] Erro ao carregar:", err);
+          if (err.code === "PGRST116") {
+            console.log("[TaxasPV] Linha id=1 não existe ainda — usando padrão");
+            setTaxas(DEFAULT_TAXAS_PV);
+          } else {
+            setError("Erro ao carregar taxas Pague Veloz do servidor: " + err.message);
+            setTaxas(DEFAULT_TAXAS_PV);
+          }
+        } else if (data?.taxas) {
+          const merged = { ...DEFAULT_TAXAS_PV, ...(data.taxas || {}) };
+          console.log("[TaxasPV] Carregadas do Supabase");
           setTaxas(merged);
         } else {
+          console.log("[TaxasPV] Linha existe mas campo 'taxas' está vazio — usando padrão");
           setTaxas(DEFAULT_TAXAS_PV);
-          try {
-            await storageSet(TAXAS_PV_STORAGE_KEY, JSON.stringify(DEFAULT_TAXAS_PV));
-          } catch {}
         }
       } catch (e) {
-        if (!cancelled) setTaxas(DEFAULT_TAXAS_PV);
+        console.error("[TaxasPV] Erro inesperado:", e);
+        if (!cancelled) {
+          setError("Erro inesperado ao carregar taxas Pague Veloz: " + e.message);
+          setTaxas(DEFAULT_TAXAS_PV);
+        }
       } finally {
         if (!cancelled) setLoaded(true);
       }
@@ -1899,17 +2000,53 @@ function useTaxasPagueVeloz() {
   }, []);
 
   const save = useCallback(async (novas) => {
-    setTaxas(novas);
+    console.log("[TaxasPV] Salvando no Supabase...");
+    setError(null);
+
     try {
-      await storageSet(TAXAS_PV_STORAGE_KEY, JSON.stringify(novas));
+      const { error: errUpd, data } = await supabase
+        .from("taxas_pague_veloz")
+        .update({ taxas: novas, updated_at: new Date().toISOString() })
+        .eq("id", 1)
+        .select();
+
+      if (errUpd) {
+        console.error("[TaxasPV] Erro no update:", errUpd);
+        if (errUpd.message?.includes("policy") || errUpd.code === "42501") {
+          setError("Sem permissão para editar as taxas. Peça para o administrador liberar a permissão 'Taxas' pra você.");
+        } else {
+          setError("Erro ao salvar taxas Pague Veloz: " + errUpd.message);
+        }
+        return false;
+      }
+
+      if (!data || data.length === 0) {
+        const { error: errIns } = await supabase
+          .from("taxas_pague_veloz")
+          .upsert({ id: 1, taxas: novas, updated_at: new Date().toISOString() });
+
+        if (errIns) {
+          console.error("[TaxasPV] Erro no upsert:", errIns);
+          if (errIns.message?.includes("policy") || errIns.code === "42501") {
+            setError("Sem permissão para editar as taxas. Peça para o administrador liberar a permissão 'Taxas' pra você.");
+          } else {
+            setError("Erro ao salvar taxas Pague Veloz: " + errIns.message);
+          }
+          return false;
+        }
+      }
+
+      setTaxas(novas);
+      console.log("[TaxasPV] Salvo com sucesso");
       return true;
     } catch (e) {
-      console.error("Erro ao salvar tabela de taxas Pague Veloz", e);
+      console.error("[TaxasPV] Erro inesperado ao salvar:", e);
+      setError("Erro inesperado ao salvar taxas Pague Veloz: " + e.message);
       return false;
     }
   }, []);
 
-  return { taxas, save, loaded };
+  return { taxas, save, loaded, error };
 }
 
 // ============================================================
@@ -2098,7 +2235,7 @@ function FileDropZone({ label, sublabel, icon: Icon, accept, file, onFile, onCle
       onDrop={handleDrop}
       className={`relative border-2 border-dashed rounded-lg p-6 transition-all ${
         dragging
-          ? "border-amber-700 bg-amber-50"
+          ? "border-red-700 bg-red-50"
           : file
           ? "border-emerald-600 bg-emerald-50/40"
           : "border-stone-300 bg-stone-50/50 hover:border-stone-400"
@@ -2128,7 +2265,7 @@ function FileDropZone({ label, sublabel, icon: Icon, accept, file, onFile, onCle
           <Icon className="w-8 h-8 text-stone-400 mb-2" />
           <p className="font-serif text-sm font-semibold text-stone-800">{label}</p>
           <p className="text-xs text-stone-500 mt-1">{sublabel}</p>
-          <p className="text-xs text-amber-800 mt-2 font-medium">Clique ou arraste aqui</p>
+          <p className="text-xs text-red-700 mt-2 font-medium">Clique ou arraste aqui</p>
           <input
             type="file"
             accept={accept}
@@ -2149,7 +2286,7 @@ function StatCard({ label, value, sublabel, accent, icon: Icon }) {
   const accentColors = {
     red: "border-red-200 bg-red-50/60",
     green: "border-emerald-200 bg-emerald-50/60",
-    amber: "border-amber-200 bg-amber-50/60",
+    amber: "border-red-200 bg-red-50/60",
     stone: "border-stone-200 bg-white",
     purple: "border-purple-200 bg-purple-50/60",
     orange: "border-orange-200 bg-orange-50/60",
@@ -2157,7 +2294,7 @@ function StatCard({ label, value, sublabel, accent, icon: Icon }) {
   const textColors = {
     red: "text-red-900",
     green: "text-emerald-800",
-    amber: "text-amber-900",
+    amber: "text-red-800",
     stone: "text-stone-900",
     purple: "text-purple-900",
     orange: "text-orange-900",
@@ -2340,7 +2477,7 @@ function ConciliacaoModule({ colorTable }) {
       {/* Header do módulo */}
       <div className="mb-8 border-b border-stone-200 pb-6">
         <div className="flex items-baseline gap-3 mb-2">
-          <span className="text-xs uppercase tracking-[0.2em] text-amber-800 font-semibold">
+          <span className="text-xs uppercase tracking-[0.2em] text-red-700 font-semibold">
             Módulo 01
           </span>
           <span className="text-stone-300">—</span>
@@ -2452,7 +2589,7 @@ function ConciliacaoModule({ colorTable }) {
                 onClick={() => setActiveView("semNegativo")}
                 className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
                   activeView === "semNegativo"
-                    ? "bg-white text-amber-900 shadow-sm"
+                    ? "bg-white text-red-800 shadow-sm"
                     : "text-stone-600 hover:text-stone-900"
                 }`}
               >
@@ -2477,7 +2614,7 @@ function ConciliacaoModule({ colorTable }) {
                 placeholder="Buscar por código, modelo ou descrição…"
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
-                className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-amber-700/30 focus:border-amber-700"
+                className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-red-700/30 focus:border-red-700"
               />
             </div>
 
@@ -2518,8 +2655,8 @@ function ConciliacaoModule({ colorTable }) {
       )}
 
       {!pedidosFile && !sifatFile && !loading && (
-        <div className="text-center py-16 bg-gradient-to-b from-amber-50/40 to-transparent rounded-lg border border-stone-200">
-          <GitCompare className="w-10 h-10 text-amber-800 mx-auto mb-3" />
+        <div className="text-center py-16 bg-gradient-to-b from-red-50/40 to-transparent rounded-lg border border-stone-200">
+          <GitCompare className="w-10 h-10 text-red-700 mx-auto mb-3" />
           <p className="font-serif text-lg text-stone-800 mb-1">
             Pronto para conciliar
           </p>
@@ -2723,9 +2860,9 @@ function SemNegativoList({ items }) {
 
   return (
     <div className="space-y-2">
-      <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-3 flex items-start gap-2">
-        <AlertTriangle className="w-4 h-4 text-amber-800 mt-0.5 flex-shrink-0" />
-        <div className="text-xs text-amber-900">
+      <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-3 flex items-start gap-2">
+        <AlertTriangle className="w-4 h-4 text-red-700 mt-0.5 flex-shrink-0" />
+        <div className="text-xs text-red-800">
           <p className="mb-2">
             <strong>Pedidos lançados mas o produto NÃO está negativo no SIFAT.</strong>
           </p>
@@ -2742,11 +2879,11 @@ function SemNegativoList({ items }) {
       {items.map((p, i) => (
         <div
           key={i}
-          className="border border-amber-200 bg-white rounded-lg overflow-hidden"
+          className="border border-red-200 bg-white rounded-lg overflow-hidden"
         >
           <div className="flex items-start p-4 gap-4">
-            <div className="w-10 h-10 rounded-md bg-amber-100 flex items-center justify-center flex-shrink-0">
-              <AlertTriangle className="w-5 h-5 text-amber-700" />
+            <div className="w-10 h-10 rounded-md bg-red-100 flex items-center justify-center flex-shrink-0">
+              <AlertTriangle className="w-5 h-5 text-red-700" />
             </div>
             <div className="flex-1 min-w-0">
               <div className="flex items-baseline gap-2 mb-1">
@@ -2773,7 +2910,7 @@ function SemNegativoList({ items }) {
                 </span>
                 <span>Data: <strong className="text-stone-900">{p.data}</strong></span>
                 {p.obs && (
-                  <span className="text-amber-800">
+                  <span className="text-red-700">
                     Obs: <strong>{p.obs}</strong>
                   </span>
                 )}
@@ -2781,7 +2918,7 @@ function SemNegativoList({ items }) {
             </div>
             <div className="text-right flex-shrink-0">
               <p className="text-xs text-stone-500 uppercase tracking-wider">Quantidade</p>
-              <p className="font-serif text-2xl font-bold text-amber-700">
+              <p className="font-serif text-2xl font-bold text-red-700">
                 {p.quantidade}
               </p>
             </div>
@@ -2792,7 +2929,7 @@ function SemNegativoList({ items }) {
   );
 }
 
-function ColorTableModule({ table, onSave }) {
+function ColorTableModule({ table, onSave, supabaseError }) {
   const [editing, setEditing] = useState(null); // index sendo editado
   const [draft, setDraft] = useState({ codigo: "", nome: "" });
   const [adding, setAdding] = useState(false);
@@ -2829,13 +2966,13 @@ function ColorTableModule({ table, onSave }) {
     setSaveStatus("");
     const ok = await onSave(newTable);
     setSaving(false);
-    setSaveStatus(ok ? "Salvo" : "Erro ao salvar");
-    setTimeout(() => setSaveStatus(""), 2000);
+    setSaveStatus(ok ? "Salvo" : "Erro");
+    setTimeout(() => setSaveStatus(""), 3000);
+    return ok;
   };
 
   const saveEdit = async () => {
     if (!draft.codigo.trim() || !draft.nome.trim()) return;
-    const originalCodigo = table[editing].codigo;
     const newCodigo = draft.codigo.trim().toUpperCase();
     // Evita duplicata ao editar pra um código que já existe em outra linha
     const duplicate = table.some(
@@ -2850,8 +2987,8 @@ function ColorTableModule({ table, onSave }) {
         ? { codigo: newCodigo, nome: draft.nome.trim().toUpperCase() }
         : c
     );
-    await persistSave(newTable);
-    cancelEdit();
+    const ok = await persistSave(newTable);
+    if (ok) cancelEdit();
   };
 
   const removeEntry = async (index) => {
@@ -2870,9 +3007,11 @@ function ColorTableModule({ table, onSave }) {
       return;
     }
     const newTable = [...table, { codigo, nome }];
-    await persistSave(newTable);
-    setNewEntry({ codigo: "", nome: "" });
-    setAdding(false);
+    const ok = await persistSave(newTable);
+    if (ok) {
+      setNewEntry({ codigo: "", nome: "" });
+      setAdding(false);
+    }
   };
 
   const restoreDefaults = async () => {
@@ -2889,7 +3028,7 @@ function ColorTableModule({ table, onSave }) {
     <div className="max-w-4xl mx-auto">
       <div className="mb-8 border-b border-stone-200 pb-6">
         <div className="flex items-baseline gap-3 mb-2">
-          <span className="text-xs uppercase tracking-[0.2em] text-amber-800 font-semibold">
+          <span className="text-xs uppercase tracking-[0.2em] text-red-700 font-semibold">
             Cadastro
           </span>
           <span className="text-stone-300">—</span>
@@ -2905,14 +3044,23 @@ function ColorTableModule({ table, onSave }) {
           <strong>nome da cor</strong>. Usada na conciliação quando a loja lançar
           o pedido só pelo nome (ex: "MARROM") sem o código.
         </p>
-        <div className="flex items-start gap-2 mt-3 text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
+        <div className="flex items-start gap-2 mt-3 text-xs text-emerald-900 bg-emerald-50 border border-emerald-200 rounded-md px-3 py-2">
           <Users className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
           <span>
-            <strong>Tabela salva no seu navegador.</strong> Cada loja precisa cadastrar suas próprias cores.
-            Para compartilhar entre lojas, é necessário um banco de dados (versão futura).
+            <strong>Tabela compartilhada entre todas as lojas.</strong> Quando uma loja
+            cadastra uma cor aqui, todas as outras passam a ver. Salvo no banco de dados
+            (Supabase).
           </span>
         </div>
       </div>
+
+      {/* Mensagem de erro do Supabase (vinda do hook) */}
+      {supabaseError && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-4 flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 text-red-700 mt-0.5 flex-shrink-0" />
+          <p className="text-sm text-red-900">{supabaseError}</p>
+        </div>
+      )}
 
       {/* Barra de ações */}
       <div className="flex flex-wrap gap-3 mb-4">
@@ -2923,7 +3071,7 @@ function ColorTableModule({ table, onSave }) {
             placeholder="Buscar código ou nome…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-amber-700/30 focus:border-amber-700"
+            className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-red-700/30 focus:border-red-700"
           />
         </div>
         <button
@@ -2931,7 +3079,7 @@ function ColorTableModule({ table, onSave }) {
             setAdding(true);
             setNewEntry({ codigo: "", nome: "" });
           }}
-          className="flex items-center gap-2 px-4 py-2 text-sm font-medium bg-amber-800 text-white rounded-md hover:bg-amber-900 transition-colors"
+          className="flex items-center gap-2 px-4 py-2 text-sm font-medium bg-red-700 text-white rounded-md hover:bg-red-800 transition-colors"
         >
           <Plus className="w-4 h-4" />
           Nova cor
@@ -2960,11 +3108,17 @@ function ColorTableModule({ table, onSave }) {
             {saveStatus}
           </div>
         )}
+        {saving && (
+          <div className="flex items-center gap-1.5 px-3 py-2 text-xs text-stone-600">
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            Salvando…
+          </div>
+        )}
       </div>
 
       {/* Linha de adição */}
       {adding && (
-        <div className="border-2 border-amber-400 bg-amber-50/50 rounded-lg p-3 mb-3 flex flex-wrap items-center gap-2">
+        <div className="border-2 border-red-400 bg-red-50/50 rounded-lg p-3 mb-3 flex flex-wrap items-center gap-2">
           <input
             type="text"
             placeholder="Código (ex: 33302)"
@@ -2973,14 +3127,14 @@ function ColorTableModule({ table, onSave }) {
               setNewEntry({ ...newEntry, codigo: e.target.value })
             }
             autoFocus
-            className="px-3 py-2 text-sm border border-stone-300 rounded-md bg-white font-mono w-40 focus:outline-none focus:ring-2 focus:ring-amber-700/30"
+            className="px-3 py-2 text-sm border border-stone-300 rounded-md bg-white font-mono w-40 focus:outline-none focus:ring-2 focus:ring-red-700/30"
           />
           <input
             type="text"
             placeholder="Nome (ex: MARROM)"
             value={newEntry.nome}
             onChange={(e) => setNewEntry({ ...newEntry, nome: e.target.value })}
-            className="px-3 py-2 text-sm border border-stone-300 rounded-md bg-white flex-1 min-w-[180px] focus:outline-none focus:ring-2 focus:ring-amber-700/30"
+            className="px-3 py-2 text-sm border border-stone-300 rounded-md bg-white flex-1 min-w-[180px] focus:outline-none focus:ring-2 focus:ring-red-700/30"
             onKeyDown={(e) => {
               if (e.key === "Enter") addEntry();
               if (e.key === "Escape") setAdding(false);
@@ -3027,7 +3181,7 @@ function ColorTableModule({ table, onSave }) {
               <div
                 key={entry.codigo}
                 className={`grid grid-cols-[140px_1fr_auto] gap-3 px-4 py-2.5 border-b border-stone-100 items-center ${
-                  isEditing ? "bg-amber-50/40" : "hover:bg-stone-50/50"
+                  isEditing ? "bg-red-50/40" : "hover:bg-stone-50/50"
                 }`}
               >
                 {isEditing ? (
@@ -3038,7 +3192,7 @@ function ColorTableModule({ table, onSave }) {
                       onChange={(e) =>
                         setDraft({ ...draft, codigo: e.target.value })
                       }
-                      className="px-2 py-1.5 text-sm border border-stone-300 rounded bg-white font-mono w-full focus:outline-none focus:ring-2 focus:ring-amber-700/30"
+                      className="px-2 py-1.5 text-sm border border-stone-300 rounded bg-white font-mono w-full focus:outline-none focus:ring-2 focus:ring-red-700/30"
                     />
                     <input
                       type="text"
@@ -3046,7 +3200,7 @@ function ColorTableModule({ table, onSave }) {
                       onChange={(e) =>
                         setDraft({ ...draft, nome: e.target.value })
                       }
-                      className="px-2 py-1.5 text-sm border border-stone-300 rounded bg-white focus:outline-none focus:ring-2 focus:ring-amber-700/30"
+                      className="px-2 py-1.5 text-sm border border-stone-300 rounded bg-white focus:outline-none focus:ring-2 focus:ring-red-700/30"
                       onKeyDown={(e) => {
                         if (e.key === "Enter") saveEdit();
                         if (e.key === "Escape") cancelEdit();
@@ -3110,13 +3264,16 @@ function ColorTableModule({ table, onSave }) {
 // MÓDULO: TABELA DE TAXAS (Blu / Pague Veloz)
 // ============================================================
 
-function TaxasModule({ taxasBlu, onSaveTaxasBlu, taxasPV, onSaveTaxasPV }) {
+function TaxasModule({ taxasBlu, onSaveTaxasBlu, taxasPV, onSaveTaxasPV, supabaseErrorBlu, supabaseErrorPV }) {
   // Aba ativa (qual maquininha está sendo editada)
   const [maquininhaAtiva, setMaquininhaAtiva] = useState("blu");
   // Estado de "rascunho" — a usuária edita aqui antes de salvar
   const [rascunho, setRascunho] = useState(taxasBlu);
   const [saving, setSaving] = useState(false);
   const [saveStatus, setSaveStatus] = useState("");
+
+  // Erro do Supabase relevante pra aba ativa
+  const supabaseError = maquininhaAtiva === "blu" ? supabaseErrorBlu : supabaseErrorPV;
 
   // Quando muda a tabela vinda do hook (ou troca de maquininha), atualiza o rascunho
   useEffect(() => {
@@ -3166,8 +3323,8 @@ function TaxasModule({ taxasBlu, onSaveTaxasBlu, taxasPV, onSaveTaxasPV }) {
       ? await onSaveTaxasBlu(rascunho)
       : await onSaveTaxasPV(rascunho);
     setSaving(false);
-    setSaveStatus(ok ? "Salvo" : "Erro ao salvar");
-    setTimeout(() => setSaveStatus(""), 2500);
+    setSaveStatus(ok ? "Salvo" : "Erro");
+    setTimeout(() => setSaveStatus(""), 3000);
   };
 
   const cancelar = () => {
@@ -3188,15 +3345,15 @@ function TaxasModule({ taxasBlu, onSaveTaxasBlu, taxasPV, onSaveTaxasPV }) {
       ? await onSaveTaxasBlu(padrao)
       : await onSaveTaxasPV(padrao);
     setSaving(false);
-    setSaveStatus(ok ? "Salvo" : "Erro ao salvar");
-    setTimeout(() => setSaveStatus(""), 2500);
+    setSaveStatus(ok ? "Salvo" : "Erro");
+    setTimeout(() => setSaveStatus(""), 3000);
   };
 
   return (
     <div className="max-w-4xl mx-auto">
       <div className="mb-8 border-b border-stone-200 pb-6">
         <div className="flex items-baseline gap-3 mb-2">
-          <span className="text-xs uppercase tracking-[0.2em] text-amber-800 font-semibold">
+          <span className="text-xs uppercase tracking-[0.2em] text-red-700 font-semibold">
             Cadastro
           </span>
           <span className="text-stone-300">—</span>
@@ -3212,14 +3369,22 @@ function TaxasModule({ taxasBlu, onSaveTaxasBlu, taxasPV, onSaveTaxasPV }) {
           Na Conciliação Financeira, o app vai comparar essas taxas com o que foi cobrado
           de fato e te avisar se houver cobrança acima do acordado.
         </p>
-        <div className="flex items-start gap-2 mt-3 text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
+        <div className="flex items-start gap-2 mt-3 text-xs text-emerald-900 bg-emerald-50 border border-emerald-200 rounded-md px-3 py-2">
           <Users className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
           <span>
-            <strong>Tabelas salvas no seu navegador.</strong> Quando o contrato mudar,
-            é só atualizar os valores aqui e salvar.
+            <strong>Tabelas compartilhadas entre todas as lojas.</strong> Quando o contrato mudar,
+            atualize aqui e todas as lojas passam a ver os novos valores. Salvo no banco de dados (Supabase).
           </span>
         </div>
       </div>
+
+      {/* Mensagem de erro do Supabase */}
+      {supabaseError && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-4 flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 text-red-700 mt-0.5 flex-shrink-0" />
+          <p className="text-sm text-red-900">{supabaseError}</p>
+        </div>
+      )}
 
       {/* Botões de seleção de maquininha */}
       <div className="flex gap-2 mb-6">
@@ -3282,7 +3447,7 @@ function TaxasModule({ taxasBlu, onSaveTaxasBlu, taxasPV, onSaveTaxasPV }) {
                           value={valorStr}
                           onChange={(e) => onChangeTaxaBlu(tipo.id, grupo.id, e.target.value)}
                           placeholder="—"
-                          className="w-full pl-3 pr-8 py-1.5 text-sm text-right border border-stone-300 rounded bg-white font-mono focus:outline-none focus:ring-2 focus:ring-amber-700/30 focus:border-amber-700"
+                          className="w-full pl-3 pr-8 py-1.5 text-sm text-right border border-stone-300 rounded bg-white font-mono focus:outline-none focus:ring-2 focus:ring-red-700/30 focus:border-red-700"
                         />
                         <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-stone-400 text-sm pointer-events-none">
                           %
@@ -3341,7 +3506,7 @@ function TaxasModule({ taxasBlu, onSaveTaxasBlu, taxasPV, onSaveTaxasPV }) {
                         value={valorStr}
                         onChange={(e) => onChangeTaxaPV(linha.id, e.target.value)}
                         placeholder="—"
-                        className="w-full pl-3 pr-8 py-1.5 text-sm text-right border border-stone-300 rounded bg-white font-mono focus:outline-none focus:ring-2 focus:ring-amber-700/30 focus:border-amber-700"
+                        className="w-full pl-3 pr-8 py-1.5 text-sm text-right border border-stone-300 rounded bg-white font-mono focus:outline-none focus:ring-2 focus:ring-red-700/30 focus:border-red-700"
                       />
                       <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-stone-400 text-sm pointer-events-none">
                         %
@@ -3411,10 +3576,6 @@ function TaxasModule({ taxasBlu, onSaveTaxasBlu, taxasPV, onSaveTaxasPV }) {
   );
 }
 
-// ============================================================
-// MÓDULO: CONCILIAÇÃO FINANCEIRA
-// ============================================================
-
 function FinanceiroModule({ bancoSelecionadoId, onSelecionarBanco, onTrocarBanco }) {
   // Resolve o banco a partir do ID vindo da URL
   const bancoSelecionado = useMemo(
@@ -3432,7 +3593,7 @@ function FinanceiroModule({ bancoSelecionadoId, onSelecionarBanco, onTrocarBanco
       <div className="max-w-5xl mx-auto">
         <div className="mb-8 border-b border-stone-200 pb-6">
           <div className="flex items-baseline gap-3 mb-2">
-            <span className="text-xs uppercase tracking-[0.2em] text-amber-800 font-semibold">
+            <span className="text-xs uppercase tracking-[0.2em] text-red-700 font-semibold">
               Módulo 02
             </span>
             <span className="text-stone-300">—</span>
@@ -3463,7 +3624,7 @@ function FinanceiroModule({ bancoSelecionadoId, onSelecionarBanco, onTrocarBanco
               className={`p-6 border-2 rounded-lg text-left transition-all ${
                 banco.emBreve
                   ? "border-stone-200 bg-stone-50 cursor-not-allowed opacity-60"
-                  : "border-stone-300 bg-white hover:border-amber-700 hover:shadow-md"
+                  : "border-stone-300 bg-white hover:border-red-700 hover:shadow-md"
               }`}
             >
               <div className="flex items-center gap-3 mb-2">
@@ -3476,7 +3637,7 @@ function FinanceiroModule({ bancoSelecionadoId, onSelecionarBanco, onTrocarBanco
                 ) : (
                   <Landmark
                     className={`w-6 h-6 ${
-                      banco.emBreve ? "text-stone-400" : "text-amber-800"
+                      banco.emBreve ? "text-stone-400" : "text-red-700"
                     }`}
                   />
                 )}
@@ -3501,7 +3662,7 @@ function FinanceiroModule({ bancoSelecionadoId, onSelecionarBanco, onTrocarBanco
           ))}
         </div>
 
-        <div className="mt-8 bg-amber-50 border border-amber-200 rounded-lg p-4 text-sm text-amber-900">
+        <div className="mt-8 bg-red-50 border border-red-200 rounded-lg p-4 text-sm text-red-800">
           <p className="font-semibold mb-1">⚠️ Como funciona</p>
           <ul className="list-disc list-inside space-y-1 text-xs">
             <li>Suba o relatório de lançamentos do ERP (PDF ou Excel).</li>
@@ -3742,7 +3903,7 @@ function ExtratoBancarioFlow({ banco, onTrocar }) {
     <div className="max-w-7xl mx-auto">
       <div className="mb-8 border-b border-stone-200 pb-6">
         <div className="flex items-baseline gap-3 mb-2">
-          <span className="text-xs uppercase tracking-[0.2em] text-amber-800 font-semibold">
+          <span className="text-xs uppercase tracking-[0.2em] text-red-700 font-semibold">
             Módulo 02
           </span>
           <span className="text-stone-300">—</span>
@@ -3751,7 +3912,7 @@ function ExtratoBancarioFlow({ banco, onTrocar }) {
           </span>
           <button
             onClick={onTrocar}
-            className="ml-2 text-xs text-amber-800 hover:text-amber-900 underline"
+            className="ml-2 text-xs text-red-700 hover:text-red-800 underline"
           >
             trocar banco
           </button>
@@ -3871,7 +4032,7 @@ function ExtratoBancarioFlow({ banco, onTrocar }) {
                 onClick={() => setActiveView("soBanco")}
                 className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
                   activeView === "soBanco"
-                    ? "bg-white text-amber-900 shadow-sm"
+                    ? "bg-white text-red-800 shadow-sm"
                     : "text-stone-600 hover:text-stone-900"
                 }`}
               >
@@ -3886,7 +4047,7 @@ function ExtratoBancarioFlow({ banco, onTrocar }) {
                 placeholder="Buscar por valor, histórico ou documento…"
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
-                className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-amber-700/30 focus:border-amber-700"
+                className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-red-700/30 focus:border-red-700"
               />
             </div>
 
@@ -3928,8 +4089,8 @@ function ExtratoBancarioFlow({ banco, onTrocar }) {
       )}
 
       {!erpFile && !bancoFile && !loading && (
-        <div className="text-center py-16 bg-gradient-to-b from-amber-50/40 to-transparent rounded-lg border border-stone-200">
-          <CircleDollarSign className="w-10 h-10 text-amber-800 mx-auto mb-3" />
+        <div className="text-center py-16 bg-gradient-to-b from-red-50/40 to-transparent rounded-lg border border-stone-200">
+          <CircleDollarSign className="w-10 h-10 text-red-700 mx-auto mb-3" />
           <p className="font-serif text-lg text-stone-800 mb-1">
             Pronto para conciliar
           </p>
@@ -4273,7 +4434,7 @@ function BluFlow({ banco, onTrocar }) {
     <div className="max-w-7xl mx-auto">
       <div className="mb-8 border-b border-stone-200 pb-6">
         <div className="flex items-baseline gap-3 mb-2">
-          <span className="text-xs uppercase tracking-[0.2em] text-amber-800 font-semibold">
+          <span className="text-xs uppercase tracking-[0.2em] text-red-700 font-semibold">
             Módulo 02
           </span>
           <span className="text-stone-300">—</span>
@@ -4282,7 +4443,7 @@ function BluFlow({ banco, onTrocar }) {
           </span>
           <button
             onClick={onTrocar}
-            className="ml-2 text-xs text-amber-800 hover:text-amber-900 underline"
+            className="ml-2 text-xs text-red-700 hover:text-red-800 underline"
           >
             trocar banco
           </button>
@@ -4480,7 +4641,7 @@ function BluFlow({ banco, onTrocar }) {
                 onClick={() => setActiveView("soBlu")}
                 className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
                   activeView === "soBlu"
-                    ? "bg-white text-amber-900 shadow-sm"
+                    ? "bg-white text-red-800 shadow-sm"
                     : "text-stone-600 hover:text-stone-900"
                 }`}
               >
@@ -4519,7 +4680,7 @@ function BluFlow({ banco, onTrocar }) {
                 placeholder="Buscar por cliente, NSU, valor…"
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
-                className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-amber-700/30 focus:border-amber-700"
+                className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-red-700/30 focus:border-red-700"
               />
             </div>
 
@@ -4758,7 +4919,7 @@ function PagueVelozPixFlow({ banco, onTrocar }) {
         <div className="flex items-baseline gap-3 mb-2">
           <button
             onClick={onTrocar}
-            className="text-xs uppercase tracking-[0.2em] text-amber-800 font-semibold hover:text-amber-900 flex items-center gap-1"
+            className="text-xs uppercase tracking-[0.2em] text-red-700 font-semibold hover:text-red-800 flex items-center gap-1"
           >
             <ChevronLeft className="w-3 h-3" />
             Trocar conta
@@ -4915,7 +5076,7 @@ function PagueVelozPixFlow({ banco, onTrocar }) {
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
                 placeholder="Buscar por cliente, valor, pagante…"
-                className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded bg-white focus:outline-none focus:ring-2 focus:ring-amber-700/30 focus:border-amber-700"
+                className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded bg-white focus:outline-none focus:ring-2 focus:ring-red-700/30 focus:border-red-700"
               />
             </div>
             <button
@@ -4953,7 +5114,7 @@ function PagueVelozPixFlow({ banco, onTrocar }) {
               onClick={() => setActiveView("soNoExtrato")}
               className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
                 activeView === "soNoExtrato"
-                  ? "bg-white text-amber-900 shadow-sm"
+                  ? "bg-white text-red-800 shadow-sm"
                   : "text-stone-600 hover:text-stone-900"
               }`}
             >
@@ -5106,36 +5267,36 @@ function PixSoNoExtratoList({ items }) {
   }
   return (
     <div className="space-y-2">
-      <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-3 flex items-start gap-2">
-        <AlertTriangle className="w-4 h-4 text-amber-700 mt-0.5 flex-shrink-0" />
-        <div className="text-xs text-amber-900">
+      <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-3 flex items-start gap-2">
+        <AlertTriangle className="w-4 h-4 text-red-700 mt-0.5 flex-shrink-0" />
+        <div className="text-xs text-red-800">
           <p className="font-semibold mb-1">PIX recebidos na Pague Veloz sem venda correspondente no ERP.</p>
           <p>Pode ser PIX VELOZ VPP ou PIX VELOZ SS (não Express), ou venda esquecida no sistema.</p>
         </div>
       </div>
 
       {items.map((p, i) => (
-        <div key={i} className="border border-amber-200 bg-white rounded-lg p-4">
+        <div key={i} className="border border-red-200 bg-white rounded-lg p-4">
           <div className="flex items-start gap-4">
-            <div className="w-10 h-10 rounded-md bg-amber-100 flex items-center justify-center flex-shrink-0">
-              <AlertTriangle className="w-5 h-5 text-amber-700" />
+            <div className="w-10 h-10 rounded-md bg-red-100 flex items-center justify-center flex-shrink-0">
+              <AlertTriangle className="w-5 h-5 text-red-700" />
             </div>
             <div className="flex-1 min-w-0">
               <div className="flex items-baseline gap-2 mb-1 flex-wrap">
                 <span className="text-xs font-mono text-stone-500">{formatarData(p.dataPix)}</span>
-                <span className="text-[10px] uppercase tracking-wider bg-amber-100 text-amber-900 px-1.5 py-0.5 rounded font-semibold border border-amber-300">
+                <span className="text-[10px] uppercase tracking-wider bg-red-100 text-red-800 px-1.5 py-0.5 rounded font-semibold border border-red-300">
                   PIX sem correspondente
                 </span>
               </div>
               <h3 className="font-serif font-semibold text-stone-900 truncate">
                 {p.pagante || "(sem pagante informado)"}
               </h3>
-              <div className="mt-2 text-xs px-3 py-2 rounded border bg-amber-50 border-amber-200 text-amber-900">
+              <div className="mt-2 text-xs px-3 py-2 rounded border bg-red-50 border-red-200 text-red-800">
                 <strong>Motivo:</strong> {p.motivoDetalhe}
               </div>
             </div>
             <div className="text-right flex-shrink-0">
-              <p className="font-serif text-xl font-bold text-amber-700">
+              <p className="font-serif text-xl font-bold text-red-700">
                 {formatarMoeda(p.valor)}
               </p>
             </div>
@@ -5247,7 +5408,7 @@ function MotivoBadge({ motivo }) {
   if (!info) return null;
   const cores = {
     red: "bg-red-100 text-red-800 border-red-200",
-    amber: "bg-amber-100 text-amber-900 border-amber-300",
+    amber: "bg-red-100 text-red-800 border-red-300",
     orange: "bg-orange-100 text-orange-900 border-orange-300",
     purple: "bg-purple-100 text-purple-900 border-purple-300",
   };
@@ -5283,7 +5444,7 @@ function BluSoErpList({ items }) {
         // Paletas: red (cr\u00edtico), amber (aten\u00e7\u00e3o), orange (sem NSU - poss\u00edvel outra maquininha), purple (NSU divergente)
         const paletas = {
           red: { borda: "border-red-200", bg: "bg-red-100", icone: "text-red-700", valor: "text-red-700", caixa: "bg-red-50 border-red-200 text-red-900" },
-          amber: { borda: "border-amber-200", bg: "bg-amber-100", icone: "text-amber-700", valor: "text-amber-700", caixa: "bg-amber-50 border-amber-200 text-amber-900" },
+          amber: { borda: "border-red-200", bg: "bg-red-100", icone: "text-red-700", valor: "text-red-700", caixa: "bg-red-50 border-red-200 text-red-800" },
           orange: { borda: "border-orange-300", bg: "bg-orange-100", icone: "text-orange-700", valor: "text-orange-700", caixa: "bg-orange-50 border-orange-200 text-orange-900" },
           purple: { borda: "border-purple-300", bg: "bg-purple-100", icone: "text-purple-700", valor: "text-purple-700", caixa: "bg-purple-50 border-purple-200 text-purple-900" },
         };
@@ -5356,9 +5517,9 @@ function BluSoBluList({ items, canceladas = false, nomeMaquininha = "Blu" }) {
   return (
     <div className="space-y-2">
       {!canceladas && (
-        <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-3 flex items-start gap-2">
-          <AlertCircle className="w-4 h-4 text-amber-700 mt-0.5 flex-shrink-0" />
-          <div className="text-xs text-amber-900">
+        <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-3 flex items-start gap-2">
+          <AlertCircle className="w-4 h-4 text-red-700 mt-0.5 flex-shrink-0" />
+          <div className="text-xs text-red-800">
             <p className="font-semibold mb-1">Vendas na {nomeMaquininha} que não foram lançadas no ERP.</p>
             <p>Cada venda mostra o motivo da divergência: NSU divergente nos dois arquivos, sem correspondente no ERP, valor diferente ou mês diferente.</p>
           </div>
@@ -5369,7 +5530,7 @@ function BluSoBluList({ items, canceladas = false, nomeMaquininha = "Blu" }) {
         // Para canceladas: cor stone fixa. Para divergências: cor depende do motivo.
         const paletas = {
           red: { borda: "border-red-200", bg: "bg-red-100", icone: "text-red-700", valor: "text-red-700", caixa: "bg-red-50 border-red-200 text-red-900" },
-          amber: { borda: "border-amber-200", bg: "bg-amber-100", icone: "text-amber-700", valor: "text-amber-700", caixa: "bg-amber-50 border-amber-200 text-amber-900" },
+          amber: { borda: "border-red-200", bg: "bg-red-100", icone: "text-red-700", valor: "text-red-700", caixa: "bg-red-50 border-red-200 text-red-800" },
           orange: { borda: "border-orange-300", bg: "bg-orange-100", icone: "text-orange-700", valor: "text-orange-700", caixa: "bg-orange-50 border-orange-200 text-orange-900" },
           purple: { borda: "border-purple-300", bg: "bg-purple-100", icone: "text-purple-700", valor: "text-purple-700", caixa: "bg-purple-50 border-purple-200 text-purple-900" },
           stone: { borda: "border-stone-300", bg: "bg-stone-100", icone: "text-stone-700", valor: "text-stone-700", caixa: "bg-stone-50 border-stone-200 text-stone-900" },
@@ -5554,7 +5715,7 @@ function ConciliadosFinanceirosList({ items }) {
       {items.map((c, i) => {
         const isAviso = c.conferir || c.diffDias > 0;
         const corBorda = isAviso
-          ? "border-amber-200 bg-amber-50/30"
+          ? "border-red-200 bg-red-50/30"
           : "border-emerald-200 bg-white";
         return (
           <div key={i} className={`border rounded-lg overflow-hidden ${corBorda}`}>
@@ -5564,11 +5725,11 @@ function ConciliadosFinanceirosList({ items }) {
             >
               <div
                 className={`w-10 h-10 rounded-md flex items-center justify-center flex-shrink-0 ${
-                  isAviso ? "bg-amber-100" : "bg-emerald-100"
+                  isAviso ? "bg-red-100" : "bg-emerald-100"
                 }`}
               >
                 {isAviso ? (
-                  <AlertCircle className="w-5 h-5 text-amber-700" />
+                  <AlertCircle className="w-5 h-5 text-red-700" />
                 ) : (
                   <CheckCircle2 className="w-5 h-5 text-emerald-700" />
                 )}
@@ -5578,13 +5739,13 @@ function ConciliadosFinanceirosList({ items }) {
                   <span className="text-xs font-mono text-stone-500">
                     {c.erp.dataStr}
                     {c.diffDias > 0 && (
-                      <span className="text-amber-700 ml-1">
+                      <span className="text-red-700 ml-1">
                         ⇄ {c.banco.dataStr}
                       </span>
                     )}
                   </span>
                   {c.conferir && (
-                    <span className="text-[10px] uppercase tracking-wider bg-amber-200 text-amber-900 px-1.5 py-0.5 rounded font-semibold">
+                    <span className="text-[10px] uppercase tracking-wider bg-red-200 text-red-800 px-1.5 py-0.5 rounded font-semibold">
                       Conferir
                     </span>
                   )}
@@ -5655,7 +5816,7 @@ function ConciliadosFinanceirosList({ items }) {
 function DivergenciaSimplesList({ items, cor }) {
   const cores = {
     red: { borda: "border-red-200", bg: "bg-red-50/30", icone: "text-red-700", iconeBg: "bg-red-100" },
-    amber: { borda: "border-amber-200", bg: "bg-amber-50/30", icone: "text-amber-700", iconeBg: "bg-amber-100" },
+    amber: { borda: "border-red-200", bg: "bg-red-50/30", icone: "text-red-700", iconeBg: "bg-red-100" },
   };
   const c = cores[cor] || cores.red;
 
@@ -5741,12 +5902,12 @@ function DivergenciaSimplesList({ items, cor }) {
 function PlaceholderModule({ title, description }) {
   return (
     <div className="max-w-3xl mx-auto text-center py-20">
-      <div className="inline-block p-4 bg-amber-50 rounded-full mb-4">
-        <Settings className="w-8 h-8 text-amber-800" />
+      <div className="inline-block p-4 bg-red-50 rounded-full mb-4">
+        <Settings className="w-8 h-8 text-red-700" />
       </div>
       <h1 className="font-serif text-3xl font-bold text-stone-900 mb-2">{title}</h1>
       <p className="text-stone-600">{description}</p>
-      <p className="text-xs uppercase tracking-widest text-amber-800 font-semibold mt-6">
+      <p className="text-xs uppercase tracking-widest text-red-700 font-semibold mt-6">
         Em breve
       </p>
     </div>
@@ -5764,9 +5925,10 @@ export default function App() {
   // Hooks restantes (sempre chamados, em qualquer ordem — regras de hooks do React)
   const { module: activeModule, bancoId: bancoSelecionadoId, navigate } = useHashRoute();
   const setActiveModule = (m) => navigate(m, null);
-  const { table: colorTable, save: saveColorTable, loaded: colorsLoaded } = useColorTable();
-  const { taxas: taxasBlu, save: saveTaxasBlu, loaded: taxasBluLoaded } = useTaxasBlu();
-  const { taxas: taxasPV, save: saveTaxasPV, loaded: taxasPVLoaded } = useTaxasPagueVeloz();
+  // ETAPA B: agora também recebemos o `error` de cada hook pra mostrar na UI
+  const { table: colorTable, save: saveColorTable, loaded: colorsLoaded, error: errorCores } = useColorTable();
+  const { taxas: taxasBlu, save: saveTaxasBlu, loaded: taxasBluLoaded, error: errorTaxasBlu } = useTaxasBlu();
+  const { taxas: taxasPV, save: saveTaxasPV, loaded: taxasPVLoaded, error: errorTaxasPV } = useTaxasPagueVeloz();
 
   // === PROTEÇÃO DE LOGIN ===
   // Enquanto verifica se está logado, mostra um carregamento simples
@@ -5839,22 +6001,25 @@ export default function App() {
       `}</style>
 
       {/* Top Bar */}
-      <header className="bg-stone-900 text-stone-100 border-b-4 border-amber-700">
+      <header
+        className="text-white border-b-4 border-rose-500"
+        style={{ background: "linear-gradient(90deg, #7f1d1d 0%, #b91c1c 100%)" }}
+      >
         <div className="max-w-7xl mx-auto px-6 py-4 flex items-center gap-4">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-md bg-amber-700 flex items-center justify-center">
-              <Armchair className="w-5 h-5 text-stone-100" />
+            <div className="w-10 h-10 rounded-md bg-white/15 border border-white/25 flex items-center justify-center">
+              <Armchair className="w-5 h-5 text-white" />
             </div>
             <div>
               <h1 className="font-serif text-xl font-bold tracking-tight leading-none">
                 Sofá Show
               </h1>
-              <p className="text-[10px] uppercase tracking-[0.2em] text-amber-300/80 mt-0.5">
-                Operações
+              <p className="text-[10px] uppercase tracking-[0.2em] text-rose-100/90 mt-0.5">
+                App exclusivo da empresa
               </p>
             </div>
           </div>
-          <div className="ml-auto text-xs text-stone-400 hidden md:block">
+          <div className="ml-auto text-xs text-white/70 hidden md:block">
             21/04/2026
           </div>
         </div>
@@ -5875,7 +6040,7 @@ export default function App() {
                   disabled={!m.available}
                   className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md text-sm text-left transition-colors ${
                     activeModule === m.id
-                      ? "bg-amber-50 text-amber-900 font-semibold"
+                      ? "bg-red-50 text-red-800 font-semibold border-l-4 border-red-700 rounded-l-none pl-2"
                       : m.available
                       ? "text-stone-700 hover:bg-stone-100"
                       : "text-stone-400 cursor-not-allowed"
@@ -5924,7 +6089,7 @@ export default function App() {
                 onClick={() => setActiveModule(m.id)}
                 className={`flex-1 flex flex-col items-center py-2 text-[10px] ${
                   activeModule === m.id
-                    ? "text-amber-900 font-semibold"
+                    ? "text-red-800 font-semibold"
                     : "text-stone-600"
                 }`}
               >
@@ -5940,7 +6105,11 @@ export default function App() {
             <ConciliacaoModule colorTable={colorTable} />
           )}
           {activeModule === "cores" && colorsLoaded && (
-            <ColorTableModule table={colorTable} onSave={saveColorTable} />
+            <ColorTableModule
+              table={colorTable}
+              onSave={saveColorTable}
+              supabaseError={errorCores}
+            />
           )}
           {activeModule === "cores" && !colorsLoaded && (
             <div className="flex items-center gap-2 text-stone-500 justify-center py-20">
@@ -5961,6 +6130,8 @@ export default function App() {
               onSaveTaxasBlu={saveTaxasBlu}
               taxasPV={taxasPV}
               onSaveTaxasPV={saveTaxasPV}
+              supabaseErrorBlu={errorTaxasBlu}
+              supabaseErrorPV={errorTaxasPV}
             />
           )}
           {activeModule === "taxas" && (!taxasBluLoaded || !taxasPVLoaded) && (
