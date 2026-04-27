@@ -1872,6 +1872,73 @@ function useTaxasPagueVeloz() {
 }
 
 // ============================================================
+// HASH ROUTING
+// Converte a URL hash em { module, bancoId } e vice-versa.
+// Formato: #/<module>[/<bancoId>]
+// Exemplos:
+//   #/                                  → módulo conciliacao (default)
+//   #/cores                              → módulo cores
+//   #/financeiro                         → módulo financeiro (tela de seleção)
+//   #/financeiro/pague_veloz_express     → financeiro com banco pré-selecionado
+//   #/taxas                              → tabelas de taxas
+// ============================================================
+
+const ROTAS_VALIDAS = ["conciliacao", "cores", "financeiro", "taxas", "estoque", "relatorios", "config"];
+const BANCOS_VALIDOS = ["sicredi", "blu_ss", "blu_lupe", "pague_veloz_express", "pague_veloz_pix"];
+
+function parseHashRoute(hash) {
+  // Remove o "#" e barras iniciais
+  const limpo = (hash || "").replace(/^#\/?/, "").trim();
+  if (!limpo) return { module: "conciliacao", bancoId: null };
+
+  const partes = limpo.split("/").filter(Boolean);
+  const module = ROTAS_VALIDAS.includes(partes[0]) ? partes[0] : "conciliacao";
+  const bancoId = (module === "financeiro" && BANCOS_VALIDOS.includes(partes[1])) ? partes[1] : null;
+  return { module, bancoId };
+}
+
+function buildHashRoute(module, bancoId) {
+  if (!module || module === "conciliacao") {
+    return bancoId ? `#/conciliacao` : `#/`;
+  }
+  if (module === "financeiro" && bancoId) {
+    return `#/financeiro/${bancoId}`;
+  }
+  return `#/${module}`;
+}
+
+// Hook que sincroniza a URL hash com o estado de navegação do app.
+// Retorna { module, bancoId, navigate(module, bancoId) }
+function useHashRoute() {
+  const [route, setRoute] = useState(() => parseHashRoute(window.location.hash));
+
+  useEffect(() => {
+    const onHashChange = () => {
+      setRoute(parseHashRoute(window.location.hash));
+    };
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+
+  const navigate = useCallback((module, bancoId = null) => {
+    const novoHash = buildHashRoute(module, bancoId);
+    // Se já estamos nessa rota, não faz nada (evita loop)
+    if (window.location.hash === novoHash || (window.location.hash === "" && novoHash === "#/")) {
+      // Só atualiza o estado interno se necessário
+      const atual = parseHashRoute(window.location.hash);
+      if (atual.module !== module || atual.bancoId !== bancoId) {
+        setRoute({ module, bancoId });
+      }
+      return;
+    }
+    window.location.hash = novoHash;
+    // O hashchange listener vai disparar e atualizar o estado
+  }, []);
+
+  return { module: route.module, bancoId: route.bancoId, navigate };
+}
+
+// ============================================================
 // UI COMPONENTS
 // ============================================================
 
@@ -3261,11 +3328,15 @@ function TaxasModule({ taxasBlu, onSaveTaxasBlu, taxasPV, onSaveTaxasPV }) {
 // MÓDULO: CONCILIAÇÃO FINANCEIRA
 // ============================================================
 
-function FinanceiroModule() {
-  const [bancoSelecionado, setBancoSelecionado] = useState(null);
+function FinanceiroModule({ bancoSelecionadoId, onSelecionarBanco, onTrocarBanco }) {
+  // Resolve o banco a partir do ID vindo da URL
+  const bancoSelecionado = useMemo(
+    () => BANCOS_SUPORTADOS.find((b) => b.id === bancoSelecionadoId) || null,
+    [bancoSelecionadoId]
+  );
 
   const trocarBanco = () => {
-    setBancoSelecionado(null);
+    onTrocarBanco();
   };
 
   // === SELEÇÃO DE BANCO ===
@@ -3300,7 +3371,7 @@ function FinanceiroModule() {
           {BANCOS_SUPORTADOS.map((banco) => (
             <button
               key={banco.id}
-              onClick={() => !banco.emBreve && setBancoSelecionado(banco)}
+              onClick={() => !banco.emBreve && onSelecionarBanco(banco.id)}
               disabled={banco.emBreve}
               className={`p-6 border-2 rounded-lg text-left transition-all ${
                 banco.emBreve
@@ -5600,7 +5671,8 @@ function PlaceholderModule({ title, description }) {
 // ============================================================
 
 export default function App() {
-  const [activeModule, setActiveModule] = useState("conciliacao");
+  const { module: activeModule, bancoId: bancoSelecionadoId, navigate } = useHashRoute();
+  const setActiveModule = (m) => navigate(m, null);
   const { table: colorTable, save: saveColorTable, loaded: colorsLoaded } = useColorTable();
   const { taxas: taxasBlu, save: saveTaxasBlu, loaded: taxasBluLoaded } = useTaxasBlu();
   const { taxas: taxasPV, save: saveTaxasPV, loaded: taxasPVLoaded } = useTaxasPagueVeloz();
@@ -5745,7 +5817,13 @@ export default function App() {
               Carregando tabela…
             </div>
           )}
-          {activeModule === "financeiro" && <FinanceiroModule />}
+          {activeModule === "financeiro" && (
+            <FinanceiroModule
+              bancoSelecionadoId={bancoSelecionadoId}
+              onSelecionarBanco={(id) => navigate("financeiro", id)}
+              onTrocarBanco={() => navigate("financeiro", null)}
+            />
+          )}
           {activeModule === "taxas" && taxasBluLoaded && taxasPVLoaded && (
             <TaxasModule
               taxasBlu={taxasBlu}
