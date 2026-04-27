@@ -17,6 +17,7 @@ import {
   Loader2,
   X,
   ChevronRight,
+  ChevronLeft,
   Armchair,
   Palette,
   Plus,
@@ -4567,6 +4568,71 @@ function PagueVelozPixFlow({ banco, onTrocar }) {
           extrato da Pague Veloz. O match é feito por <strong>valor + mês</strong>{" "}
           (sem usar NSU ou nome do cliente).
         </p>
+      </div>
+
+      {/* Passo-a-passo: como tirar o extrato PIX */}
+      <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6">
+        <div className="flex items-start gap-3 mb-3">
+          <AlertCircle className="w-5 h-5 text-blue-700 mt-0.5 flex-shrink-0" />
+          <div>
+            <h3 className="font-serif text-base font-semibold text-blue-900">
+              Como tirar o relatório de PIX da Pague Veloz
+            </h3>
+            <p className="text-xs text-blue-800 mt-0.5">
+              Siga os passos abaixo para baixar o extrato da conta com os PIX recebidos.
+            </p>
+          </div>
+        </div>
+
+        <ol className="space-y-2.5 text-sm text-blue-900 ml-1">
+          <li className="flex gap-2">
+            <span className="flex-shrink-0 w-5 h-5 rounded-full bg-blue-700 text-white text-xs font-bold flex items-center justify-center">1</span>
+            <div className="flex-1">
+              Acesse{" "}
+              <a
+                href="https://www.pagueveloz.com.br/conta/consultas/extrato/"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-700 underline hover:text-blue-900 font-mono text-xs break-all"
+              >
+                pagueveloz.com.br/conta/consultas/extrato
+              </a>
+            </div>
+          </li>
+          <li className="flex gap-2">
+            <span className="flex-shrink-0 w-5 h-5 rounded-full bg-blue-700 text-white text-xs font-bold flex items-center justify-center">2</span>
+            <div className="flex-1">
+              Faça login com o e-mail{" "}
+              <code className="bg-white border border-blue-200 px-1.5 py-0.5 rounded font-mono text-xs">sacsofashow@gmail.com</code>
+              {" "}e a senha da conta
+            </div>
+          </li>
+          <li className="flex gap-2">
+            <span className="flex-shrink-0 w-5 h-5 rounded-full bg-blue-700 text-white text-xs font-bold flex items-center justify-center">3</span>
+            <div className="flex-1">
+              Clique na aba <strong>Consultas</strong>
+            </div>
+          </li>
+          <li className="flex gap-2">
+            <span className="flex-shrink-0 w-5 h-5 rounded-full bg-blue-700 text-white text-xs font-bold flex items-center justify-center">4</span>
+            <div className="flex-1">
+              Informe o <strong>período</strong> que você quer conciliar
+            </div>
+          </li>
+          <li className="flex gap-2">
+            <span className="flex-shrink-0 w-5 h-5 rounded-full bg-blue-700 text-white text-xs font-bold flex items-center justify-center">5</span>
+            <div className="flex-1">
+              Clique em <strong>Exportar CSV</strong>
+            </div>
+          </li>
+          <li className="flex gap-2">
+            <span className="flex-shrink-0 w-5 h-5 rounded-full bg-blue-700 text-white text-xs font-bold flex items-center justify-center">6</span>
+            <div className="flex-1">
+              Volte aqui e envie o arquivo no campo <strong>Extrato da Pague Veloz</strong> abaixo.
+              O app vai filtrar automaticamente só os PIX recebidos.
+            </div>
+          </li>
+        </ol>
       </div>
 
       <div className="grid md:grid-cols-2 gap-4 mb-6">
