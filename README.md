@@ -1,3 +1,3 @@
-# Sofá Show - App de Conciliação
+# Sofá Show - App 
 
 App da Sofá Show 
