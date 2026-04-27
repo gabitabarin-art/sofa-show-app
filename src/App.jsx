@@ -667,11 +667,13 @@ const TOLERANCIA_DIAS = 4;
 // Bancos do tipo "extrato" usam o fluxo Sicredi (ERP + extrato).
 // Bancos do tipo "blu" usam o fluxo Blu (Excel da Blu + PDF do ERP por seção, match por NSU).
 // Bancos do tipo "pague_veloz" usam o fluxo PV (CSV PV + PDF do ERP por seção, match por NSU/Cod.Autorização).
+// Bancos do tipo "pague_veloz_pix" usam o fluxo PV PIX (extrato PV + PDF do ERP, match por valor + mês).
 const BANCOS_SUPORTADOS = [
   { id: "sicredi", nome: "Sicredi", tipo: "extrato", cor: "emerald" },
   { id: "blu_ss", nome: "Blu SS Express", tipo: "blu", secaoPdf: "BLU SS EXPRESS", cor: "purple" },
   { id: "blu_lupe", nome: "Blu Lupe", tipo: "blu", secaoPdf: "BLU LUPE", cor: "purple" },
   { id: "pague_veloz_express", nome: "Pague Veloz Express", tipo: "pague_veloz", secaoPdf: "CARTÃO VELOZ EXP", cor: "blue" },
+  { id: "pague_veloz_pix", nome: "Pague Veloz PIX", tipo: "pague_veloz_pix", secaoPdf: "PIX VELOZ EXPRES", cor: "blue" },
 ];
 
 // Converte "R$ -1.234,56" ou "1234,56" ou "-1,234.56" em número
@@ -1220,6 +1222,136 @@ async function readPagueVelozCsv(file) {
   return vendas;
 }
 
+// Lê o EXTRATO da Pague Veloz (relatorio-extrato.csv) e devolve só os
+// "PIX Recebidos" — que são os PIX que entraram na conta da PV.
+// Este arquivo tem estrutura totalmente diferente do relatório de operações:
+//   colunas: Id, Data, DataHora, Tipo, TipoInt, TipoEnum, Descricao, Valor
+// Ignora todas as outras movimentações (operações de cartão, saques, estornos, etc.).
+async function readPagueVelozExtratoPix(file) {
+  const texto = await file.text();
+  const linhas = texto.split(/\r?\n/).filter((l) => l.trim());
+  if (linhas.length < 2) return [];
+
+  const cabecalho = linhas[0].split(";").map((h) => h.trim());
+  const idx = (nome) => cabecalho.findIndex((h) => h.toLowerCase() === nome.toLowerCase());
+
+  const iId        = idx("Id");
+  const iData      = idx("Data");
+  const iTipoEnum  = idx("TipoEnum");
+  const iDescricao = idx("Descricao");
+  const iValor     = idx("Valor");
+
+  const recebidos = [];
+  for (let i = 1; i < linhas.length; i++) {
+    const cols = linhas[i].split(";");
+    if (cols.length < 5) continue;
+    // Filtra: só PIX RECEBIDO
+    const tipoEnum = (cols[iTipoEnum] || "").trim();
+    if (tipoEnum !== "PixRecebido") continue;
+
+    const id        = (cols[iId] || "").trim();
+    const dataStr   = (cols[iData] || "").trim();
+    const valorStr  = (cols[iValor] || "").trim();
+    const descricao = (cols[iDescricao] || "").trim();
+
+    const dataPix = parseData(dataStr);
+    const valor = parseValor(valorStr);
+    if (!dataPix || isNaN(valor) || valor <= 0) continue;
+
+    recebidos.push({
+      id,
+      dataPix,
+      valor,
+      // Descrição (nome do pagador) é guardada só pra mostrar na UI
+      // mas NÃO é usada no matching (conforme pedido)
+      pagante: descricao,
+    });
+  }
+
+  return recebidos;
+}
+
+// Conciliação PIX simples: APENAS valor + mês.
+// Não usa NSU nem nome do cliente. Se houver vários PIX com mesmo valor
+// no mesmo mês, casa o primeiro disponível na ordem.
+//
+// Retorna { conciliados, soNoErp, soNoExtrato }
+//   conciliados: [{ erp, pix }] — vendas que foram pareadas
+//   soNoErp:     [{ ...erp, motivoDetalhe }] — vendas no ERP sem PIX correspondente
+//   soNoExtrato: [{ ...pix, motivoDetalhe }] — PIX no extrato sem venda correspondente
+function conciliarPixPagueVeloz(vendasErp, pixRecebidos, toleranciaValor = 0.01) {
+  // Indexa PIX por (ano-mês, valor arredondado em centavos)
+  const pixPorChave = new Map();
+  for (const p of pixRecebidos) {
+    const key = `${p.dataPix.getFullYear()}-${p.dataPix.getMonth()}-${Math.round(p.valor * 100)}`;
+    if (!pixPorChave.has(key)) pixPorChave.set(key, []);
+    pixPorChave.get(key).push(p);
+  }
+  // Ordena cada bucket por data — quando há vários PIX com mesmo valor no mês,
+  // casamos com a venda mais antiga primeiro
+  for (const lista of pixPorChave.values()) {
+    lista.sort((a, b) => a.dataPix - b.dataPix);
+  }
+
+  const conciliados = [];
+  const soNoErp = [];
+  const usados = new Set();
+
+  for (const v of vendasErp) {
+    if (!v.data) {
+      soNoErp.push({ ...v, motivoDetalhe: "ERP sem data válida — não foi possível conciliar." });
+      continue;
+    }
+    const cents = Math.round(v.valor * 100);
+    // Tolerância de R$ 0,01: testa o valor exato e os 2 vizinhos em centavos
+    const candKeys = [
+      `${v.data.getFullYear()}-${v.data.getMonth()}-${cents}`,
+      `${v.data.getFullYear()}-${v.data.getMonth()}-${cents - 1}`,
+      `${v.data.getFullYear()}-${v.data.getMonth()}-${cents + 1}`,
+    ];
+
+    let achou = null;
+    for (const k of candKeys) {
+      const lista = pixPorChave.get(k);
+      if (!lista) continue;
+      for (const p of lista) {
+        if (usados.has(p.id)) continue;
+        if (Math.abs(p.valor - v.valor) > toleranciaValor) continue;
+        achou = p;
+        usados.add(p.id);
+        break;
+      }
+      if (achou) break;
+    }
+
+    if (achou) {
+      conciliados.push({ erp: v, pix: achou });
+    } else {
+      soNoErp.push({
+        ...v,
+        motivoDetalhe:
+          `Não há PIX recebido no extrato da Pague Veloz com valor ${formatarMoeda(v.valor)} ` +
+          `dentro do mês ${String(v.data.getMonth() + 1).padStart(2, "0")}/${v.data.getFullYear()}. ` +
+          `Verifique se o valor lançado no ERP está correto ou se o PIX foi para outra conta.`,
+      });
+    }
+  }
+
+  // PIX que sobraram no extrato e não foram pareados
+  const soNoExtrato = pixRecebidos
+    .filter((p) => !usados.has(p.id))
+    .map((p) => ({
+      ...p,
+      motivoDetalhe:
+        `Este PIX recebido na Pague Veloz não tem venda correspondente no ERP em ` +
+        `${String(p.dataPix.getMonth() + 1).padStart(2, "0")}/${p.dataPix.getFullYear()} ` +
+        `com valor ${formatarMoeda(p.valor)}. Pode ser PIX VELOZ VPP ou PIX VELOZ SS ` +
+        `(não Express), ou venda esquecida no sistema.`,
+    }));
+
+  return { conciliados, soNoErp, soNoExtrato };
+}
+
 // Lê o PDF do ERP (Vendas Por Finalizadores) e extrai vendas de uma seção
 // específica (BLU SS EXPRESS ou BLU LUPE).
 async function readErpBluPdf(file, secaoNome) {
@@ -1343,6 +1475,9 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01, tabelaTaxas 
   // Escolhe o conferidor de taxa apropriado
   const conferirTaxa = tipoMaquininha === "pague_veloz" ? conferirTaxaVendaPV : conferirTaxaVenda;
 
+  // Nome amigável da maquininha pra usar nas mensagens de motivo
+  const nomeMaquininha = tipoMaquininha === "pague_veloz" ? "Pague Veloz" : "Blu";
+
   // Helper: mesmo mês entre 2 datas
   const mesmoMes = (d1, d2) =>
     d1 && d2 &&
@@ -1410,9 +1545,9 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01, tabelaTaxas 
       }
 
       if (candNsuDivergente) {
-        // 🟠 NSU divergente: mesmo valor e mês, mas NSU diferente entre ERP e Blu
+        // 🟣 NSU divergente: mesmo valor e mês, mas NSU diferente entre ERP e o extrato
         const motivoDetalhe =
-          `NSU divergente entre os dois arquivos: ERP registra "${vErp.nsuErp}" e Blu registra "${candNsuDivergente.autorizacao}". ` +
+          `NSU divergente entre os dois arquivos: ERP registra "${vErp.nsuErp}" e ${nomeMaquininha} registra "${candNsuDivergente.autorizacao}". ` +
           `Os dois lançamentos têm mesmo valor (${formatarMoeda(vErp.valor)}) e mesmo mês (${formatMesAno(vErp.data)}), ` +
           `provável erro de digitação em um dos lados.`;
         soNoErp.push({
@@ -1425,11 +1560,16 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01, tabelaTaxas 
         continue;
       }
 
-      // 🔴 O NSU do ERP não existe no extrato da Blu (e não tem nada com mesmo valor/mês)
+      // 🟠 O NSU do ERP não existe no extrato da maquininha (e não tem nada com mesmo valor/mês)
+      // Pode ser que essa venda tenha sido passada em outra maquininha
+      const nomeMaquininha = tipoMaquininha === "pague_veloz" ? "Pague Veloz" : "Blu";
       soNoErp.push({
         ...vErp,
         motivo: "sem_nsu",
-        motivoDetalhe: "O NSU não foi encontrado no extrato da Blu (pode ser PIX ou venda fora desta maquininha).",
+        motivoDetalhe:
+          `O NSU "${vErp.nsuErp}" não foi encontrado no extrato da ${nomeMaquininha}. ` +
+          `Esta venda pode ter sido passada em outra maquininha (Blu, Pague Veloz, PIX, etc.) ` +
+          `ou foi lançada na seção errada do ERP.`,
       });
       continue;
     }
@@ -1446,20 +1586,20 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01, tabelaTaxas 
       const mm = mesmoMes(vErp.data, cand.dataVenda);
 
       if (mm && !valorBate) {
-        // 🟡 mesmo mês, valor diferente → vence outras hipóteses
+        // 🔴 mesmo mês, valor diferente → vence outras hipóteses
         const diff = (cand.valorBrutoTotal - vErp.valor);
         const diffStr = formatarMoeda(Math.abs(diff));
-        const sinal = diff > 0 ? "Blu maior" : "ERP maior";
+        const sinal = diff > 0 ? `${nomeMaquininha} maior` : "ERP maior";
         melhorCand = cand;
         motivo = "valor_diferente";
-        motivoDetalhe = `Valor diferente: ERP ${formatarMoeda(vErp.valor)} | Blu ${formatarMoeda(cand.valorBrutoTotal)} (diferença ${diffStr}, ${sinal}).`;
+        motivoDetalhe = `Valor diferente: ERP ${formatarMoeda(vErp.valor)} | ${nomeMaquininha} ${formatarMoeda(cand.valorBrutoTotal)} (diferença ${diffStr}, ${sinal}).`;
         break;
       }
       if (!mm && valorBate && !melhorCand) {
         // 🟡 valor igual, mês diferente
         melhorCand = cand;
         motivo = "mes_diferente";
-        motivoDetalhe = `Mês diferente: ERP ${formatMesAno(vErp.data)} | Blu ${formatMesAno(cand.dataVenda)} (mesmo valor e NSU).`;
+        motivoDetalhe = `Mês diferente: ERP ${formatMesAno(vErp.data)} | ${nomeMaquininha} ${formatMesAno(cand.dataVenda)} (mesmo valor e NSU).`;
       }
     }
 
@@ -1468,7 +1608,7 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01, tabelaTaxas 
       const cand = candidatos.find((c) => !bluMatched.has(c.nsu)) || candidatos[0];
       melhorCand = cand;
       motivo = "valor_e_mes_diferentes";
-      motivoDetalhe = `NSU bate, mas valor e mês são diferentes: ERP ${formatarMoeda(vErp.valor)} em ${formatMesAno(vErp.data)} | Blu ${formatarMoeda(cand.valorBrutoTotal)} em ${formatMesAno(cand.dataVenda)}.`;
+      motivoDetalhe = `NSU bate, mas valor e mês são diferentes: ERP ${formatarMoeda(vErp.valor)} em ${formatMesAno(vErp.data)} | ${nomeMaquininha} ${formatarMoeda(cand.valorBrutoTotal)} em ${formatMesAno(cand.dataVenda)}.`;
     }
 
     soNoErp.push({ ...vErp, motivo, motivoDetalhe, candidatoBlu: melhorCand });
@@ -1492,27 +1632,27 @@ function conciliarBlu(vendasBlu, vendasErp, toleranciaValor = 0.01, tabelaTaxas 
       if (motivo === "valor_diferente") {
         const diff = (vBlu.valorBrutoTotal - candidatoErp.valor);
         const diffStr = formatarMoeda(Math.abs(diff));
-        const sinal = diff > 0 ? "Blu maior" : "ERP maior";
-        motivoDetalhe = `Valor diferente: Blu ${formatarMoeda(vBlu.valorBrutoTotal)} | ERP ${formatarMoeda(candidatoErp.valor)} (diferença ${diffStr}, ${sinal}).`;
+        const sinal = diff > 0 ? `${nomeMaquininha} maior` : "ERP maior";
+        motivoDetalhe = `Valor diferente: ${nomeMaquininha} ${formatarMoeda(vBlu.valorBrutoTotal)} | ERP ${formatarMoeda(candidatoErp.valor)} (diferença ${diffStr}, ${sinal}).`;
       } else if (motivo === "mes_diferente") {
-        motivoDetalhe = `Mês diferente: Blu ${formatMesAno(vBlu.dataVenda)} | ERP ${formatMesAno(candidatoErp.data)} (mesmo valor e NSU).`;
+        motivoDetalhe = `Mês diferente: ${nomeMaquininha} ${formatMesAno(vBlu.dataVenda)} | ERP ${formatMesAno(candidatoErp.data)} (mesmo valor e NSU).`;
       } else if (motivo === "nsu_divergente") {
         motivoDetalhe =
-          `NSU divergente entre os dois arquivos: Blu registra "${vBlu.autorizacao}" e ERP registra "${candidatoErp.nsuErp}". ` +
+          `NSU divergente entre os dois arquivos: ${nomeMaquininha} registra "${vBlu.autorizacao}" e ERP registra "${candidatoErp.nsuErp}". ` +
           `Os dois lançamentos têm mesmo valor (${formatarMoeda(vBlu.valorBrutoTotal)}) e mesmo mês (${formatMesAno(vBlu.dataVenda)}), ` +
           `provável erro de digitação em um dos lados.`;
       } else {
-        motivoDetalhe = `NSU bate, mas valor e mês são diferentes: Blu ${formatarMoeda(vBlu.valorBrutoTotal)} em ${formatMesAno(vBlu.dataVenda)} | ERP ${formatarMoeda(candidatoErp.valor)} em ${formatMesAno(candidatoErp.data)}.`;
+        motivoDetalhe = `NSU bate, mas valor e mês são diferentes: ${nomeMaquininha} ${formatarMoeda(vBlu.valorBrutoTotal)} em ${formatMesAno(vBlu.dataVenda)} | ERP ${formatarMoeda(candidatoErp.valor)} em ${formatMesAno(candidatoErp.data)}.`;
       }
       soNaBlu.push({ ...vBlu, motivo, motivoDetalhe, candidatoErp });
       continue;
     }
 
-    // Sem candidato no ERP — venda 100% só na Blu
+    // Sem candidato no ERP — venda 100% só no extrato da maquininha
     soNaBlu.push({
       ...vBlu,
       motivo: "sem_no_erp",
-      motivoDetalhe: "Esta venda não tem correspondente no PDF do ERP (pode ser teste, venda esquecida no sistema ou divergência de cadastro).",
+      motivoDetalhe: `Esta venda não tem correspondente no PDF do ERP (pode ser teste, venda esquecida no sistema ou divergência de cadastro).`,
     });
   }
 
@@ -3173,9 +3313,14 @@ function FinanceiroModule() {
     );
   }
 
-  // === FLUXO MAQUININHA (Blu / Pague Veloz) ===
+  // === FLUXO MAQUININHA (Blu / Pague Veloz Cartão) ===
   if (bancoSelecionado.tipo === "blu" || bancoSelecionado.tipo === "pague_veloz") {
     return <BluFlow banco={bancoSelecionado} onTrocar={trocarBanco} />;
+  }
+
+  // === FLUXO PIX (Pague Veloz PIX) ===
+  if (bancoSelecionado.tipo === "pague_veloz_pix") {
+    return <PagueVelozPixFlow banco={bancoSelecionado} onTrocar={trocarBanco} />;
   }
 
   // === FLUXO EXTRATO (Sicredi e similares) ===
@@ -3946,6 +4091,72 @@ function BluFlow({ banco, onTrocar }) {
         </p>
       </div>
 
+      {/* Passo-a-passo: como tirar o extrato (apenas Pague Veloz) */}
+      {ehPagueVeloz && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6">
+          <div className="flex items-start gap-3 mb-3">
+            <AlertCircle className="w-5 h-5 text-blue-700 mt-0.5 flex-shrink-0" />
+            <div>
+              <h3 className="font-serif text-base font-semibold text-blue-900">
+                Como tirar o CSV da Pague Veloz
+              </h3>
+              <p className="text-xs text-blue-800 mt-0.5">
+                Siga os passos abaixo para baixar o relatório de operações.
+              </p>
+            </div>
+          </div>
+
+          <ol className="space-y-2.5 text-sm text-blue-900 ml-1">
+            <li className="flex gap-2">
+              <span className="flex-shrink-0 w-5 h-5 rounded-full bg-blue-700 text-white text-xs font-bold flex items-center justify-center">1</span>
+              <div className="flex-1">
+                Acesse{" "}
+                <a
+                  href="https://www.pagueveloz.com.br/conta/maquininha/relatorios/operacoes/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-blue-700 underline hover:text-blue-900 font-mono text-xs break-all"
+                >
+                  pagueveloz.com.br/conta/maquininha/relatorios/operacoes
+                </a>
+              </div>
+            </li>
+            <li className="flex gap-2">
+              <span className="flex-shrink-0 w-5 h-5 rounded-full bg-blue-700 text-white text-xs font-bold flex items-center justify-center">2</span>
+              <div className="flex-1">
+                Faça login com o e-mail{" "}
+                <code className="bg-white border border-blue-200 px-1.5 py-0.5 rounded font-mono text-xs">sacsofashow@gmail.com</code>
+                {" "}e a senha da conta
+              </div>
+            </li>
+            <li className="flex gap-2">
+              <span className="flex-shrink-0 w-5 h-5 rounded-full bg-blue-700 text-white text-xs font-bold flex items-center justify-center">3</span>
+              <div className="flex-1">
+                Clique na aba <strong>Maquininha</strong> e depois em <strong>Relatórios de Operações</strong>
+              </div>
+            </li>
+            <li className="flex gap-2">
+              <span className="flex-shrink-0 w-5 h-5 rounded-full bg-blue-700 text-white text-xs font-bold flex items-center justify-center">4</span>
+              <div className="flex-1">
+                No campo <strong>Status</strong>, selecione <strong>Pago</strong>
+              </div>
+            </li>
+            <li className="flex gap-2">
+              <span className="flex-shrink-0 w-5 h-5 rounded-full bg-blue-700 text-white text-xs font-bold flex items-center justify-center">5</span>
+              <div className="flex-1">
+                Clique em <strong>Buscar</strong> e depois em <strong>Exportar CSV</strong>
+              </div>
+            </li>
+            <li className="flex gap-2">
+              <span className="flex-shrink-0 w-5 h-5 rounded-full bg-blue-700 text-white text-xs font-bold flex items-center justify-center">6</span>
+              <div className="flex-1">
+                Volte aqui e envie o arquivo no campo <strong>CSV da Pague Veloz</strong> abaixo
+              </div>
+            </li>
+          </ol>
+        </div>
+      )}
+
       {/* Upload */}
       <div className="grid md:grid-cols-2 gap-4 mb-6">
         <FileDropZone
@@ -4165,6 +4376,501 @@ function BluFlow({ banco, onTrocar }) {
   );
 }
 
+// ============================================================
+// FLUXO: PAGUE VELOZ PIX
+// Conciliação simples por VALOR + MÊS, sem usar NSU nem nome do cliente.
+// Lê o extrato (relatorio-extrato.csv) e filtra só "Pix Recebido".
+// ============================================================
+
+function PagueVelozPixFlow({ banco, onTrocar }) {
+  const [extratoFile, setExtratoFile] = useState(null);
+  const [erpFile, setErpFile] = useState(null);
+  const [pixRecebidos, setPixRecebidos] = useState([]);
+  const [vendasErp, setVendasErp] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [activeView, setActiveView] = useState("conciliados");
+  const [searchTerm, setSearchTerm] = useState("");
+
+  const handleExtrato = async (f) => {
+    setError("");
+    setLoading(true);
+    setExtratoFile(f);
+    try {
+      const items = await readPagueVelozExtratoPix(f);
+      if (!items.length) {
+        setError(
+          `Nenhum PIX Recebido foi encontrado no extrato. Verifique se o arquivo é o "relatorio-extrato.csv" ` +
+          `e contém movimentações do tipo "Pix Recebido".`
+        );
+        setExtratoFile(null);
+      } else {
+        setPixRecebidos(items);
+      }
+    } catch (e) {
+      setError("Erro ao ler extrato da Pague Veloz: " + e.message);
+      setExtratoFile(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleErp = async (f) => {
+    setError("");
+    setLoading(true);
+    setErpFile(f);
+    try {
+      const items = await readErpBluPdf(f, banco.secaoPdf);
+      if (!items.length) {
+        setError(
+          `Nenhuma venda foi encontrada na seção "${banco.secaoPdf}" do PDF do ERP. ` +
+          `Verifique se o relatório é "Vendas Por Finalizadores" e contém essa forma de pagamento.`
+        );
+        setErpFile(null);
+      } else {
+        setVendasErp(items);
+      }
+    } catch (e) {
+      setError("Erro ao ler PDF do ERP: " + e.message);
+      setErpFile(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const result = useMemo(() => {
+    if (!pixRecebidos.length || !vendasErp.length) return null;
+    return conciliarPixPagueVeloz(vendasErp, pixRecebidos);
+  }, [pixRecebidos, vendasErp]);
+
+  const totais = useMemo(() => {
+    if (!result) return null;
+    return {
+      conciliados: result.conciliados.reduce((s, c) => s + c.erp.valor, 0),
+      soNoErp: result.soNoErp.reduce((s, v) => s + v.valor, 0),
+      soNoExtrato: result.soNoExtrato.reduce((s, p) => s + p.valor, 0),
+    };
+  }, [result]);
+
+  // Filtros de busca
+  const filtrar = (items, getter) => {
+    const t = searchTerm.toLowerCase().trim();
+    if (!t) return items;
+    return items.filter((it) =>
+      getter(it).some((c) => String(c || "").toLowerCase().includes(t))
+    );
+  };
+  const filteredConciliados = useMemo(() => {
+    if (!result) return [];
+    return filtrar(result.conciliados, (c) => [
+      c.erp.cliente, c.erp.numVenda, c.erp.valor.toFixed(2), c.pix.pagante,
+    ]);
+  }, [result, searchTerm]);
+  const filteredSoNoErp = useMemo(() => {
+    if (!result) return [];
+    return filtrar(result.soNoErp, (v) => [
+      v.cliente, v.numVenda, v.valor.toFixed(2),
+    ]);
+  }, [result, searchTerm]);
+  const filteredSoNoExtrato = useMemo(() => {
+    if (!result) return [];
+    return filtrar(result.soNoExtrato, (p) => [
+      p.pagante, p.valor.toFixed(2),
+    ]);
+  }, [result, searchTerm]);
+
+  // Exportar Excel
+  const exportar = () => {
+    if (!result) return;
+    const hoje = new Date().toISOString().slice(0, 10);
+    const wb = XLSX.utils.book_new();
+
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+      result.conciliados.map((c) => ({
+        "Data Venda (ERP)": c.erp.dataStr,
+        "Loja": c.erp.loja,
+        "Nº Venda": c.erp.numVenda,
+        "Cliente (ERP)": c.erp.cliente,
+        "Valor (ERP)": c.erp.valor,
+        "Data PIX (Extrato)": formatarData(c.pix.dataPix),
+        "Pagante (Extrato)": c.pix.pagante,
+        "Valor (Extrato)": c.pix.valor,
+      }))
+    ), "Conciliados");
+
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+      result.soNoErp.map((v) => ({
+        "Data": v.dataStr,
+        "Loja": v.loja,
+        "Nº Venda": v.numVenda,
+        "Cliente": v.cliente,
+        "Valor": v.valor,
+        "Motivo": v.motivoDetalhe,
+      }))
+    ), "Só no ERP");
+
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+      result.soNoExtrato.map((p) => ({
+        "Data": formatarData(p.dataPix),
+        "Pagante": p.pagante,
+        "Valor": p.valor,
+        "Motivo": p.motivoDetalhe,
+      }))
+    ), "Só no extrato PV");
+
+    const wsResumo = XLSX.utils.aoa_to_sheet([
+      ["RESUMO DA CONCILIAÇÃO PIX PAGUE VELOZ"],
+      [],
+      ["Conta", banco.nome],
+      ["Seção do ERP", banco.secaoPdf],
+      ["Data da conciliação", hoje],
+      [],
+      ["PIX Recebidos no extrato", pixRecebidos.length],
+      ["Linhas no PDF do ERP", vendasErp.length],
+      [],
+      ["Conciliados (qtd)", result.conciliados.length],
+      ["Conciliados (valor total)", totais.conciliados],
+      [],
+      ["Só no ERP (qtd)", result.soNoErp.length],
+      ["Só no ERP (valor total)", totais.soNoErp],
+      [],
+      ["Só no extrato PV (qtd)", result.soNoExtrato.length],
+      ["Só no extrato PV (valor total)", totais.soNoExtrato],
+    ]);
+    XLSX.utils.book_append_sheet(wb, wsResumo, "Resumo");
+
+    XLSX.writeFile(wb, `Conciliacao-PIX-PagueVeloz-${hoje}.xlsx`);
+  };
+
+  return (
+    <div className="max-w-7xl mx-auto">
+      <div className="mb-8 border-b border-stone-200 pb-6">
+        <div className="flex items-baseline gap-3 mb-2">
+          <button
+            onClick={onTrocar}
+            className="text-xs uppercase tracking-[0.2em] text-amber-800 font-semibold hover:text-amber-900 flex items-center gap-1"
+          >
+            <ChevronLeft className="w-3 h-3" />
+            Trocar conta
+          </button>
+          <span className="text-stone-300">—</span>
+          <span className="text-xs uppercase tracking-wider text-stone-500">
+            Conciliação Financeira
+          </span>
+        </div>
+        <h1 className="font-serif text-4xl font-bold text-stone-900 tracking-tight">
+          Conciliação — {banco.nome}
+        </h1>
+        <p className="text-stone-600 mt-2 max-w-2xl">
+          Compara as vendas registradas no <strong>ERP</strong> (forma de pagamento{" "}
+          <strong>{banco.secaoPdf}</strong>) com os <strong>PIX recebidos</strong> no
+          extrato da Pague Veloz. O match é feito por <strong>valor + mês</strong>{" "}
+          (sem usar NSU ou nome do cliente).
+        </p>
+      </div>
+
+      <div className="grid md:grid-cols-2 gap-4 mb-6">
+        <FileDropZone
+          label="Extrato da Pague Veloz"
+          sublabel="relatorio-extrato.csv"
+          icon={Landmark}
+          accept=".csv,.txt"
+          file={extratoFile}
+          onFile={handleExtrato}
+          onClear={() => {
+            setExtratoFile(null);
+            setPixRecebidos([]);
+          }}
+          disabled={loading}
+        />
+        <FileDropZone
+          label="PDF do ERP (Vendas Por Finalizadores)"
+          sublabel="relatório do sistema"
+          icon={FileText}
+          accept=".pdf"
+          file={erpFile}
+          onFile={handleErp}
+          onClear={() => {
+            setErpFile(null);
+            setVendasErp([]);
+          }}
+          disabled={loading}
+        />
+      </div>
+
+      {error && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-6 flex items-start gap-3">
+          <XCircle className="w-5 h-5 text-red-700 mt-0.5 flex-shrink-0" />
+          <p className="text-sm text-red-900">{error}</p>
+        </div>
+      )}
+
+      {result && (
+        <>
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-3 mb-6">
+            <StatCard
+              label="Conciliados"
+              value={result.conciliados.length}
+              sublabel={formatarMoeda(totais.conciliados)}
+              accent="green"
+              icon={CheckCircle2}
+            />
+            <StatCard
+              label="Só no ERP"
+              value={result.soNoErp.length}
+              sublabel={formatarMoeda(totais.soNoErp)}
+              accent="orange"
+              icon={AlertCircle}
+            />
+            <StatCard
+              label="Só no extrato PV"
+              value={result.soNoExtrato.length}
+              sublabel={formatarMoeda(totais.soNoExtrato)}
+              accent="amber"
+              icon={AlertTriangle}
+            />
+          </div>
+
+          {/* Barra de busca + exportar */}
+          <div className="flex items-center gap-2 mb-4">
+            <div className="relative flex-1">
+              <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-stone-400" />
+              <input
+                type="text"
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                placeholder="Buscar por cliente, valor, pagante…"
+                className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded bg-white focus:outline-none focus:ring-2 focus:ring-amber-700/30 focus:border-amber-700"
+              />
+            </div>
+            <button
+              onClick={exportar}
+              className="flex items-center gap-1.5 px-3 py-2 text-sm bg-emerald-700 text-white font-medium rounded hover:bg-emerald-800"
+            >
+              <Download className="w-4 h-4" />
+              Excel
+            </button>
+          </div>
+
+          {/* Abas */}
+          <div className="bg-stone-100 p-1 rounded-md inline-flex gap-1 mb-4 flex-wrap">
+            <button
+              onClick={() => setActiveView("conciliados")}
+              className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
+                activeView === "conciliados"
+                  ? "bg-white text-emerald-800 shadow-sm"
+                  : "text-stone-600 hover:text-stone-900"
+              }`}
+            >
+              Conciliados ({result.conciliados.length})
+            </button>
+            <button
+              onClick={() => setActiveView("soNoErp")}
+              className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
+                activeView === "soNoErp"
+                  ? "bg-white text-orange-800 shadow-sm"
+                  : "text-stone-600 hover:text-stone-900"
+              }`}
+            >
+              Só no ERP ({result.soNoErp.length})
+            </button>
+            <button
+              onClick={() => setActiveView("soNoExtrato")}
+              className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
+                activeView === "soNoExtrato"
+                  ? "bg-white text-amber-900 shadow-sm"
+                  : "text-stone-600 hover:text-stone-900"
+              }`}
+            >
+              Só no extrato PV ({result.soNoExtrato.length})
+            </button>
+          </div>
+
+          {activeView === "conciliados" && (
+            <PixConciliadosList items={filteredConciliados} />
+          )}
+          {activeView === "soNoErp" && (
+            <PixSoNoErpList items={filteredSoNoErp} />
+          )}
+          {activeView === "soNoExtrato" && (
+            <PixSoNoExtratoList items={filteredSoNoExtrato} />
+          )}
+        </>
+      )}
+
+      {!extratoFile && !erpFile && !loading && (
+        <div className="text-center py-16 bg-gradient-to-b from-blue-50/40 to-transparent rounded-lg border border-stone-200">
+          <Landmark className="w-10 h-10 text-blue-700 mx-auto mb-3" />
+          <p className="font-serif text-lg text-stone-800 mb-1">
+            Pronto para conciliar PIX
+          </p>
+          <p className="text-sm text-stone-600 max-w-md mx-auto">
+            Envie o extrato da Pague Veloz (relatorio-extrato.csv) e o PDF do ERP.
+            O app vai filtrar só os PIX Recebidos e cruzar com a seção PIX VELOZ EXPRES.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Cards das listas do fluxo PIX
+function PixConciliadosList({ items }) {
+  if (!items.length) {
+    return (
+      <div className="text-center py-12 text-stone-500 text-sm">
+        Nenhuma venda conciliada ainda.
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-2">
+      {items.map((c, i) => (
+        <div key={i} className="border border-emerald-200 bg-white rounded-lg p-4">
+          <div className="flex items-start gap-4">
+            <div className="w-10 h-10 rounded-md bg-emerald-100 flex items-center justify-center flex-shrink-0">
+              <CheckCircle2 className="w-5 h-5 text-emerald-700" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-baseline gap-2 mb-1 flex-wrap">
+                <span className="text-xs font-mono text-stone-500">{c.erp.dataStr}</span>
+                <span className="text-[10px] uppercase tracking-wider bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded font-semibold">
+                  Conciliado
+                </span>
+              </div>
+              <h3 className="font-serif font-semibold text-stone-900 truncate">
+                {c.erp.cliente}
+              </h3>
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-600 mt-1">
+                <span>Loja: <strong className="text-stone-900">{c.erp.loja}</strong></span>
+                <span>Nº Venda: <strong className="text-stone-900">{c.erp.numVenda}</strong></span>
+                <span>PIX recebido em: <strong className="text-stone-900">{formatarData(c.pix.dataPix)}</strong></span>
+                <span>Pagante: <strong className="text-stone-900">{c.pix.pagante}</strong></span>
+              </div>
+            </div>
+            <div className="text-right flex-shrink-0">
+              <p className="font-serif text-xl font-bold text-emerald-800">
+                {formatarMoeda(c.erp.valor)}
+              </p>
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function PixSoNoErpList({ items }) {
+  if (!items.length) {
+    return (
+      <div className="text-center py-12">
+        <CheckCircle2 className="w-10 h-10 text-emerald-600 mx-auto mb-3" />
+        <p className="font-serif text-lg text-stone-800">
+          Todas as vendas do ERP têm PIX correspondente
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-2">
+      <div className="bg-orange-50 border border-orange-300 rounded-lg p-3 mb-3 flex items-start gap-2">
+        <AlertCircle className="w-4 h-4 text-orange-700 mt-0.5 flex-shrink-0" />
+        <div className="text-xs text-orange-900">
+          <p className="font-semibold mb-1">Vendas no ERP sem PIX correspondente no extrato.</p>
+          <p>O valor lançado pode estar errado, ou o PIX foi para outra conta — confira no ERP.</p>
+        </div>
+      </div>
+
+      {items.map((v, i) => (
+        <div key={i} className="border border-orange-300 bg-white rounded-lg p-4">
+          <div className="flex items-start gap-4">
+            <div className="w-10 h-10 rounded-md bg-orange-100 flex items-center justify-center flex-shrink-0">
+              <AlertCircle className="w-5 h-5 text-orange-700" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-baseline gap-2 mb-1 flex-wrap">
+                <span className="text-xs font-mono text-stone-500">{v.dataStr}</span>
+                <span className="text-[10px] uppercase tracking-wider bg-orange-100 text-orange-900 px-1.5 py-0.5 rounded font-semibold border border-orange-300">
+                  Sem PIX correspondente
+                </span>
+              </div>
+              <h3 className="font-serif font-semibold text-stone-900 truncate">
+                {v.cliente}
+              </h3>
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-600 mt-1">
+                <span>Loja: <strong className="text-stone-900">{v.loja}</strong></span>
+                <span>Nº Venda: <strong className="text-stone-900">{v.numVenda}</strong></span>
+                <span>Pedido: <strong className="text-stone-900">{v.numPedido}</strong></span>
+              </div>
+              <div className="mt-2 text-xs px-3 py-2 rounded border bg-orange-50 border-orange-200 text-orange-900">
+                <strong>Motivo:</strong> {v.motivoDetalhe}
+              </div>
+            </div>
+            <div className="text-right flex-shrink-0">
+              <p className="font-serif text-xl font-bold text-orange-700">
+                {formatarMoeda(v.valor)}
+              </p>
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function PixSoNoExtratoList({ items }) {
+  if (!items.length) {
+    return (
+      <div className="text-center py-12">
+        <CheckCircle2 className="w-10 h-10 text-emerald-600 mx-auto mb-3" />
+        <p className="font-serif text-lg text-stone-800">
+          Todos os PIX recebidos foram conciliados
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-2">
+      <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-3 flex items-start gap-2">
+        <AlertTriangle className="w-4 h-4 text-amber-700 mt-0.5 flex-shrink-0" />
+        <div className="text-xs text-amber-900">
+          <p className="font-semibold mb-1">PIX recebidos na Pague Veloz sem venda correspondente no ERP.</p>
+          <p>Pode ser PIX VELOZ VPP ou PIX VELOZ SS (não Express), ou venda esquecida no sistema.</p>
+        </div>
+      </div>
+
+      {items.map((p, i) => (
+        <div key={i} className="border border-amber-200 bg-white rounded-lg p-4">
+          <div className="flex items-start gap-4">
+            <div className="w-10 h-10 rounded-md bg-amber-100 flex items-center justify-center flex-shrink-0">
+              <AlertTriangle className="w-5 h-5 text-amber-700" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-baseline gap-2 mb-1 flex-wrap">
+                <span className="text-xs font-mono text-stone-500">{formatarData(p.dataPix)}</span>
+                <span className="text-[10px] uppercase tracking-wider bg-amber-100 text-amber-900 px-1.5 py-0.5 rounded font-semibold border border-amber-300">
+                  PIX sem correspondente
+                </span>
+              </div>
+              <h3 className="font-serif font-semibold text-stone-900 truncate">
+                {p.pagante || "(sem pagante informado)"}
+              </h3>
+              <div className="mt-2 text-xs px-3 py-2 rounded border bg-amber-50 border-amber-200 text-amber-900">
+                <strong>Motivo:</strong> {p.motivoDetalhe}
+              </div>
+            </div>
+            <div className="text-right flex-shrink-0">
+              <p className="font-serif text-xl font-bold text-amber-700">
+                {formatarMoeda(p.valor)}
+              </p>
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function BluConciliadosList({ items }) {
   if (!items.length) {
     return (
@@ -4230,23 +4936,23 @@ function BluConciliadosList({ items }) {
 // Mapa de motivos para visual e texto curto
 const MOTIVOS_DIVERGENCIA = {
   sem_nsu: {
-    label: "NSU não está na Blu",
-    cor: "red",
-    explicacao: "O NSU desta venda não está no extrato da Blu.",
+    label: "NSU não está no extrato",
+    cor: "orange",
+    explicacao: "O NSU desta venda não foi encontrado no extrato da maquininha — pode ter sido passado em outra maquininha.",
   },
   sem_no_erp: {
     label: "Sem correspondente no ERP",
     cor: "red",
-    explicacao: "Esta venda da Blu não aparece no PDF do ERP.",
+    explicacao: "Esta venda do extrato da maquininha não aparece no PDF do ERP.",
   },
   nsu_divergente: {
     label: "NSU divergente nos dois arquivos",
-    cor: "orange",
-    explicacao: "O valor e o mês batem, mas o NSU foi registrado diferente entre ERP e Blu (provável erro de digitação).",
+    cor: "purple",
+    explicacao: "O valor e o mês batem, mas o NSU foi registrado diferente entre ERP e o extrato da maquininha (provável erro de digitação).",
   },
   valor_diferente: {
     label: "Divergência de valor",
-    cor: "amber",
+    cor: "red",
     explicacao: "O NSU e o mês batem, mas o valor é diferente.",
   },
   mes_diferente: {
@@ -4268,6 +4974,7 @@ function MotivoBadge({ motivo }) {
     red: "bg-red-100 text-red-800 border-red-200",
     amber: "bg-amber-100 text-amber-900 border-amber-300",
     orange: "bg-orange-100 text-orange-900 border-orange-300",
+    purple: "bg-purple-100 text-purple-900 border-purple-300",
   };
   return (
     <span className={`text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded font-semibold border ${cores[info.cor]}`}>
@@ -4298,11 +5005,12 @@ function BluSoErpList({ items }) {
 
       {items.map((v, i) => {
         const info = MOTIVOS_DIVERGENCIA[v.motivo] || MOTIVOS_DIVERGENCIA.sem_nsu;
-        // 3 paletas: red (crítico), amber (atenção), orange (NSU divergente)
+        // Paletas: red (cr\u00edtico), amber (aten\u00e7\u00e3o), orange (sem NSU - poss\u00edvel outra maquininha), purple (NSU divergente)
         const paletas = {
           red: { borda: "border-red-200", bg: "bg-red-100", icone: "text-red-700", valor: "text-red-700", caixa: "bg-red-50 border-red-200 text-red-900" },
           amber: { borda: "border-amber-200", bg: "bg-amber-100", icone: "text-amber-700", valor: "text-amber-700", caixa: "bg-amber-50 border-amber-200 text-amber-900" },
           orange: { borda: "border-orange-300", bg: "bg-orange-100", icone: "text-orange-700", valor: "text-orange-700", caixa: "bg-orange-50 border-orange-200 text-orange-900" },
+          purple: { borda: "border-purple-300", bg: "bg-purple-100", icone: "text-purple-700", valor: "text-purple-700", caixa: "bg-purple-50 border-purple-200 text-purple-900" },
         };
         const p = paletas[info.cor] || paletas.red;
         const Icone = info.cor === "red" ? XCircle : AlertCircle;
@@ -4388,6 +5096,7 @@ function BluSoBluList({ items, canceladas = false, nomeMaquininha = "Blu" }) {
           red: { borda: "border-red-200", bg: "bg-red-100", icone: "text-red-700", valor: "text-red-700", caixa: "bg-red-50 border-red-200 text-red-900" },
           amber: { borda: "border-amber-200", bg: "bg-amber-100", icone: "text-amber-700", valor: "text-amber-700", caixa: "bg-amber-50 border-amber-200 text-amber-900" },
           orange: { borda: "border-orange-300", bg: "bg-orange-100", icone: "text-orange-700", valor: "text-orange-700", caixa: "bg-orange-50 border-orange-200 text-orange-900" },
+          purple: { borda: "border-purple-300", bg: "bg-purple-100", icone: "text-purple-700", valor: "text-purple-700", caixa: "bg-purple-50 border-purple-200 text-purple-900" },
           stone: { borda: "border-stone-300", bg: "bg-stone-100", icone: "text-stone-700", valor: "text-stone-700", caixa: "bg-stone-50 border-stone-200 text-stone-900" },
         };
         let p;
