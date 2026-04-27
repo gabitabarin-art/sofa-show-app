@@ -31,7 +31,10 @@ import {
   Eye,
   AlertCircle,
   CreditCard,
+  LogOut,
 } from "lucide-react";
+import { supabase } from "./supabaseClient";
+import LoginScreen from "./LoginScreen";
 
 // ============================================================
 // TABELA DE CORES (persistência compartilhada)
@@ -1974,6 +1977,52 @@ function useHashRoute() {
   }, []);
 
   return { module: route.module, bancoId: route.bancoId, navigate };
+}
+
+// ============================================================
+// HOOK DE AUTENTICAÇÃO
+// Gerencia a sessão do usuário no Supabase.
+// Retorna { user, loading, logout }:
+//   user    — objeto do usuário logado (ou null se não estiver logado)
+//   loading — true enquanto carrega a sessão inicial
+//   logout  — função pra fazer logout
+// ============================================================
+
+function useAuth() {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    // Pega a sessão atual (se já estiver logado de antes)
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (cancelled) return;
+      setUser(session?.user || null);
+      setLoading(false);
+    }).catch((e) => {
+      console.error("Erro ao obter sessão:", e);
+      if (!cancelled) setLoading(false);
+    });
+
+    // Escuta mudanças de sessão (login, logout, refresh do token)
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (cancelled) return;
+      setUser(session?.user || null);
+    });
+
+    return () => {
+      cancelled = true;
+      subscription?.unsubscribe();
+    };
+  }, []);
+
+  const logout = useCallback(async () => {
+    await supabase.auth.signOut();
+    // O onAuthStateChange já vai zerar o user automaticamente
+  }, []);
+
+  return { user, loading, logout };
 }
 
 // ============================================================
@@ -5709,11 +5758,33 @@ function PlaceholderModule({ title, description }) {
 // ============================================================
 
 export default function App() {
+  // Autenticação
+  const { user, loading: authLoading, logout } = useAuth();
+
+  // Hooks restantes (sempre chamados, em qualquer ordem — regras de hooks do React)
   const { module: activeModule, bancoId: bancoSelecionadoId, navigate } = useHashRoute();
   const setActiveModule = (m) => navigate(m, null);
   const { table: colorTable, save: saveColorTable, loaded: colorsLoaded } = useColorTable();
   const { taxas: taxasBlu, save: saveTaxasBlu, loaded: taxasBluLoaded } = useTaxasBlu();
   const { taxas: taxasPV, save: saveTaxasPV, loaded: taxasPVLoaded } = useTaxasPagueVeloz();
+
+  // === PROTEÇÃO DE LOGIN ===
+  // Enquanto verifica se está logado, mostra um carregamento simples
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-stone-50 flex items-center justify-center">
+        <div className="flex items-center gap-3 text-stone-600">
+          <Loader2 className="w-5 h-5 animate-spin" />
+          <span className="text-sm">Carregando...</span>
+        </div>
+      </div>
+    );
+  }
+  // Se não está logado, mostra a tela de login
+  if (!user) {
+    return <LoginScreen />;
+  }
+  // Se está logado, segue pro app normal abaixo
 
   const modules = [
     {
@@ -5791,34 +5862,56 @@ export default function App() {
 
       <div className="flex">
         {/* Sidebar */}
-        <aside className="w-64 bg-white border-r border-stone-200 min-h-[calc(100vh-73px)] py-6 px-3 hidden md:block">
-          <p className="text-[10px] uppercase tracking-[0.2em] text-stone-500 font-semibold px-3 mb-3">
-            Módulos
-          </p>
-          <nav className="space-y-1">
-            {modules.map((m) => (
-              <button
-                key={m.id}
-                onClick={() => m.available && setActiveModule(m.id)}
-                disabled={!m.available}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md text-sm text-left transition-colors ${
-                  activeModule === m.id
-                    ? "bg-amber-50 text-amber-900 font-semibold"
-                    : m.available
-                    ? "text-stone-700 hover:bg-stone-100"
-                    : "text-stone-400 cursor-not-allowed"
-                }`}
-              >
-                <m.icon className="w-4 h-4 flex-shrink-0" />
-                <span className="flex-1">{m.label}</span>
-                {!m.available && (
-                  <span className="text-[9px] uppercase tracking-wider bg-stone-200 text-stone-600 px-1.5 py-0.5 rounded">
-                    Em breve
-                  </span>
-                )}
-              </button>
-            ))}
-          </nav>
+        <aside className="w-64 bg-white border-r border-stone-200 min-h-[calc(100vh-73px)] py-6 px-3 hidden md:flex md:flex-col">
+          <div className="flex-1">
+            <p className="text-[10px] uppercase tracking-[0.2em] text-stone-500 font-semibold px-3 mb-3">
+              Módulos
+            </p>
+            <nav className="space-y-1">
+              {modules.map((m) => (
+                <button
+                  key={m.id}
+                  onClick={() => m.available && setActiveModule(m.id)}
+                  disabled={!m.available}
+                  className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md text-sm text-left transition-colors ${
+                    activeModule === m.id
+                      ? "bg-amber-50 text-amber-900 font-semibold"
+                      : m.available
+                      ? "text-stone-700 hover:bg-stone-100"
+                      : "text-stone-400 cursor-not-allowed"
+                  }`}
+                >
+                  <m.icon className="w-4 h-4 flex-shrink-0" />
+                  <span className="flex-1">{m.label}</span>
+                  {!m.available && (
+                    <span className="text-[9px] uppercase tracking-wider bg-stone-200 text-stone-600 px-1.5 py-0.5 rounded">
+                      Em breve
+                    </span>
+                  )}
+                </button>
+              ))}
+            </nav>
+          </div>
+
+          {/* Painel do usuário logado */}
+          <div className="border-t border-stone-200 pt-4 mt-4 px-1">
+            <div className="px-3 mb-2">
+              <p className="text-[10px] uppercase tracking-[0.2em] text-stone-500 font-semibold mb-1">
+                Conectada como
+              </p>
+              <p className="text-xs text-stone-800 font-medium truncate" title={user.email}>
+                {user.email}
+              </p>
+            </div>
+            <button
+              onClick={logout}
+              className="w-full flex items-center gap-2 px-3 py-2 rounded-md text-xs text-stone-600 hover:bg-stone-100 hover:text-stone-900 transition-colors"
+              title="Sair do sistema"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              <span>Sair</span>
+            </button>
+          </div>
         </aside>
 
         {/* Mobile tabs */}
