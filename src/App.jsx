@@ -1706,12 +1706,23 @@ const hasClaudeStorage = typeof window !== "undefined" && window.storage && type
 
 async function storageGet(key) {
   if (hasClaudeStorage) {
-    const result = await window.storage.get(key, true);
-    return result && result.value ? result.value : null;
+    try {
+      const result = await window.storage.get(key, true);
+      return result && result.value ? result.value : null;
+    } catch (e) {
+      console.error(`Erro ao ler ${key} do Claude storage:`, e);
+      // Não cai pro localStorage aqui — se Claude storage existe, ele é o sistema oficial
+      return null;
+    }
   }
   // Fallback: localStorage
   if (typeof window !== "undefined" && window.localStorage) {
-    return window.localStorage.getItem(key);
+    try {
+      return window.localStorage.getItem(key);
+    } catch (e) {
+      console.error(`Erro ao ler ${key} do localStorage:`, e);
+      return null;
+    }
   }
   return null;
 }
@@ -1723,8 +1734,13 @@ async function storageSet(key, value) {
   }
   // Fallback: localStorage
   if (typeof window !== "undefined" && window.localStorage) {
-    window.localStorage.setItem(key, value);
-    return;
+    try {
+      window.localStorage.setItem(key, value);
+      return;
+    } catch (e) {
+      // localStorage pode falhar em modo privado, quota cheia, etc.
+      throw new Error(`Não foi possível salvar no navegador: ${e.message}`);
+    }
   }
   throw new Error("Nenhum sistema de armazenamento disponível");
 }
@@ -1738,22 +1754,35 @@ function useColorTable() {
     let cancelled = false;
     (async () => {
       try {
+        console.log("[Cores] Carregando do storage...");
         const value = await storageGet(COLOR_STORAGE_KEY);
+        console.log("[Cores] Valor lido do storage:", value ? `${value.length} chars` : "VAZIO");
         if (cancelled) return;
+        // Tenta parsear o que está salvo
+        let parsed = null;
         if (value) {
-          const parsed = JSON.parse(value);
-          setTable(Array.isArray(parsed) ? parsed : DEFAULT_COLOR_TABLE);
+          try {
+            parsed = JSON.parse(value);
+          } catch (e) {
+            console.error("[Cores] Tabela corrompida no storage:", e);
+            parsed = null;
+          }
+        }
+        if (Array.isArray(parsed)) {
+          console.log(`[Cores] Carregadas ${parsed.length} cores do storage`);
+          setTable(parsed);
         } else {
+          console.log("[Cores] Sem dados salvos, usando padrão (e persistindo)");
           setTable(DEFAULT_COLOR_TABLE);
-          // Salva os padrões na primeira vez
           try {
             await storageSet(COLOR_STORAGE_KEY, JSON.stringify(DEFAULT_COLOR_TABLE));
-          } catch {}
+          } catch (e) {
+            console.error("[Cores] Não foi possível persistir padrão:", e);
+          }
         }
       } catch (e) {
-        if (!cancelled) {
-          setTable(DEFAULT_COLOR_TABLE);
-        }
+        console.error("[Cores] Erro ao ler:", e);
+        if (!cancelled) setTable(DEFAULT_COLOR_TABLE);
       } finally {
         if (!cancelled) setLoaded(true);
       }
@@ -1764,12 +1793,21 @@ function useColorTable() {
   }, []);
 
   const save = useCallback(async (newTable) => {
+    console.log(`[Cores] Salvando ${newTable.length} cores...`);
     setTable(newTable);
     try {
       await storageSet(COLOR_STORAGE_KEY, JSON.stringify(newTable));
+      console.log("[Cores] Salvo no storage. Verificando...");
+      const verify = await storageGet(COLOR_STORAGE_KEY);
+      if (!verify) {
+        console.error("[Cores] FALHA: storage retornou vazio após salvar!");
+        return false;
+      }
+      const verifyParsed = JSON.parse(verify);
+      console.log(`[Cores] Verificado: ${verifyParsed.length} cores no storage`);
       return true;
     } catch (e) {
-      console.error("Erro ao salvar tabela de cores", e);
+      console.error("[Cores] Erro ao salvar:", e);
       return false;
     }
   }, []);
