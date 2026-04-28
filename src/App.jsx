@@ -36,6 +36,8 @@ import {
   Lock,
   ClipboardList,
   Wallet,
+  ShoppingCart,
+  UserPlus,
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 import LoginScreen from "./LoginScreen";
@@ -2207,7 +2209,7 @@ function podeEditarModulo(permissoes, modulo) {
 //   #/taxas                              → tabelas de taxas
 // ============================================================
 
-const ROTAS_VALIDAS = ["conciliacao", "cores", "financeiro", "taxas", "permissoes", "estoque", "relatorios", "config"];
+const ROTAS_VALIDAS = ["conciliacao", "cores", "financeiro", "taxas", "permissoes", "pedido_venda", "estoque", "relatorios", "config"];
 const BANCOS_VALIDOS = ["sicredi", "blu_ss", "blu_lupe", "pague_veloz_express", "pague_veloz_pix"];
 
 function parseHashRoute(hash) {
@@ -7877,6 +7879,988 @@ function GlobalSearchBar({ userCtx, onNavegar, colorTable, taxasBlu, taxasPV }) 
   );
 }
 
+// ============================================================
+// MÓDULO PEDIDO DE VENDA - Cadastro de Clientes
+// ============================================================
+
+// ----- Validadores e formatadores -----
+
+// Remove tudo que não é dígito
+function soNumeros(s) {
+  return String(s || "").replace(/\D/g, "");
+}
+
+// Valida CPF (11 dígitos + dígitos verificadores)
+function validarCPF(cpf) {
+  const n = soNumeros(cpf);
+  if (n.length !== 11) return false;
+  // Rejeita CPFs com todos os dígitos iguais (ex: 11111111111)
+  if (/^(\d)\1+$/.test(n)) return false;
+  let soma = 0;
+  for (let i = 0; i < 9; i++) soma += parseInt(n[i]) * (10 - i);
+  let resto = (soma * 10) % 11;
+  if (resto === 10) resto = 0;
+  if (resto !== parseInt(n[9])) return false;
+  soma = 0;
+  for (let i = 0; i < 10; i++) soma += parseInt(n[i]) * (11 - i);
+  resto = (soma * 10) % 11;
+  if (resto === 10) resto = 0;
+  if (resto !== parseInt(n[10])) return false;
+  return true;
+}
+
+// Valida CNPJ (14 dígitos + dígitos verificadores)
+function validarCNPJ(cnpj) {
+  const n = soNumeros(cnpj);
+  if (n.length !== 14) return false;
+  if (/^(\d)\1+$/.test(n)) return false;
+  const calc = (base, pesos) => {
+    let soma = 0;
+    for (let i = 0; i < pesos.length; i++) soma += parseInt(base[i]) * pesos[i];
+    const r = soma % 11;
+    return r < 2 ? 0 : 11 - r;
+  };
+  const p1 = [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2];
+  const p2 = [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2];
+  const d1 = calc(n.slice(0, 12), p1);
+  if (d1 !== parseInt(n[12])) return false;
+  const d2 = calc(n.slice(0, 13), p2);
+  if (d2 !== parseInt(n[13])) return false;
+  return true;
+}
+
+// Valida e-mail simples
+function validarEmail(email) {
+  const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return re.test(String(email || "").trim());
+}
+
+// Valida telefone brasileiro (10 ou 11 dígitos)
+function validarTelefone(tel) {
+  const n = soNumeros(tel);
+  if (n.length !== 10 && n.length !== 11) return false;
+  // DDD válido: 11–99 (não pode começar com 0)
+  const ddd = parseInt(n.slice(0, 2));
+  if (ddd < 11 || ddd > 99) return false;
+  // Celular (11 dígitos) deve começar com 9 no terceiro dígito
+  if (n.length === 11 && n[2] !== "9") return false;
+  return true;
+}
+
+// Formata CPF: 123.456.789-00
+function formatarCPF(s) {
+  const n = soNumeros(s).slice(0, 11);
+  if (n.length <= 3) return n;
+  if (n.length <= 6) return `${n.slice(0,3)}.${n.slice(3)}`;
+  if (n.length <= 9) return `${n.slice(0,3)}.${n.slice(3,6)}.${n.slice(6)}`;
+  return `${n.slice(0,3)}.${n.slice(3,6)}.${n.slice(6,9)}-${n.slice(9)}`;
+}
+
+// Formata CNPJ: 12.345.678/0001-99
+function formatarCNPJ(s) {
+  const n = soNumeros(s).slice(0, 14);
+  if (n.length <= 2) return n;
+  if (n.length <= 5) return `${n.slice(0,2)}.${n.slice(2)}`;
+  if (n.length <= 8) return `${n.slice(0,2)}.${n.slice(2,5)}.${n.slice(5)}`;
+  if (n.length <= 12) return `${n.slice(0,2)}.${n.slice(2,5)}.${n.slice(5,8)}/${n.slice(8)}`;
+  return `${n.slice(0,2)}.${n.slice(2,5)}.${n.slice(5,8)}/${n.slice(8,12)}-${n.slice(12)}`;
+}
+
+// Formata telefone: (11) 91234-5678 ou (11) 1234-5678
+function formatarTelefone(s) {
+  const n = soNumeros(s).slice(0, 11);
+  if (n.length <= 2) return n.length ? `(${n}` : "";
+  if (n.length <= 6) return `(${n.slice(0,2)}) ${n.slice(2)}`;
+  if (n.length <= 10) return `(${n.slice(0,2)}) ${n.slice(2,6)}-${n.slice(6)}`;
+  return `(${n.slice(0,2)}) ${n.slice(2,7)}-${n.slice(7)}`;
+}
+
+// Formata CEP: 12345-678
+function formatarCEP(s) {
+  const n = soNumeros(s).slice(0, 8);
+  if (n.length <= 5) return n;
+  return `${n.slice(0,5)}-${n.slice(5)}`;
+}
+
+// ----- Hook que carrega/persiste clientes no Supabase -----
+
+function useClientes(user) {
+  const [clientes, setClientes] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState(null);
+
+  const carregar = useCallback(async () => {
+    setError(null);
+    try {
+      const { data, error: e } = await supabase
+        .from("clientes")
+        .select("*")
+        .order("nome");
+      if (e) throw e;
+      setClientes(data || []);
+    } catch (e) {
+      console.error("[useClientes] Erro:", e);
+      setError(e.message);
+    } finally {
+      setLoaded(true);
+    }
+  }, []);
+
+  useEffect(() => { carregar(); }, [carregar]);
+
+  const salvar = async (cliente) => {
+    const payload = {
+      nome:           cliente.nome.trim(),
+      tipo_documento: cliente.tipoDocumento,
+      documento:      soNumeros(cliente.documento),
+      email:          cliente.email.trim().toLowerCase(),
+      telefone:       soNumeros(cliente.telefone),
+      telefone_2:     cliente.telefone2 ? soNumeros(cliente.telefone2) : null,
+      cep:            soNumeros(cliente.cep),
+      endereco:       cliente.endereco.trim(),
+      bairro:         cliente.bairro.trim(),
+      cidade:         cliente.cidade.trim(),
+      estado:         cliente.estado.trim().toUpperCase(),
+      tipo_moradia:   cliente.tipoMoradia,
+      bloco:          cliente.tipoMoradia === "apartamento" ? cliente.bloco?.trim() || null : null,
+      andar:          cliente.tipoMoradia === "apartamento" ? cliente.andar?.trim() || null : null,
+    };
+
+    if (cliente.id) {
+      // Update
+      payload.updated_at = new Date().toISOString();
+      const { data, error: e } = await supabase
+        .from("clientes")
+        .update(payload)
+        .eq("id", cliente.id)
+        .select()
+        .single();
+      if (e) throw e;
+      await carregar();
+      return data;
+    } else {
+      // Insert
+      payload.created_by = user?.id || null;
+      const { data, error: e } = await supabase
+        .from("clientes")
+        .insert(payload)
+        .select()
+        .single();
+      if (e) throw e;
+      await carregar();
+      return data;
+    }
+  };
+
+  const remover = async (id) => {
+    const { error: e } = await supabase.from("clientes").delete().eq("id", id);
+    if (e) throw e;
+    await carregar();
+  };
+
+  return { clientes, loaded, error, salvar, remover, reload: carregar };
+}
+
+// ============================================================
+// MÓDULO PRINCIPAL — tela com 2 botões → cadastro / pesquisa
+// ============================================================
+
+function PedidoVendaModule({ user }) {
+  // Tela ativa: "inicial" | "cadastro" | "pesquisa"
+  const [tela, setTela] = useState("inicial");
+  // Cliente sendo editado (null = novo cadastro)
+  const [clienteEdicao, setClienteEdicao] = useState(null);
+  // Pop-up depois de salvar: "Deseja fazer pedido?"
+  const [perguntaPedido, setPerguntaPedido] = useState(null); // { cliente }
+  // Mensagem "Em construção" ao confirmar pedido
+  const [mostrarEmConstrucao, setMostrarEmConstrucao] = useState(false);
+
+  const { clientes, loaded, error, salvar, remover } = useClientes(user);
+
+  const irParaCadastro = (cliente = null) => {
+    setClienteEdicao(cliente);
+    setTela("cadastro");
+  };
+
+  const apósSalvar = (clienteSalvo) => {
+    setTela("inicial");
+    setClienteEdicao(null);
+    setPerguntaPedido({ cliente: clienteSalvo });
+  };
+
+  return (
+    <div className="max-w-5xl mx-auto">
+      {/* Cabeçalho */}
+      <div className="mb-8 border-b border-stone-200 pb-6">
+        <div className="flex items-baseline gap-3 mb-2">
+          <span className="text-xs uppercase tracking-[0.2em] text-red-700 font-semibold">
+            Vendas
+          </span>
+          <span className="text-stone-300">—</span>
+          <span className="text-xs uppercase tracking-wider text-stone-500">
+            Pedido de Venda
+          </span>
+        </div>
+        <h1 className="font-serif text-4xl font-bold text-stone-900 tracking-tight">
+          {tela === "cadastro"
+            ? clienteEdicao ? "Editar Cliente" : "Novo Cliente"
+            : tela === "pesquisa"
+            ? "Pesquisar Cliente"
+            : "Pedido de Venda"}
+        </h1>
+        {tela === "inicial" && (
+          <p className="text-stone-600 mt-2">
+            Comece cadastrando um novo cliente ou pesquisando um cliente já cadastrado.
+          </p>
+        )}
+      </div>
+
+      {/* Erro de conexão */}
+      {error && tela === "inicial" && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-4 flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 text-red-700 mt-0.5 flex-shrink-0" />
+          <p className="text-sm text-red-900">Erro ao carregar clientes: {error}</p>
+        </div>
+      )}
+
+      {/* TELA INICIAL - 2 botões */}
+      {tela === "inicial" && (
+        <div className="grid md:grid-cols-2 gap-4 max-w-2xl mx-auto py-8">
+          <button
+            onClick={() => irParaCadastro(null)}
+            className="bg-white border-2 border-red-200 hover:border-red-500 rounded-xl p-8 text-center transition-all hover:shadow-lg hover:-translate-y-0.5 group"
+          >
+            <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-red-50 group-hover:bg-red-100 mb-4 transition-colors">
+              <Plus className="w-8 h-8 text-red-700" />
+            </div>
+            <h2 className="font-serif text-xl font-semibold text-stone-900 mb-1">
+              Novo Cliente
+            </h2>
+            <p className="text-sm text-stone-600">
+              Cadastrar um cliente novo do zero
+            </p>
+          </button>
+
+          <button
+            onClick={() => setTela("pesquisa")}
+            className="bg-white border-2 border-stone-200 hover:border-red-500 rounded-xl p-8 text-center transition-all hover:shadow-lg hover:-translate-y-0.5 group"
+          >
+            <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-stone-100 group-hover:bg-red-100 mb-4 transition-colors">
+              <Search className="w-8 h-8 text-stone-700 group-hover:text-red-700 transition-colors" />
+            </div>
+            <h2 className="font-serif text-xl font-semibold text-stone-900 mb-1">
+              Pesquisar Cliente
+            </h2>
+            <p className="text-sm text-stone-600">
+              {loaded
+                ? `${clientes.length} cliente${clientes.length === 1 ? "" : "s"} cadastrado${clientes.length === 1 ? "" : "s"}`
+                : "Carregando..."}
+            </p>
+          </button>
+        </div>
+      )}
+
+      {/* TELA CADASTRO */}
+      {tela === "cadastro" && (
+        <ClienteFormulario
+          clienteInicial={clienteEdicao}
+          onSalvar={async (c) => {
+            const salvo = await salvar(c);
+            apósSalvar(salvo);
+          }}
+          onCancelar={() => { setTela("inicial"); setClienteEdicao(null); }}
+        />
+      )}
+
+      {/* TELA PESQUISA */}
+      {tela === "pesquisa" && (
+        <ClientePesquisa
+          clientes={clientes}
+          loaded={loaded}
+          onVoltar={() => setTela("inicial")}
+          onEditar={(c) => irParaCadastro(c)}
+          onRemover={async (c) => {
+            if (!confirm(`Remover o cliente "${c.nome}"?\n\nEssa ação não pode ser desfeita.`)) return;
+            try {
+              await remover(c.id);
+            } catch (e) {
+              alert("Erro ao remover: " + e.message);
+            }
+          }}
+          onFazerPedido={(c) => setPerguntaPedido({ cliente: c })}
+        />
+      )}
+
+      {/* POP-UP "Deseja fazer pedido?" */}
+      {perguntaPedido && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ backgroundColor: "rgba(0,0,0,0.5)" }}
+        >
+          <div className="bg-white rounded-lg shadow-2xl w-full max-w-md p-6">
+            <div className="flex items-center gap-2 mb-3">
+              <CheckCircle2 className="w-5 h-5 text-emerald-700" />
+              <h2 className="font-serif text-xl font-bold text-stone-900">
+                Cadastro salvo!
+              </h2>
+            </div>
+            <p className="text-sm text-stone-700 mb-1">
+              <strong>{perguntaPedido.cliente?.nome}</strong> foi salvo com sucesso.
+            </p>
+            <p className="text-sm text-stone-700 mb-5">
+              Deseja fazer um pedido para esse cliente agora?
+            </p>
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => setPerguntaPedido(null)}
+                className="px-4 py-2 text-sm text-stone-600 hover:bg-stone-100 rounded-md transition-colors"
+              >
+                Não, depois
+              </button>
+              <button
+                onClick={() => {
+                  setPerguntaPedido(null);
+                  setMostrarEmConstrucao(true);
+                }}
+                className="flex items-center gap-1.5 px-4 py-2 text-sm bg-red-700 text-white font-medium rounded-md hover:bg-red-800 transition-colors"
+              >
+                <ChevronRight className="w-4 h-4" />
+                Sim, fazer pedido
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Pop-up "Em construção" */}
+      {mostrarEmConstrucao && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ backgroundColor: "rgba(0,0,0,0.5)" }}
+        >
+          <div className="bg-white rounded-lg shadow-2xl w-full max-w-md p-6 text-center">
+            <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-amber-50 mb-3">
+              <Settings className="w-8 h-8 text-amber-700" />
+            </div>
+            <h2 className="font-serif text-xl font-bold text-stone-900 mb-2">
+              Em construção
+            </h2>
+            <p className="text-sm text-stone-700 mb-5">
+              A tela de fazer pedido ainda está sendo desenvolvida. Por enquanto, o cadastro do cliente já foi salvo!
+            </p>
+            <button
+              onClick={() => setMostrarEmConstrucao(false)}
+              className="px-4 py-2 text-sm bg-stone-100 text-stone-700 rounded-md hover:bg-stone-200"
+            >
+              Entendi
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// FORMULÁRIO DE CADASTRO/EDIÇÃO DE CLIENTE
+// ============================================================
+
+function ClienteFormulario({ clienteInicial, onSalvar, onCancelar }) {
+  // Estado do formulário (com formatação aplicada nos campos visuais)
+  const [form, setForm] = useState(() => {
+    if (clienteInicial) {
+      return {
+        id:             clienteInicial.id,
+        nome:           clienteInicial.nome || "",
+        tipoDocumento:  clienteInicial.tipo_documento || "cpf",
+        documento:      clienteInicial.tipo_documento === "cnpj"
+                          ? formatarCNPJ(clienteInicial.documento)
+                          : formatarCPF(clienteInicial.documento),
+        email:          clienteInicial.email || "",
+        telefone:       formatarTelefone(clienteInicial.telefone || ""),
+        telefone2:      formatarTelefone(clienteInicial.telefone_2 || ""),
+        cep:            formatarCEP(clienteInicial.cep || ""),
+        endereco:       clienteInicial.endereco || "",
+        bairro:         clienteInicial.bairro || "",
+        cidade:         clienteInicial.cidade || "",
+        estado:         clienteInicial.estado || "",
+        tipoMoradia:    clienteInicial.tipo_moradia || "casa",
+        bloco:          clienteInicial.bloco || "",
+        andar:          clienteInicial.andar || "",
+      };
+    }
+    return {
+      id: null,
+      nome: "", tipoDocumento: "cpf", documento: "", email: "",
+      telefone: "", telefone2: "",
+      cep: "", endereco: "", bairro: "", cidade: "", estado: "",
+      tipoMoradia: "casa", bloco: "", andar: "",
+    };
+  });
+
+  const [erros, setErros] = useState({});
+  const [erroGeral, setErroGeral] = useState(null);
+  const [salvando, setSalvando] = useState(false);
+  const [buscandoCEP, setBuscandoCEP] = useState(false);
+
+  const setCampo = (campo, valor) => {
+    setForm((f) => ({ ...f, [campo]: valor }));
+    // Limpa o erro do campo quando o usuário edita
+    setErros((e) => ({ ...e, [campo]: undefined }));
+    setErroGeral(null);
+  };
+
+  // Validação completa antes de salvar
+  const validar = () => {
+    const e = {};
+
+    if (!form.nome.trim()) e.nome = "Nome é obrigatório.";
+    else if (form.nome.trim().length < 2) e.nome = "Nome muito curto.";
+
+    if (!form.documento.trim()) {
+      e.documento = `${form.tipoDocumento.toUpperCase()} é obrigatório.`;
+    } else if (form.tipoDocumento === "cpf") {
+      if (!validarCPF(form.documento)) e.documento = "CPF inválido. Verifique os dígitos.";
+    } else {
+      if (!validarCNPJ(form.documento)) e.documento = "CNPJ inválido. Verifique os dígitos.";
+    }
+
+    if (!form.email.trim()) e.email = "E-mail é obrigatório.";
+    else if (!validarEmail(form.email)) e.email = "E-mail inválido.";
+
+    if (!form.telefone.trim()) e.telefone = "Telefone é obrigatório.";
+    else if (!validarTelefone(form.telefone)) e.telefone = "Telefone inválido. Use o formato (XX) XXXXX-XXXX.";
+
+    if (form.telefone2.trim() && !validarTelefone(form.telefone2)) {
+      e.telefone2 = "Telefone secundário inválido.";
+    }
+
+    if (!form.cep.trim()) e.cep = "CEP é obrigatório.";
+    else if (soNumeros(form.cep).length !== 8) e.cep = "CEP precisa ter 8 dígitos.";
+
+    if (!form.endereco.trim()) e.endereco = "Endereço é obrigatório.";
+    if (!form.bairro.trim())   e.bairro   = "Bairro é obrigatório.";
+    if (!form.cidade.trim())   e.cidade   = "Cidade é obrigatória.";
+    if (!form.estado.trim())   e.estado   = "Estado é obrigatório.";
+
+    if (form.tipoMoradia === "apartamento") {
+      if (!form.bloco.trim()) e.bloco = "Bloco é obrigatório para apartamento.";
+      if (!form.andar.trim()) e.andar = "Andar é obrigatório para apartamento.";
+    }
+
+    setErros(e);
+    return Object.keys(e).length === 0;
+  };
+
+  // Busca endereço pelo CEP usando ViaCEP
+  const buscarCEP = async (cep) => {
+    const n = soNumeros(cep);
+    if (n.length !== 8) return;
+    setBuscandoCEP(true);
+    try {
+      const res = await fetch(`https://viacep.com.br/ws/${n}/json/`);
+      const data = await res.json();
+      if (data.erro) {
+        setErros((e) => ({ ...e, cep: "CEP não encontrado." }));
+        return;
+      }
+      setForm((f) => ({
+        ...f,
+        endereco: data.logradouro || f.endereco,
+        bairro:   data.bairro     || f.bairro,
+        cidade:   data.localidade || f.cidade,
+        estado:   data.uf         || f.estado,
+      }));
+      setErros((e) => ({ ...e, cep: undefined, endereco: undefined, bairro: undefined, cidade: undefined, estado: undefined }));
+    } catch (err) {
+      console.error("[ClienteForm] Erro ao buscar CEP:", err);
+      setErros((e) => ({ ...e, cep: "Não foi possível buscar o CEP. Preencha manualmente." }));
+    } finally {
+      setBuscandoCEP(false);
+    }
+  };
+
+  const handleCEPChange = (valor) => {
+    const formatado = formatarCEP(valor);
+    setCampo("cep", formatado);
+    if (soNumeros(formatado).length === 8) {
+      buscarCEP(formatado);
+    }
+  };
+
+  const handleSalvar = async () => {
+    setErroGeral(null);
+    if (!validar()) {
+      setErroGeral("Verifique os campos marcados em vermelho.");
+      return;
+    }
+    setSalvando(true);
+    try {
+      await onSalvar(form);
+    } catch (err) {
+      console.error("[ClienteForm] Erro ao salvar:", err);
+      if (err.code === "23505" || err.message?.includes("duplicate")) {
+        setErroGeral(`Já existe um cliente cadastrado com esse ${form.tipoDocumento.toUpperCase()}.`);
+      } else if (err.message?.includes("policy")) {
+        setErroGeral("Você não tem permissão para salvar este cadastro.");
+      } else {
+        setErroGeral("Erro ao salvar: " + err.message);
+      }
+    } finally {
+      setSalvando(false);
+    }
+  };
+
+  // Helper de classe pra input com/sem erro
+  const inputClass = (campo) =>
+    `w-full px-3 py-2 text-sm border rounded-md bg-white focus:outline-none focus:ring-2 transition-colors ${
+      erros[campo]
+        ? "border-red-400 focus:ring-red-200 focus:border-red-500"
+        : "border-stone-300 focus:ring-red-700/30 focus:border-red-700"
+    }`;
+
+  const showErro = (campo) =>
+    erros[campo] ? (
+      <p className="text-xs text-red-700 mt-1">{erros[campo]}</p>
+    ) : null;
+
+  return (
+    <div className="bg-white border border-stone-200 rounded-lg p-6 space-y-6">
+      {/* Seção 1: Dados pessoais */}
+      <div>
+        <h3 className="font-serif text-lg font-semibold text-stone-900 mb-4 pb-2 border-b border-stone-100">
+          Dados pessoais
+        </h3>
+        <div className="grid md:grid-cols-2 gap-4">
+          {/* Nome - linha inteira */}
+          <div className="md:col-span-2">
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              Nome completo *
+            </label>
+            <input
+              type="text"
+              value={form.nome}
+              onChange={(e) => setCampo("nome", e.target.value)}
+              placeholder="Ex: Maria Silva"
+              autoFocus
+              className={inputClass("nome")}
+            />
+            {showErro("nome")}
+          </div>
+
+          {/* Tipo de documento */}
+          <div>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              Tipo de documento *
+            </label>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => { setCampo("tipoDocumento", "cpf"); setCampo("documento", ""); }}
+                className={`flex-1 px-3 py-2 text-sm font-medium rounded-md border transition-colors ${
+                  form.tipoDocumento === "cpf"
+                    ? "bg-red-700 text-white border-red-700"
+                    : "bg-white text-stone-700 border-stone-300 hover:bg-stone-50"
+                }`}
+              >
+                CPF
+              </button>
+              <button
+                type="button"
+                onClick={() => { setCampo("tipoDocumento", "cnpj"); setCampo("documento", ""); }}
+                className={`flex-1 px-3 py-2 text-sm font-medium rounded-md border transition-colors ${
+                  form.tipoDocumento === "cnpj"
+                    ? "bg-red-700 text-white border-red-700"
+                    : "bg-white text-stone-700 border-stone-300 hover:bg-stone-50"
+                }`}
+              >
+                CNPJ
+              </button>
+            </div>
+          </div>
+
+          {/* Número do documento */}
+          <div>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              {form.tipoDocumento === "cpf" ? "CPF" : "CNPJ"} *
+            </label>
+            <input
+              type="text"
+              inputMode="numeric"
+              value={form.documento}
+              onChange={(e) => {
+                const formatado = form.tipoDocumento === "cpf"
+                  ? formatarCPF(e.target.value)
+                  : formatarCNPJ(e.target.value);
+                setCampo("documento", formatado);
+              }}
+              placeholder={form.tipoDocumento === "cpf" ? "000.000.000-00" : "00.000.000/0000-00"}
+              className={inputClass("documento")}
+            />
+            {showErro("documento")}
+          </div>
+
+          {/* E-mail - linha inteira */}
+          <div className="md:col-span-2">
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              E-mail *
+            </label>
+            <input
+              type="email"
+              value={form.email}
+              onChange={(e) => setCampo("email", e.target.value)}
+              placeholder="cliente@exemplo.com"
+              className={inputClass("email")}
+            />
+            {showErro("email")}
+          </div>
+
+          {/* Telefone principal */}
+          <div>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              Telefone principal *
+            </label>
+            <input
+              type="text"
+              inputMode="tel"
+              value={form.telefone}
+              onChange={(e) => setCampo("telefone", formatarTelefone(e.target.value))}
+              placeholder="(11) 91234-5678"
+              className={inputClass("telefone")}
+            />
+            {showErro("telefone")}
+          </div>
+
+          {/* Telefone secundário */}
+          <div>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              Telefone secundário (opcional)
+            </label>
+            <input
+              type="text"
+              inputMode="tel"
+              value={form.telefone2}
+              onChange={(e) => setCampo("telefone2", formatarTelefone(e.target.value))}
+              placeholder="(11) 91234-5678"
+              className={inputClass("telefone2")}
+            />
+            {showErro("telefone2")}
+          </div>
+        </div>
+      </div>
+
+      {/* Seção 2: Endereço */}
+      <div>
+        <h3 className="font-serif text-lg font-semibold text-stone-900 mb-4 pb-2 border-b border-stone-100">
+          Endereço
+        </h3>
+        <div className="grid md:grid-cols-3 gap-4">
+          {/* CEP */}
+          <div>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              CEP *
+              {buscandoCEP && (
+                <span className="ml-2 inline-flex items-center gap-1 text-stone-500 normal-case font-normal">
+                  <Loader2 className="w-3 h-3 animate-spin" /> buscando...
+                </span>
+              )}
+            </label>
+            <input
+              type="text"
+              inputMode="numeric"
+              value={form.cep}
+              onChange={(e) => handleCEPChange(e.target.value)}
+              placeholder="00000-000"
+              className={inputClass("cep")}
+            />
+            {showErro("cep")}
+          </div>
+
+          {/* Endereço (rua) */}
+          <div className="md:col-span-2">
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              Endereço (rua/avenida) *
+            </label>
+            <input
+              type="text"
+              value={form.endereco}
+              onChange={(e) => setCampo("endereco", e.target.value)}
+              placeholder="Ex: Rua das Flores, 123"
+              className={inputClass("endereco")}
+            />
+            {showErro("endereco")}
+          </div>
+
+          {/* Bairro */}
+          <div>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              Bairro *
+            </label>
+            <input
+              type="text"
+              value={form.bairro}
+              onChange={(e) => setCampo("bairro", e.target.value)}
+              placeholder="Ex: Centro"
+              className={inputClass("bairro")}
+            />
+            {showErro("bairro")}
+          </div>
+
+          {/* Cidade */}
+          <div>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              Cidade *
+            </label>
+            <input
+              type="text"
+              value={form.cidade}
+              onChange={(e) => setCampo("cidade", e.target.value)}
+              placeholder="Ex: São Paulo"
+              className={inputClass("cidade")}
+            />
+            {showErro("cidade")}
+          </div>
+
+          {/* Estado */}
+          <div>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              Estado *
+            </label>
+            <input
+              type="text"
+              value={form.estado}
+              onChange={(e) => setCampo("estado", e.target.value.toUpperCase().slice(0, 2))}
+              placeholder="SP"
+              maxLength={2}
+              className={inputClass("estado")}
+            />
+            {showErro("estado")}
+          </div>
+        </div>
+      </div>
+
+      {/* Seção 3: Tipo de moradia */}
+      <div>
+        <h3 className="font-serif text-lg font-semibold text-stone-900 mb-4 pb-2 border-b border-stone-100">
+          Tipo de moradia
+        </h3>
+        <div className="space-y-4">
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => setCampo("tipoMoradia", "casa")}
+              className={`flex-1 max-w-xs px-3 py-2 text-sm font-medium rounded-md border transition-colors ${
+                form.tipoMoradia === "casa"
+                  ? "bg-red-700 text-white border-red-700"
+                  : "bg-white text-stone-700 border-stone-300 hover:bg-stone-50"
+              }`}
+            >
+              🏠 Casa
+            </button>
+            <button
+              type="button"
+              onClick={() => setCampo("tipoMoradia", "apartamento")}
+              className={`flex-1 max-w-xs px-3 py-2 text-sm font-medium rounded-md border transition-colors ${
+                form.tipoMoradia === "apartamento"
+                  ? "bg-red-700 text-white border-red-700"
+                  : "bg-white text-stone-700 border-stone-300 hover:bg-stone-50"
+              }`}
+            >
+              🏢 Apartamento
+            </button>
+          </div>
+
+          {form.tipoMoradia === "apartamento" && (
+            <div className="grid md:grid-cols-2 gap-4 bg-red-50/30 border border-red-100 rounded-md p-4">
+              <div>
+                <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+                  Bloco *
+                </label>
+                <input
+                  type="text"
+                  value={form.bloco}
+                  onChange={(e) => setCampo("bloco", e.target.value)}
+                  placeholder="Ex: A"
+                  className={inputClass("bloco")}
+                />
+                {showErro("bloco")}
+              </div>
+              <div>
+                <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+                  Andar *
+                </label>
+                <input
+                  type="text"
+                  value={form.andar}
+                  onChange={(e) => setCampo("andar", e.target.value)}
+                  placeholder="Ex: 5"
+                  className={inputClass("andar")}
+                />
+                {showErro("andar")}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Erro geral */}
+      {erroGeral && (
+        <div className="bg-red-50 border border-red-200 rounded-md p-3 flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 text-red-700 mt-0.5 flex-shrink-0" />
+          <p className="text-sm text-red-900">{erroGeral}</p>
+        </div>
+      )}
+
+      {/* Botões */}
+      <div className="flex gap-2 pt-4 border-t border-stone-100">
+        <button
+          onClick={handleSalvar}
+          disabled={salvando}
+          className="flex items-center gap-1.5 px-5 py-2 text-sm bg-emerald-700 text-white font-medium rounded-md hover:bg-emerald-800 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          {salvando ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+          {form.id ? "Salvar alterações" : "Cadastrar cliente"}
+        </button>
+        <button
+          onClick={onCancelar}
+          disabled={salvando}
+          className="px-4 py-2 text-sm text-stone-600 hover:text-stone-900"
+        >
+          Cancelar
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// PESQUISA DE CLIENTES — lista com busca
+// ============================================================
+
+function ClientePesquisa({ clientes, loaded, onVoltar, onEditar, onRemover, onFazerPedido }) {
+  const [busca, setBusca] = useState("");
+
+  const norm = (s) =>
+    String(s || "")
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "");
+
+  const filtrados = useMemo(() => {
+    const q = norm(busca.trim());
+    if (!q) return clientes;
+    return clientes.filter((c) => {
+      return (
+        norm(c.nome).includes(q) ||
+        norm(c.documento).includes(q) ||
+        norm(c.email).includes(q) ||
+        norm(c.telefone).includes(q) ||
+        norm(c.cidade).includes(q)
+      );
+    });
+  }, [clientes, busca]);
+
+  return (
+    <div>
+      {/* Botão voltar e busca */}
+      <div className="mb-4 flex items-center gap-3">
+        <button
+          onClick={onVoltar}
+          className="flex items-center gap-1 px-3 py-2 text-sm text-stone-700 hover:bg-stone-100 rounded-md"
+        >
+          <ChevronRight className="w-4 h-4 rotate-180" />
+          Voltar
+        </button>
+        <div className="flex-1 relative">
+          <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-stone-400 pointer-events-none" />
+          <input
+            type="text"
+            value={busca}
+            onChange={(e) => setBusca(e.target.value)}
+            autoFocus
+            placeholder="Buscar por nome, CPF/CNPJ, email, telefone ou cidade..."
+            className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-700/30 focus:border-red-700"
+          />
+        </div>
+      </div>
+
+      {!loaded ? (
+        <div className="flex items-center gap-2 text-stone-500 justify-center py-20">
+          <Loader2 className="w-5 h-5 animate-spin" />
+          Carregando clientes...
+        </div>
+      ) : filtrados.length === 0 ? (
+        <div className="text-center py-12 bg-stone-50 rounded-lg text-stone-500 text-sm">
+          {clientes.length === 0
+            ? "Nenhum cliente cadastrado ainda."
+            : `Nenhum cliente encontrado para "${busca}".`}
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {filtrados.map((c) => (
+            <ClienteCard
+              key={c.id}
+              cliente={c}
+              onEditar={() => onEditar(c)}
+              onRemover={() => onRemover(c)}
+              onFazerPedido={() => onFazerPedido(c)}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ClienteCard({ cliente, onEditar, onRemover, onFazerPedido }) {
+  const docFormatado = cliente.tipo_documento === "cnpj"
+    ? formatarCNPJ(cliente.documento)
+    : formatarCPF(cliente.documento);
+  const telFormatado = formatarTelefone(cliente.telefone);
+
+  return (
+    <div className="border border-stone-200 bg-white rounded-lg p-4">
+      <div className="flex items-start justify-between gap-3 mb-2">
+        <div className="flex-1 min-w-0">
+          <h3 className="font-serif text-base font-semibold text-stone-900">
+            {cliente.nome}
+          </h3>
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-600 mt-1">
+            <span>{cliente.tipo_documento.toUpperCase()}: <strong>{docFormatado}</strong></span>
+            <span>📧 {cliente.email}</span>
+            <span>📞 {telFormatado}</span>
+            <span>📍 {cliente.cidade}/{cliente.estado}</span>
+          </div>
+        </div>
+        <div className="flex gap-2 flex-shrink-0">
+          <button
+            onClick={onFazerPedido}
+            className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium bg-red-700 text-white rounded-md hover:bg-red-800"
+            title="Fazer pedido para este cliente"
+          >
+            <Plus className="w-3 h-3" />
+            Pedido
+          </button>
+          <button
+            onClick={onEditar}
+            className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-red-800 border border-red-200 rounded-md hover:bg-red-50"
+          >
+            <Pencil className="w-3 h-3" />
+            Editar
+          </button>
+          <button
+            onClick={onRemover}
+            className="p-1.5 text-stone-500 hover:bg-red-50 hover:text-red-700 rounded-md"
+            title="Remover cliente"
+          >
+            <Trash2 className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function PlaceholderModule({ title, description }) {
   return (
     <div className="max-w-3xl mx-auto text-center py-20">
@@ -7996,6 +8980,14 @@ export default function App() {
       parent: "financeiro",
     },
     {
+      id: "pedido_venda",
+      label: "Cadastro de Clientes",
+      icon: UserPlus,
+      available: true,
+      visible: true, // todos os usuários logados
+      parent: "vendas",
+    },
+    {
       id: "permissoes",
       label: userCtx.isRH && !userCtx.isAdmin ? "Cadastro de Funcionários" : "Gerenciar Permissões",
       icon: Users,
@@ -8041,6 +9033,7 @@ export default function App() {
   const ABAS_PAI = [
     { id: "administrativo", label: "Administrativo", icon: ClipboardList },
     { id: "financeiro",     label: "Financeiro",     icon: Wallet },
+    { id: "vendas",         label: "Vendas",         icon: ShoppingCart },
   ];
   const menuAgrupado = [];
   for (const aba of ABAS_PAI) {
@@ -8251,6 +9244,7 @@ export default function App() {
           {/* Se o usuário tentou acessar um módulo a que não tem permissão (via URL),
               mostra mensagem ao invés de renderizar o módulo */}
           {activeModule !== "permissoes" &&
+            activeModule !== "pedido_venda" &&
             !modulesVisiveis.find((m) => m.id === activeModule) && (
             <div className="max-w-2xl mx-auto text-center py-20">
               <div className="inline-block p-4 bg-red-50 rounded-full mb-4">
@@ -8335,6 +9329,9 @@ export default function App() {
               title="Acesso negado"
               description="Você não tem permissão para acessar esta tela."
             />
+          )}
+          {activeModule === "pedido_venda" && (
+            <PedidoVendaModule user={user} />
           )}
           {activeModule === "estoque" && (
             <PlaceholderModule
