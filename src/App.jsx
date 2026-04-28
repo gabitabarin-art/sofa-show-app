@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect, useCallback } from "react";
+import React, { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import * as XLSX from "xlsx";
 import {
   Upload,
@@ -34,6 +34,8 @@ import {
   LogOut,
   Mail,
   Lock,
+  ClipboardList,
+  Wallet,
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 import LoginScreen from "./LoginScreen";
@@ -7501,6 +7503,380 @@ function TrocaSenhaModal({ onFechar }) {
   );
 }
 
+// ============================================================
+// BUSCA GLOBAL — busca em módulos, funcionários, cores e taxas
+// ============================================================
+
+function GlobalSearchBar({ userCtx, onNavegar, colorTable, taxasBlu, taxasPV }) {
+  const [query, setQuery] = useState("");
+  const [aberto, setAberto] = useState(false);
+  const [usuarios, setUsuarios] = useState([]);
+  const [carregouUsuarios, setCarregouUsuarios] = useState(false);
+  const inputRef = useRef(null);
+  const containerRef = useRef(null);
+
+  // Carrega usuários sob demanda (só admin/RH)
+  // Se for RH (não admin), esconde usuários que estão no Escritório
+  useEffect(() => {
+    if (!aberto) return;
+    if (carregouUsuarios) return;
+    if (!userCtx.isAdmin && !userCtx.isRH) return;
+    (async () => {
+      try {
+        // Busca usuários e lojas em paralelo (precisamos das lojas pra saber qual é o Escritório)
+        const [resUsuarios, resLojas] = await Promise.all([
+          supabase
+            .from("vw_usuarios_completo")
+            .select("user_id, email, grupo_nome, lojas_ids, lojas_nomes"),
+          supabase
+            .from("lojas")
+            .select("id, eh_escritorio"),
+        ]);
+        let lista = resUsuarios.data || [];
+
+        // Se for somente RH (não admin), filtra fora os usuários do Escritório
+        const ehSomenteRH = userCtx.isRH && !userCtx.isAdmin;
+        if (ehSomenteRH && resLojas.data) {
+          const escritorioIds = resLojas.data
+            .filter((l) => l.eh_escritorio)
+            .map((l) => l.id);
+          lista = lista.filter((u) => {
+            const lojas = u.lojas_ids || [];
+            return !lojas.some((id) => escritorioIds.includes(id));
+          });
+        }
+
+        setUsuarios(lista);
+        setCarregouUsuarios(true);
+      } catch (e) {
+        console.error("[GlobalSearch] Erro ao carregar usuários:", e);
+      }
+    })();
+  }, [aberto, carregouUsuarios, userCtx.isAdmin, userCtx.isRH]);
+
+  // Fecha se clicar fora
+  useEffect(() => {
+    if (!aberto) return;
+    const onClick = (e) => {
+      if (containerRef.current && !containerRef.current.contains(e.target)) {
+        setAberto(false);
+      }
+    };
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, [aberto]);
+
+  // Atalho Ctrl/Cmd+K
+  useEffect(() => {
+    const onKey = (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        inputRef.current?.focus();
+        setAberto(true);
+      }
+      if (e.key === "Escape" && aberto) {
+        setAberto(false);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [aberto]);
+
+  // Normaliza pra busca (remove acento, minúsculas)
+  const norm = (s) =>
+    String(s || "")
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "");
+
+  // Calcula resultados em tempo real
+  const resultados = useMemo(() => {
+    const q = norm(query.trim());
+    if (q.length < 2) return null;
+
+    const out = {
+      modulos: [],
+      funcionarios: [],
+      cores: [],
+      taxas: [],
+    };
+
+    // ===== 1. MÓDULOS (com palavras-chave) =====
+    const modulosBase = [
+      {
+        id: "conciliacao",
+        nome: "Conciliação dos Pedidos",
+        keywords: ["conciliacao", "conciliação", "pedidos", "negativos", "sistema", "administrativo", "casar", "comparar"],
+        aba: "Administrativo",
+        visivel: userCtx.estaNoEscritorio && podeVerModulo(userCtx.permissoes, "conciliacao"),
+      },
+      {
+        id: "cores",
+        nome: "Tabela de Cores",
+        keywords: ["cores", "cor", "tabela", "produtos", "skus", "modelos", "administrativo"],
+        aba: "Administrativo",
+        visivel: userCtx.estaNoEscritorio && podeVerModulo(userCtx.permissoes, "cores"),
+      },
+      {
+        id: "financeiro",
+        nome: "Conciliação Financeira",
+        keywords: ["financeiro", "conciliacao", "conciliação", "banco", "extrato", "vendas", "blu", "pague", "veloz", "pix", "cartao", "cartão"],
+        aba: "Financeiro",
+        visivel: userCtx.estaNoEscritorio && podeVerModulo(userCtx.permissoes, "financeiro"),
+      },
+      {
+        id: "taxas",
+        nome: "Tabelas de Taxas de Cartões",
+        keywords: ["taxas", "taxa", "cartoes", "cartões", "cartao", "credito", "crédito", "debito", "débito", "blu", "pague", "veloz", "parcelas", "bandeiras", "visa", "mastercard", "elo", "amex", "hipercard", "pix", "financeiro"],
+        aba: "Financeiro",
+        visivel: userCtx.estaNoEscritorio && podeVerModulo(userCtx.permissoes, "taxas"),
+      },
+      {
+        id: "permissoes",
+        nome: userCtx.isRH && !userCtx.isAdmin ? "Cadastro de Funcionários" : "Gerenciar Permissões",
+        keywords: ["permissoes", "permissões", "permissao", "permissão", "usuarios", "usuários", "usuario", "funcionarios", "funcionários", "cadastrar", "grupos", "lojas", "rh", "admin", "acesso"],
+        aba: null,
+        visivel: userCtx.isAdmin || userCtx.isRH,
+      },
+    ];
+
+    for (const m of modulosBase) {
+      if (!m.visivel) continue;
+      const nomeMatch = norm(m.nome).includes(q);
+      const kwMatch = m.keywords.some((k) => norm(k).includes(q));
+      const abaMatch = m.aba && norm(m.aba).includes(q);
+      if (nomeMatch || kwMatch || abaMatch) {
+        out.modulos.push(m);
+      }
+    }
+
+    // ===== 2. FUNCIONÁRIOS (só admin/RH) =====
+    if (userCtx.isAdmin || userCtx.isRH) {
+      for (const u of usuarios) {
+        const emailMatch = norm(u.email).includes(q);
+        const grupoMatch = norm(u.grupo_nome).includes(q);
+        const lojasMatch = norm(u.lojas_nomes || "").includes(q);
+        if (emailMatch || grupoMatch || lojasMatch) {
+          out.funcionarios.push(u);
+        }
+        if (out.funcionarios.length >= 8) break;
+      }
+    }
+
+    // ===== 3. CORES =====
+    if (userCtx.estaNoEscritorio && podeVerModulo(userCtx.permissoes, "cores") && colorTable) {
+      // colorTable tem estrutura: { [marketplace]: [{cor, codigos: [...]}, ...] }
+      // ou pode ser uma estrutura diferente — vamos tentar genérico
+      try {
+        const procurar = (obj, profundidade = 0) => {
+          if (profundidade > 5) return; // limite de segurança
+          if (out.cores.length >= 8) return;
+          if (typeof obj === "string") {
+            if (norm(obj).includes(q)) {
+              if (!out.cores.find((c) => c.label === obj)) {
+                out.cores.push({ label: obj });
+              }
+            }
+          } else if (Array.isArray(obj)) {
+            for (const item of obj) procurar(item, profundidade + 1);
+          } else if (obj && typeof obj === "object") {
+            for (const v of Object.values(obj)) procurar(v, profundidade + 1);
+          }
+        };
+        procurar(colorTable);
+      } catch (e) {
+        console.error("[GlobalSearch] Erro buscando em cores:", e);
+      }
+    }
+
+    // ===== 4. TAXAS =====
+    if (userCtx.estaNoEscritorio && podeVerModulo(userCtx.permissoes, "taxas")) {
+      const buscarEmTaxas = (taxas, banco) => {
+        if (!taxas) return;
+        try {
+          const procurar = (obj, profundidade = 0, caminho = "") => {
+            if (profundidade > 5) return;
+            if (out.taxas.length >= 8) return;
+            if (typeof obj === "string") {
+              if (norm(obj).includes(q)) {
+                if (!out.taxas.find((t) => t.label === obj && t.banco === banco)) {
+                  out.taxas.push({ label: obj, banco, caminho });
+                }
+              }
+            } else if (Array.isArray(obj)) {
+              obj.forEach((item, i) => procurar(item, profundidade + 1, caminho));
+            } else if (obj && typeof obj === "object") {
+              for (const [k, v] of Object.entries(obj)) {
+                if (norm(k).includes(q) && profundidade > 0) {
+                  if (!out.taxas.find((t) => t.label === k && t.banco === banco)) {
+                    out.taxas.push({ label: k, banco, caminho });
+                  }
+                }
+                procurar(v, profundidade + 1, caminho ? `${caminho} › ${k}` : k);
+              }
+            }
+          };
+          procurar(taxas);
+        } catch (e) {
+          console.error("[GlobalSearch] Erro buscando em taxas:", e);
+        }
+      };
+      buscarEmTaxas(taxasBlu, "Blu");
+      buscarEmTaxas(taxasPV, "Pague Veloz");
+    }
+
+    return out;
+  }, [query, userCtx, colorTable, taxasBlu, taxasPV, usuarios]);
+
+  const totalResultados =
+    (resultados?.modulos.length || 0) +
+    (resultados?.funcionarios.length || 0) +
+    (resultados?.cores.length || 0) +
+    (resultados?.taxas.length || 0);
+
+  const irPara = (rota) => {
+    setAberto(false);
+    setQuery("");
+    onNavegar(rota);
+  };
+
+  return (
+    <div ref={containerRef} className="relative flex-1 max-w-md">
+      <div className="relative">
+        <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-white/70 pointer-events-none" />
+        <input
+          ref={inputRef}
+          type="text"
+          value={query}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            setAberto(true);
+          }}
+          onFocus={() => setAberto(true)}
+          placeholder="Buscar... (Ctrl+K)"
+          className="w-full pl-9 pr-9 py-2 text-sm rounded-md bg-white/15 hover:bg-white/20 focus:bg-white/25 border border-white/20 text-white placeholder-white/60 focus:outline-none focus:ring-2 focus:ring-white/40 transition-colors"
+        />
+        {query && (
+          <button
+            onClick={() => {
+              setQuery("");
+              inputRef.current?.focus();
+            }}
+            className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-white/70 hover:text-white hover:bg-white/10 rounded"
+          >
+            <X className="w-3 h-3" />
+          </button>
+        )}
+      </div>
+
+      {/* Dropdown de resultados */}
+      {aberto && resultados && (
+        <div className="absolute top-full left-0 right-0 mt-1 bg-white rounded-lg shadow-2xl border border-stone-200 max-h-[70vh] overflow-y-auto z-50">
+          {totalResultados === 0 ? (
+            <div className="p-4 text-center text-sm text-stone-500">
+              {query.trim().length < 2
+                ? "Digite ao menos 2 letras pra buscar..."
+                : `Nada encontrado pra "${query}"`}
+            </div>
+          ) : (
+            <div className="py-2">
+              {/* Módulos */}
+              {resultados.modulos.length > 0 && (
+                <div className="mb-2">
+                  <p className="text-[10px] uppercase tracking-[0.15em] text-stone-500 font-semibold px-3 py-1.5">
+                    Módulos
+                  </p>
+                  {resultados.modulos.map((m) => (
+                    <button
+                      key={m.id}
+                      onClick={() => irPara(m.id)}
+                      className="w-full flex items-center gap-3 px-3 py-2 text-sm text-left hover:bg-red-50 transition-colors"
+                    >
+                      <ChevronRight className="w-3.5 h-3.5 text-red-700 flex-shrink-0" />
+                      <span className="flex-1 text-stone-900">{m.nome}</span>
+                      {m.aba && (
+                        <span className="text-[10px] uppercase tracking-wider text-stone-500">
+                          {m.aba}
+                        </span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* Funcionários */}
+              {resultados.funcionarios.length > 0 && (
+                <div className="mb-2 border-t border-stone-100 pt-2">
+                  <p className="text-[10px] uppercase tracking-[0.15em] text-stone-500 font-semibold px-3 py-1.5">
+                    Funcionários
+                  </p>
+                  {resultados.funcionarios.map((u) => (
+                    <button
+                      key={u.user_id}
+                      onClick={() => irPara("permissoes")}
+                      className="w-full flex items-start gap-3 px-3 py-2 text-sm text-left hover:bg-red-50 transition-colors"
+                    >
+                      <Users className="w-3.5 h-3.5 text-amber-700 flex-shrink-0 mt-0.5" />
+                      <div className="flex-1 min-w-0">
+                        <p className="text-stone-900 truncate">{u.email}</p>
+                        <p className="text-[10px] text-stone-500 truncate">
+                          {u.grupo_nome}
+                          {u.lojas_nomes && ` • ${u.lojas_nomes}`}
+                        </p>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* Cores */}
+              {resultados.cores.length > 0 && (
+                <div className="mb-2 border-t border-stone-100 pt-2">
+                  <p className="text-[10px] uppercase tracking-[0.15em] text-stone-500 font-semibold px-3 py-1.5">
+                    Cores
+                  </p>
+                  {resultados.cores.slice(0, 8).map((c, i) => (
+                    <button
+                      key={i}
+                      onClick={() => irPara("cores")}
+                      className="w-full flex items-center gap-3 px-3 py-2 text-sm text-left hover:bg-red-50 transition-colors"
+                    >
+                      <Palette className="w-3.5 h-3.5 text-pink-600 flex-shrink-0" />
+                      <span className="flex-1 text-stone-900">{c.label}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* Taxas */}
+              {resultados.taxas.length > 0 && (
+                <div className="mb-2 border-t border-stone-100 pt-2">
+                  <p className="text-[10px] uppercase tracking-[0.15em] text-stone-500 font-semibold px-3 py-1.5">
+                    Taxas
+                  </p>
+                  {resultados.taxas.slice(0, 8).map((t, i) => (
+                    <button
+                      key={i}
+                      onClick={() => irPara("taxas")}
+                      className="w-full flex items-center gap-3 px-3 py-2 text-sm text-left hover:bg-red-50 transition-colors"
+                    >
+                      <CreditCard className="w-3.5 h-3.5 text-emerald-700 flex-shrink-0" />
+                      <span className="flex-1 text-stone-900">{t.label}</span>
+                      <span className="text-[10px] uppercase tracking-wider text-stone-500">
+                        {t.banco}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PlaceholderModule({ title, description }) {
   return (
     <div className="max-w-3xl mx-auto text-center py-20">
@@ -7588,10 +7964,12 @@ export default function App() {
   const modules = [
     {
       id: "conciliacao",
-      label: "Conciliação dos Pedidos com os Negativos do Sistema",
+      label: "Conciliação dos Pedidos",
+      labelLong: "Conciliação dos Pedidos com os Negativos do Sistema",
       icon: GitCompare,
       available: true,
       visible: podeVerAdmin && podeVerModulo(userCtx.permissoes, "conciliacao"),
+      parent: "administrativo",
     },
     {
       id: "cores",
@@ -7599,6 +7977,7 @@ export default function App() {
       icon: Palette,
       available: true,
       visible: podeVerAdmin && podeVerModulo(userCtx.permissoes, "cores"),
+      parent: "administrativo",
     },
     {
       id: "financeiro",
@@ -7606,6 +7985,7 @@ export default function App() {
       icon: CircleDollarSign,
       available: true,
       visible: podeVerAdmin && podeVerModulo(userCtx.permissoes, "financeiro"),
+      parent: "financeiro",
     },
     {
       id: "taxas",
@@ -7613,6 +7993,7 @@ export default function App() {
       icon: CreditCard,
       available: true,
       visible: podeVerAdmin && podeVerModulo(userCtx.permissoes, "taxas"),
+      parent: "financeiro",
     },
     {
       id: "permissoes",
@@ -7622,6 +8003,7 @@ export default function App() {
       visible: userCtx.isAdmin || userCtx.isRH, // admin ou RH
       adminOnly: userCtx.isAdmin, // só mostra badge "Admin" se for admin
       rhOnly: userCtx.isRH && !userCtx.isAdmin, // badge "RH" se for só RH
+      parent: null, // fica solto, sem aba pai
     },
     {
       id: "estoque",
@@ -7629,6 +8011,7 @@ export default function App() {
       icon: Package,
       available: false,
       visible: false, // futuro
+      parent: null,
     },
     {
       id: "relatorios",
@@ -7636,6 +8019,7 @@ export default function App() {
       icon: BarChart3,
       available: false,
       visible: false, // futuro
+      parent: null,
     },
     {
       id: "config",
@@ -7643,11 +8027,32 @@ export default function App() {
       icon: Settings,
       available: false,
       visible: false, // futuro
+      parent: null,
     },
   ];
 
   // Filtra só os módulos visíveis pra esse usuário
   const modulesVisiveis = modules.filter((m) => m.visible);
+
+  // Estrutura agrupada para o menu lateral.
+  // - Cada aba pai (Administrativo, Financeiro) só aparece se TIVER pelo menos
+  //   um filho visível pra esse usuário.
+  // - Módulos sem parent (Permissões) ficam soltos no fim.
+  const ABAS_PAI = [
+    { id: "administrativo", label: "Administrativo", icon: ClipboardList },
+    { id: "financeiro",     label: "Financeiro",     icon: Wallet },
+  ];
+  const menuAgrupado = [];
+  for (const aba of ABAS_PAI) {
+    const filhos = modulesVisiveis.filter((m) => m.parent === aba.id);
+    if (filhos.length > 0) {
+      menuAgrupado.push({ tipo: "aba", aba, filhos });
+    }
+  }
+  const modulosSoltos = modulesVisiveis.filter((m) => !m.parent);
+  for (const m of modulosSoltos) {
+    menuAgrupado.push({ tipo: "modulo", modulo: m });
+  }
 
   return (
     <div className="min-h-screen bg-stone-50" style={{ fontFamily: "'Inter', system-ui, sans-serif" }}>
@@ -7665,12 +8070,12 @@ export default function App() {
           <button
             onClick={() => setActiveModule("conciliacao")}
             title="Voltar para a tela inicial"
-            className="flex items-center gap-3 rounded-md p-1 -m-1 hover:bg-white/10 active:bg-white/20 transition-colors cursor-pointer text-left"
+            className="flex items-center gap-3 rounded-md p-1 -m-1 hover:bg-white/10 active:bg-white/20 transition-colors cursor-pointer text-left flex-shrink-0"
           >
             <div className="w-10 h-10 rounded-md bg-white/15 border border-white/25 flex items-center justify-center">
               <Armchair className="w-5 h-5 text-white" />
             </div>
-            <div>
+            <div className="hidden sm:block">
               <h1 className="font-serif text-xl font-bold tracking-tight leading-none">
                 Sofá Show
               </h1>
@@ -7679,7 +8084,19 @@ export default function App() {
               </p>
             </div>
           </button>
-          <div className="ml-auto text-xs text-white/70 hidden md:block">
+
+          {/* Barra de busca global */}
+          <div className="flex-1 flex justify-center">
+            <GlobalSearchBar
+              userCtx={userCtx}
+              onNavegar={(rota) => setActiveModule(rota)}
+              colorTable={colorTable}
+              taxasBlu={taxasBlu}
+              taxasPV={taxasPV}
+            />
+          </div>
+
+          <div className="text-xs text-white/70 hidden md:block flex-shrink-0">
             21/04/2026
           </div>
         </div>
@@ -7693,38 +8110,77 @@ export default function App() {
               Módulos
             </p>
             <nav className="space-y-1">
-              {modulesVisiveis.map((m) => (
-                <button
-                  key={m.id}
-                  onClick={() => m.available && setActiveModule(m.id)}
-                  disabled={!m.available}
-                  className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md text-sm text-left transition-colors ${
-                    activeModule === m.id
-                      ? "bg-red-50 text-red-800 font-semibold border-l-4 border-red-700 rounded-l-none pl-2"
-                      : m.available
-                      ? "text-stone-700 hover:bg-stone-100"
-                      : "text-stone-400 cursor-not-allowed"
-                  }`}
-                >
-                  <m.icon className="w-4 h-4 flex-shrink-0" />
-                  <span className="flex-1">{m.label}</span>
-                  {m.adminOnly && (
-                    <span className="text-[9px] uppercase tracking-wider bg-red-700 text-white px-1.5 py-0.5 rounded">
-                      Admin
-                    </span>
-                  )}
-                  {m.rhOnly && (
-                    <span className="text-[9px] uppercase tracking-wider bg-amber-600 text-white px-1.5 py-0.5 rounded">
-                      RH
-                    </span>
-                  )}
-                  {!m.available && (
-                    <span className="text-[9px] uppercase tracking-wider bg-stone-200 text-stone-600 px-1.5 py-0.5 rounded">
-                      Em breve
-                    </span>
-                  )}
-                </button>
-              ))}
+              {menuAgrupado.map((item, idx) => {
+                if (item.tipo === "aba") {
+                  // Aba pai: header não-clicável + filhos identados
+                  const AbaIcon = item.aba.icon;
+                  return (
+                    <div key={item.aba.id} className={idx > 0 ? "mt-3" : ""}>
+                      {/* Cabeçalho da aba pai */}
+                      <div className="flex items-center gap-3 px-3 py-2 text-[11px] uppercase tracking-[0.15em] text-stone-500 font-semibold">
+                        <AbaIcon className="w-3.5 h-3.5 flex-shrink-0 text-red-700" />
+                        <span className="flex-1">{item.aba.label}</span>
+                      </div>
+                      {/* Submódulos identados */}
+                      <div className="space-y-1">
+                        {item.filhos.map((m) => (
+                          <button
+                            key={m.id}
+                            onClick={() => m.available && setActiveModule(m.id)}
+                            disabled={!m.available}
+                            className={`w-full flex items-center gap-3 pl-7 pr-3 py-2 rounded-md text-sm text-left transition-colors ${
+                              activeModule === m.id
+                                ? "bg-red-50 text-red-800 font-semibold border-l-4 border-red-700 rounded-l-none pl-6"
+                                : m.available
+                                ? "text-stone-700 hover:bg-stone-100"
+                                : "text-stone-400 cursor-not-allowed"
+                            }`}
+                          >
+                            <m.icon className="w-4 h-4 flex-shrink-0" />
+                            <span className="flex-1">{m.label}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                } else {
+                  // Módulo solto (sem aba pai)
+                  const m = item.modulo;
+                  return (
+                    <div key={m.id} className={idx > 0 ? "mt-3 pt-3 border-t border-stone-200" : ""}>
+                      <button
+                        onClick={() => m.available && setActiveModule(m.id)}
+                        disabled={!m.available}
+                        className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md text-sm text-left transition-colors ${
+                          activeModule === m.id
+                            ? "bg-red-50 text-red-800 font-semibold border-l-4 border-red-700 rounded-l-none pl-2"
+                            : m.available
+                            ? "text-stone-700 hover:bg-stone-100"
+                            : "text-stone-400 cursor-not-allowed"
+                        }`}
+                      >
+                        <m.icon className="w-4 h-4 flex-shrink-0" />
+                        <span className="flex-1">{m.label}</span>
+                        {m.adminOnly && (
+                          <span className="text-[9px] uppercase tracking-wider bg-red-700 text-white px-1.5 py-0.5 rounded">
+                            Admin
+                          </span>
+                        )}
+                        {m.rhOnly && (
+                          <span className="text-[9px] uppercase tracking-wider bg-amber-600 text-white px-1.5 py-0.5 rounded">
+                            RH
+                          </span>
+                        )}
+                        {!m.available && (
+                          <span className="text-[9px] uppercase tracking-wider bg-stone-200 text-stone-600 px-1.5 py-0.5 rounded">
+                            Em breve
+                          </span>
+                        )}
+                      </button>
+                    </div>
+                  );
+                }
+              })}
               {modulesVisiveis.length === 0 && (
                 <div className="px-3 py-4 text-xs text-stone-500 italic">
                   Você ainda não tem módulos liberados.<br />
