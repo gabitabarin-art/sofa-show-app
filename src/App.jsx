@@ -32,6 +32,8 @@ import {
   AlertCircle,
   CreditCard,
   LogOut,
+  Mail,
+  Lock,
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 import LoginScreen from "./LoginScreen";
@@ -2078,6 +2080,7 @@ function useUserContext(user) {
   const [ctx, setCtx] = useState({
     loading: true,
     isAdmin: false,
+    isRH: false,           // ETAPA C+: é admin do RH?
     grupoId: null,
     grupoNome: null,
     permissoes: { conciliacao: "sem_acesso", cores: "sem_acesso", taxas: "sem_acesso", financeiro: "sem_acesso" },
@@ -2092,13 +2095,14 @@ function useUserContext(user) {
       return;
     }
     try {
-      // 1) Verifica se é admin
+      // 1) Verifica se é admin e/ou RH
       const { data: permRow } = await supabase
         .from("user_permissions")
-        .select("is_admin")
+        .select("is_admin, eh_rh")
         .eq("user_id", user.id)
         .maybeSingle();
       const isAdmin = !!permRow?.is_admin;
+      const isRH    = !!permRow?.eh_rh;
 
       // 2) Busca grupo do usuário (se houver)
       const { data: grupoRow } = await supabase
@@ -2148,6 +2152,7 @@ function useUserContext(user) {
       setCtx({
         loading: false,
         isAdmin,
+        isRH,
         grupoId,
         grupoNome,
         permissoes,
@@ -2159,6 +2164,7 @@ function useUserContext(user) {
       console.log("[UserContext] Carregado:", {
         email: user.email,
         isAdmin,
+        isRH,
         grupoNome,
         permissoes,
         lojas: lojas.map((l) => l.nome),
@@ -6033,7 +6039,10 @@ function DivergenciaSimplesList({ items, cor }) {
   );
 }
 
-function PermissoesModule() {
+function PermissoesModule({ userCtx, onUserAlterado }) {
+  // Quem é RH (não admin) vê só a aba de usuários — sem grupos nem lojas
+  const ehSomenteRH = userCtx.isRH && !userCtx.isAdmin;
+
   // Aba ativa: "grupos" | "lojas" | "usuarios"
   const [aba, setAba] = useState("usuarios");
   const [loadingInicial, setLoadingInicial] = useState(true);
@@ -6049,21 +6058,48 @@ function PermissoesModule() {
   const carregar = useCallback(async () => {
     setError(null);
     try {
-      const [resGrupos, resLojas, resUsuariosCom, resUsuariosSem] = await Promise.all([
+      const [resGrupos, resLojas, resUsuariosCom, resUsuariosSem, resPerms] = await Promise.all([
         supabase.from("grupos").select("id, nome, descricao, permissoes").order("nome"),
         supabase.from("lojas").select("id, nome, eh_escritorio, ativa").order("nome"),
         supabase.from("vw_usuarios_completo").select("user_id, email, grupo_id, grupo_nome, lojas_ids, lojas_nomes"),
         supabase.from("vw_usuarios_disponiveis").select("user_id, email, cadastrado_em"),
+        supabase.from("user_permissions").select("user_id, is_admin, eh_rh"),
       ]);
 
       if (resGrupos.error) throw resGrupos.error;
       if (resLojas.error) throw resLojas.error;
       if (resUsuariosCom.error) throw resUsuariosCom.error;
       if (resUsuariosSem.error) throw resUsuariosSem.error;
+      // resPerms pode falhar pra RH (se RLS bloquear) — não é fatal
+      const permsMap = new Map();
+      if (!resPerms.error && resPerms.data) {
+        for (const p of resPerms.data) {
+          permsMap.set(p.user_id, { is_admin: !!p.is_admin, eh_rh: !!p.eh_rh });
+        }
+      }
+
+      // Anexa info de admin/RH em cada usuário
+      let usuariosCom = (resUsuariosCom.data || []).map((u) => ({
+        ...u,
+        is_admin: permsMap.get(u.user_id)?.is_admin || false,
+        eh_rh: permsMap.get(u.user_id)?.eh_rh || false,
+      }));
+
+      // Se for somente RH, filtra: esconde usuários que estão no Escritório
+      if (ehSomenteRH) {
+        const escritorioIds = (resLojas.data || [])
+          .filter((l) => l.eh_escritorio)
+          .map((l) => l.id);
+        usuariosCom = usuariosCom.filter((u) => {
+          const lojas = u.lojas_ids || [];
+          // Esconde se TEM alguma loja do Escritório
+          return !lojas.some((id) => escritorioIds.includes(id));
+        });
+      }
 
       setGrupos(resGrupos.data || []);
       setLojas(resLojas.data || []);
-      setUsuariosCadastrados(resUsuariosCom.data || []);
+      setUsuariosCadastrados(usuariosCom);
       setUsuariosDisponiveis(resUsuariosSem.data || []);
     } catch (e) {
       console.error("[Permissoes] Erro ao carregar:", e);
@@ -6101,10 +6137,16 @@ function PermissoesModule() {
         <h1 className="font-serif text-4xl font-bold text-stone-900 tracking-tight">
           Gerenciar Permissões
         </h1>
-        <p className="text-stone-600 mt-2 max-w-2xl">
-          Controle quem pode acessar cada módulo do app. Crie grupos, defina o que cada
-          grupo pode fazer e atribua usuários a grupos e lojas.
-        </p>
+        {ehSomenteRH ? (
+          <p className="text-stone-600 mt-2 max-w-2xl">
+            Cadastre funcionários das lojas físicas, atribua-os a grupos e lojas.
+          </p>
+        ) : (
+          <p className="text-stone-600 mt-2 max-w-2xl">
+            Controle quem pode acessar cada módulo do app. Crie grupos, defina o que cada
+            grupo pode fazer e atribua usuários a grupos e lojas.
+          </p>
+        )}
       </div>
 
       {error && (
@@ -6114,7 +6156,7 @@ function PermissoesModule() {
         </div>
       )}
 
-      {/* Abas */}
+      {/* Abas — RH só vê 'Usuários'. Admin vê as 3 */}
       <div className="flex bg-stone-100 rounded-md p-1 mb-6 inline-flex">
         <button
           onClick={() => setAba("usuarios")}
@@ -6129,22 +6171,26 @@ function PermissoesModule() {
             </span>
           )}
         </button>
-        <button
-          onClick={() => setAba("grupos")}
-          className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
-            aba === "grupos" ? "bg-white text-red-800 shadow-sm" : "text-stone-600 hover:text-stone-900"
-          }`}
-        >
-          Grupos ({grupos.length})
-        </button>
-        <button
-          onClick={() => setAba("lojas")}
-          className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
-            aba === "lojas" ? "bg-white text-red-800 shadow-sm" : "text-stone-600 hover:text-stone-900"
-          }`}
-        >
-          Lojas ({lojas.length})
-        </button>
+        {!ehSomenteRH && (
+          <>
+            <button
+              onClick={() => setAba("grupos")}
+              className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
+                aba === "grupos" ? "bg-white text-red-800 shadow-sm" : "text-stone-600 hover:text-stone-900"
+              }`}
+            >
+              Grupos ({grupos.length})
+            </button>
+            <button
+              onClick={() => setAba("lojas")}
+              className={`px-4 py-1.5 text-sm font-medium rounded transition-colors ${
+                aba === "lojas" ? "bg-white text-red-800 shadow-sm" : "text-stone-600 hover:text-stone-900"
+              }`}
+            >
+              Lojas ({lojas.length})
+            </button>
+          </>
+        )}
       </div>
 
       {aba === "usuarios" && (
@@ -6153,7 +6199,11 @@ function PermissoesModule() {
           usuariosDisponiveis={usuariosDisponiveis}
           grupos={grupos}
           lojas={lojas}
-          onChange={carregar}
+          userCtx={userCtx}
+          onChange={() => {
+            carregar();
+            if (onUserAlterado) onUserAlterado();
+          }}
         />
       )}
 
@@ -6172,12 +6222,30 @@ function PermissoesModule() {
 // Aba USUÁRIOS — atribuir grupo + lojas a cada usuário cadastrado
 // ============================================================
 
-function UsuariosTab({ usuariosCadastrados, usuariosDisponiveis, grupos, lojas, onChange }) {
+function UsuariosTab({ usuariosCadastrados, usuariosDisponiveis, grupos, lojas, userCtx, onChange }) {
+  const ehSomenteRH = userCtx.isRH && !userCtx.isAdmin;
+
   const [editando, setEditando] = useState(null); // user_id sendo editado
   const [draftGrupoId, setDraftGrupoId] = useState(null);
   const [draftLojasIds, setDraftLojasIds] = useState([]);
   const [salvando, setSalvando] = useState(false);
   const [erroLinha, setErroLinha] = useState(null);
+
+  // ETAPA C+: modal de convite por e-mail
+  const [convidando, setConvidando] = useState(false);
+  const [conviteEmail, setConviteEmail] = useState("");
+  const [conviteGrupoId, setConviteGrupoId] = useState(null);
+  const [conviteLojasIds, setConviteLojasIds] = useState([]);
+  const [conviteErro, setConviteErro] = useState(null);
+  const [conviteSucesso, setConviteSucesso] = useState(null);
+  const [enviandoConvite, setEnviandoConvite] = useState(false);
+
+  // IDs das lojas que o usuário atual NÃO PODE atribuir
+  // (RH não pode atribuir Escritório; admin pode tudo)
+  const lojasBloqueadasIds = useMemo(() => {
+    if (!ehSomenteRH) return [];
+    return lojas.filter((l) => l.eh_escritorio).map((l) => l.id);
+  }, [ehSomenteRH, lojas]);
 
   const iniciarEdicao = (u, ehNovo) => {
     setEditando(u.user_id);
@@ -6199,12 +6267,25 @@ function UsuariosTab({ usuariosCadastrados, usuariosDisponiveis, grupos, lojas, 
   };
 
   const toggleLoja = (lojaId) => {
+    if (lojasBloqueadasIds.includes(lojaId)) return; // bloqueio pra RH
     setDraftLojasIds((prev) =>
       prev.includes(lojaId) ? prev.filter((id) => id !== lojaId) : [...prev, lojaId]
     );
   };
 
+  const validarLojas = (lojasIds) => {
+    if (!ehSomenteRH) return null;
+    const temEscritorio = lojasIds.some((id) => lojasBloqueadasIds.includes(id));
+    if (temEscritorio) return "Você não pode atribuir a loja Escritório (apenas o admin pode).";
+    return null;
+  };
+
   const salvar = async (userId) => {
+    const erro = validarLojas(draftLojasIds);
+    if (erro) {
+      setErroLinha(erro);
+      return;
+    }
     setSalvando(true);
     setErroLinha(null);
     try {
@@ -6232,7 +6313,7 @@ function UsuariosTab({ usuariosCadastrados, usuariosDisponiveis, grupos, lojas, 
     } catch (e) {
       console.error("[UsuariosTab] Erro ao salvar:", e);
       if (e.message?.includes("policy") || e.code === "42501") {
-        setErroLinha("Sem permissão. Apenas admin pode alterar permissões.");
+        setErroLinha("Sem permissão. Apenas admin ou RH pode alterar permissões.");
       } else {
         setErroLinha("Erro ao salvar: " + e.message);
       }
@@ -6256,8 +6337,280 @@ function UsuariosTab({ usuariosCadastrados, usuariosDisponiveis, grupos, lojas, 
     }
   };
 
+  // ETAPA C+: alternar status de RH (só admin pode chamar)
+  const alternarRH = async (userId, ehRhAtual, email) => {
+    const novoStatus = !ehRhAtual;
+    const acao = novoStatus ? "promover a RH" : "remover de RH";
+    if (!confirm(`${acao.charAt(0).toUpperCase() + acao.slice(1)} ${email}?\n\n${
+      novoStatus
+        ? "Esta pessoa vai poder cadastrar e editar funcionários das lojas físicas."
+        : "Esta pessoa vai perder o acesso ao painel de Permissões."
+    }`)) return;
+    setSalvando(true);
+    try {
+      const { error } = await supabase
+        .from("user_permissions")
+        .update({ eh_rh: novoStatus, updated_at: new Date().toISOString() })
+        .eq("user_id", userId);
+      if (error) {
+        if (error.message?.includes("policy") || error.code === "42501") {
+          alert("Sem permissão. Apenas admin pode marcar usuários como RH.");
+        } else {
+          alert("Erro: " + error.message);
+        }
+        return;
+      }
+      onChange();
+    } finally {
+      setSalvando(false);
+    }
+  };
+
+  // ===== CONVITE POR E-MAIL =====
+  const abrirConvite = () => {
+    setConvidando(true);
+    setConviteEmail("");
+    setConviteGrupoId(grupos[0]?.id || null);
+    setConviteLojasIds([]);
+    setConviteErro(null);
+    setConviteSucesso(null);
+  };
+
+  const fecharConvite = () => {
+    setConvidando(false);
+    setConviteEmail("");
+    setConviteErro(null);
+    setConviteSucesso(null);
+  };
+
+  const toggleLojaConvite = (lojaId) => {
+    if (lojasBloqueadasIds.includes(lojaId)) return;
+    setConviteLojasIds((prev) =>
+      prev.includes(lojaId) ? prev.filter((id) => id !== lojaId) : [...prev, lojaId]
+    );
+  };
+
+  const enviarConvite = async () => {
+    setConviteErro(null);
+    setConviteSucesso(null);
+
+    const email = conviteEmail.trim().toLowerCase();
+    if (!email || !email.includes("@")) {
+      setConviteErro("E-mail inválido.");
+      return;
+    }
+    if (!conviteGrupoId) {
+      setConviteErro("Selecione um grupo.");
+      return;
+    }
+    if (conviteLojasIds.length === 0) {
+      setConviteErro("Selecione ao menos uma loja.");
+      return;
+    }
+    const erroLojas = validarLojas(conviteLojasIds);
+    if (erroLojas) {
+      setConviteErro(erroLojas);
+      return;
+    }
+
+    setEnviandoConvite(true);
+    try {
+      // 1) Envia o e-mail de convite (Supabase manda link pra criar senha)
+      // OBS: o Supabase JS não tem método "invite" direto pelo client comum —
+      // usamos signUp com uma senha temporária aleatória que o usuário trocará.
+      // O usuário recebe e-mail de confirmação (se confirmação tiver ativada
+      // no Supabase) ou já entra direto.
+      const senhaTemp = "T" + Math.random().toString(36).slice(2, 12) + "!" + Math.floor(Math.random() * 1000);
+      const { data: signUpData, error: errSignUp } = await supabase.auth.signUp({
+        email,
+        password: senhaTemp,
+        options: {
+          emailRedirectTo: window.location.origin,
+        },
+      });
+
+      if (errSignUp) {
+        if (errSignUp.message.toLowerCase().includes("already registered")) {
+          setConviteErro("Esse e-mail já tem conta. Edite o usuário existente em vez de convidar de novo.");
+        } else {
+          setConviteErro("Erro ao convidar: " + errSignUp.message);
+        }
+        return;
+      }
+
+      const novoUserId = signUpData?.user?.id;
+      if (!novoUserId) {
+        setConviteErro("Convite enviado, mas não consegui pegar o ID do usuário. Atualize a página.");
+        return;
+      }
+
+      // 2) Atribui o grupo pelo upsert
+      const { error: errGrupo } = await supabase
+        .from("usuarios_grupos")
+        .upsert({ user_id: novoUserId, grupo_id: conviteGrupoId, updated_at: new Date().toISOString() });
+      if (errGrupo) throw errGrupo;
+
+      // 3) Atribui as lojas
+      const linhas = conviteLojasIds.map((lojaId) => ({ user_id: novoUserId, loja_id: lojaId }));
+      const { error: errLojas } = await supabase.from("usuarios_lojas").insert(linhas);
+      if (errLojas) throw errLojas;
+
+      setConviteSucesso(
+        `Convite enviado para ${email}! ` +
+        `O funcionário vai receber um e-mail e precisa clicar pra confirmar. ` +
+        `Depois pode fazer login com a senha que ele criar.`
+      );
+      // Limpa o form mas mantém o modal aberto pra mostrar a mensagem
+      setConviteEmail("");
+      setConviteLojasIds([]);
+      onChange();
+    } catch (e) {
+      console.error("[UsuariosTab] Erro no convite:", e);
+      setConviteErro("Erro ao processar convite: " + e.message);
+    } finally {
+      setEnviandoConvite(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
+      {/* Botão de convidar funcionário (admin e RH) */}
+      <div className="flex justify-end">
+        <button
+          onClick={abrirConvite}
+          className="flex items-center gap-2 px-4 py-2 text-sm font-medium bg-red-700 text-white rounded-md hover:bg-red-800 transition-colors"
+        >
+          <Plus className="w-4 h-4" />
+          Cadastrar funcionário
+        </button>
+      </div>
+
+      {/* Modal de convite */}
+      {convidando && (
+        <div className="border-2 border-red-300 bg-red-50/30 rounded-lg p-4 space-y-3">
+          <div className="flex items-start justify-between">
+            <h3 className="font-serif text-lg font-semibold text-stone-900">
+              Cadastrar novo funcionário
+            </h3>
+            <button
+              onClick={fecharConvite}
+              className="p-1 text-stone-500 hover:bg-stone-100 rounded"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          <p className="text-xs text-stone-600">
+            O funcionário vai receber um e-mail pra confirmar o cadastro e definir a senha dele.
+          </p>
+
+          <div>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              E-mail do funcionário
+            </label>
+            <input
+              type="email"
+              value={conviteEmail}
+              onChange={(e) => setConviteEmail(e.target.value)}
+              placeholder="exemplo@sofashow.com.br"
+              autoFocus
+              className="w-full px-3 py-2 text-sm border border-stone-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-red-700/30 focus:border-red-700"
+            />
+          </div>
+
+          <div>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              Grupo
+            </label>
+            <select
+              value={conviteGrupoId || ""}
+              onChange={(e) => setConviteGrupoId(parseInt(e.target.value) || null)}
+              className="w-full px-3 py-2 text-sm border border-stone-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-red-700/30 focus:border-red-700"
+            >
+              {grupos.map((g) => (
+                <option key={g.id} value={g.id}>{g.nome}</option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              Lojas (selecione uma ou mais)
+            </label>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+              {lojas.filter((l) => l.ativa).map((l) => {
+                const bloqueada = lojasBloqueadasIds.includes(l.id);
+                const marcada = conviteLojasIds.includes(l.id);
+                return (
+                  <label
+                    key={l.id}
+                    className={`flex items-center gap-2 px-3 py-2 text-sm border rounded transition-colors ${
+                      bloqueada
+                        ? "bg-stone-100 border-stone-200 text-stone-400 cursor-not-allowed"
+                        : marcada
+                        ? "bg-red-50 border-red-300 text-red-900 cursor-pointer"
+                        : "bg-white border-stone-200 text-stone-700 hover:bg-stone-50 cursor-pointer"
+                    }`}
+                    title={bloqueada ? "Apenas admin pode atribuir esta loja" : ""}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={marcada}
+                      disabled={bloqueada}
+                      onChange={() => toggleLojaConvite(l.id)}
+                      className="w-3.5 h-3.5 accent-red-700"
+                    />
+                    <span className="flex-1">
+                      {l.nome}
+                      {l.eh_escritorio && (
+                        <span className="ml-1 text-[10px] text-red-700 font-semibold">★</span>
+                      )}
+                      {bloqueada && (
+                        <span className="ml-1 text-[9px] text-stone-400">(só admin)</span>
+                      )}
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+            {!ehSomenteRH && (
+              <p className="text-xs text-stone-500 mt-2">
+                <span className="text-red-700 font-semibold">★</span> Escritório libera os módulos administrativos
+              </p>
+            )}
+          </div>
+
+          {conviteErro && (
+            <div className="bg-red-50 border border-red-200 rounded-md p-2 text-xs text-red-900">
+              {conviteErro}
+            </div>
+          )}
+          {conviteSucesso && (
+            <div className="bg-emerald-50 border border-emerald-200 rounded-md p-2 text-xs text-emerald-900">
+              {conviteSucesso}
+            </div>
+          )}
+
+          <div className="flex gap-2 pt-1">
+            <button
+              onClick={enviarConvite}
+              disabled={enviandoConvite}
+              className="flex items-center gap-1.5 px-4 py-2 text-sm bg-emerald-700 text-white font-medium rounded-md hover:bg-emerald-800 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {enviandoConvite ? <Loader2 className="w-4 h-4 animate-spin" /> : <Mail className="w-4 h-4" />}
+              Enviar convite
+            </button>
+            <button
+              onClick={fecharConvite}
+              disabled={enviandoConvite}
+              className="px-3 py-2 text-sm text-stone-600 hover:text-stone-900"
+            >
+              Fechar
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Usuários novos esperando atribuição */}
       {usuariosDisponiveis.length > 0 && (
         <div>
@@ -6265,7 +6618,7 @@ function UsuariosTab({ usuariosCadastrados, usuariosDisponiveis, grupos, lojas, 
             <span className="inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 text-[10px] font-bold rounded-full bg-red-600 text-white">
               {usuariosDisponiveis.length}
             </span>
-            Esperando liberação de acesso
+            Esperando atribuição
           </h2>
           <p className="text-xs text-stone-600 mb-3">
             Estes usuários se cadastraram e ainda não têm grupo. Atribua um grupo + lojas pra liberar o acesso.
@@ -6278,6 +6631,8 @@ function UsuariosTab({ usuariosCadastrados, usuariosDisponiveis, grupos, lojas, 
                 ehNovo={true}
                 grupos={grupos}
                 lojas={lojas}
+                lojasBloqueadasIds={lojasBloqueadasIds}
+                ehSomenteRH={ehSomenteRH}
                 editando={editando === u.user_id}
                 draftGrupoId={draftGrupoId}
                 draftLojasIds={draftLojasIds}
@@ -6313,11 +6668,15 @@ function UsuariosTab({ usuariosCadastrados, usuariosDisponiveis, grupos, lojas, 
                 ehNovo={false}
                 grupos={grupos}
                 lojas={lojas}
+                lojasBloqueadasIds={lojasBloqueadasIds}
+                ehSomenteRH={ehSomenteRH}
                 editando={editando === u.user_id}
                 draftGrupoId={draftGrupoId}
                 draftLojasIds={draftLojasIds}
                 erroLinha={erroLinha}
                 salvando={salvando}
+                mostrarRH={userCtx.isAdmin}
+                onAlternarRH={() => alternarRH(u.user_id, u.eh_rh, u.email)}
                 onChangeGrupo={setDraftGrupoId}
                 onToggleLoja={toggleLoja}
                 onIniciarEdicao={() => iniciarEdicao(u, false)}
@@ -6334,8 +6693,9 @@ function UsuariosTab({ usuariosCadastrados, usuariosDisponiveis, grupos, lojas, 
 }
 
 function UsuarioCard({
-  u, ehNovo, grupos, lojas, editando,
+  u, ehNovo, grupos, lojas, lojasBloqueadasIds = [], ehSomenteRH = false, editando,
   draftGrupoId, draftLojasIds, erroLinha, salvando,
+  mostrarRH = false, onAlternarRH = null,
   onChangeGrupo, onToggleLoja, onIniciarEdicao, onCancelar, onSalvar, onRemover,
 }) {
   return (
@@ -6343,7 +6703,19 @@ function UsuarioCard({
       <div className="p-4">
         <div className="flex items-start justify-between gap-3 mb-2">
           <div className="flex-1 min-w-0">
-            <p className="font-serif text-sm font-semibold text-stone-900 truncate">{u.email}</p>
+            <div className="flex items-center gap-2 flex-wrap">
+              <p className="font-serif text-sm font-semibold text-stone-900 truncate">{u.email}</p>
+              {u.is_admin && (
+                <span className="text-[9px] uppercase tracking-wider bg-red-700 text-white px-1.5 py-0.5 rounded">
+                  Admin
+                </span>
+              )}
+              {u.eh_rh && !u.is_admin && (
+                <span className="text-[9px] uppercase tracking-wider bg-amber-600 text-white px-1.5 py-0.5 rounded">
+                  RH
+                </span>
+              )}
+            </div>
             {!editando && !ehNovo && (
               <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-600 mt-1">
                 <span>Grupo: <strong className="text-red-800">{u.grupo_nome}</strong></span>
@@ -6360,6 +6732,21 @@ function UsuarioCard({
           </div>
           {!editando && (
             <div className="flex gap-2 flex-shrink-0">
+              {mostrarRH && onAlternarRH && !u.is_admin && (
+                <button
+                  onClick={onAlternarRH}
+                  disabled={salvando}
+                  className={`flex items-center gap-1 px-2 py-1.5 text-xs font-medium rounded-md border ${
+                    u.eh_rh
+                      ? "bg-amber-50 text-amber-800 border-amber-300 hover:bg-amber-100"
+                      : "bg-white text-stone-600 border-stone-300 hover:bg-stone-50"
+                  }`}
+                  title={u.eh_rh ? "Remover de RH" : "Marcar como RH"}
+                >
+                  <Users className="w-3 h-3" />
+                  {u.eh_rh ? "É RH" : "Tornar RH"}
+                </button>
+              )}
               <button
                 onClick={onIniciarEdicao}
                 className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-red-800 border border-red-200 rounded-md hover:bg-red-50"
@@ -6405,33 +6792,46 @@ function UsuarioCard({
                 Lojas (selecione uma ou mais)
               </label>
               <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-                {lojas.filter((l) => l.ativa).map((l) => (
-                  <label
-                    key={l.id}
-                    className={`flex items-center gap-2 px-3 py-2 text-sm border rounded cursor-pointer transition-colors ${
-                      draftLojasIds.includes(l.id)
-                        ? "bg-red-50 border-red-300 text-red-900"
-                        : "bg-white border-stone-200 text-stone-700 hover:bg-stone-50"
-                    }`}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={draftLojasIds.includes(l.id)}
-                      onChange={() => onToggleLoja(l.id)}
-                      className="w-3.5 h-3.5 accent-red-700"
-                    />
-                    <span className="flex-1">
-                      {l.nome}
-                      {l.eh_escritorio && (
-                        <span className="ml-1 text-[10px] text-red-700 font-semibold">★</span>
-                      )}
-                    </span>
-                  </label>
-                ))}
+                {lojas.filter((l) => l.ativa).map((l) => {
+                  const bloqueada = lojasBloqueadasIds.includes(l.id);
+                  const marcada = draftLojasIds.includes(l.id);
+                  return (
+                    <label
+                      key={l.id}
+                      className={`flex items-center gap-2 px-3 py-2 text-sm border rounded transition-colors ${
+                        bloqueada
+                          ? "bg-stone-100 border-stone-200 text-stone-400 cursor-not-allowed"
+                          : marcada
+                          ? "bg-red-50 border-red-300 text-red-900 cursor-pointer"
+                          : "bg-white border-stone-200 text-stone-700 hover:bg-stone-50 cursor-pointer"
+                      }`}
+                      title={bloqueada ? "Apenas admin pode atribuir esta loja" : ""}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={marcada}
+                        disabled={bloqueada}
+                        onChange={() => onToggleLoja(l.id)}
+                        className="w-3.5 h-3.5 accent-red-700"
+                      />
+                      <span className="flex-1">
+                        {l.nome}
+                        {l.eh_escritorio && (
+                          <span className="ml-1 text-[10px] text-red-700 font-semibold">★</span>
+                        )}
+                        {bloqueada && (
+                          <span className="ml-1 text-[9px] text-stone-400">(só admin)</span>
+                        )}
+                      </span>
+                    </label>
+                  );
+                })}
               </div>
-              <p className="text-xs text-stone-500 mt-2">
-                <span className="text-red-700 font-semibold">★</span> Escritório libera os módulos administrativos
-              </p>
+              {!ehSomenteRH && (
+                <p className="text-xs text-stone-500 mt-2">
+                  <span className="text-red-700 font-semibold">★</span> Escritório libera os módulos administrativos
+                </p>
+              )}
             </div>
 
             {erroLinha && (
@@ -6949,6 +7349,158 @@ function LojasTab({ lojas, onChange }) {
   );
 }
 
+function TrocaSenhaModal({ onFechar }) {
+  const [senhaAtual, setSenhaAtual] = useState("");
+  const [senhaNova, setSenhaNova] = useState("");
+  const [confirmarSenha, setConfirmarSenha] = useState("");
+  const [erro, setErro] = useState(null);
+  const [sucesso, setSucesso] = useState(false);
+  const [salvando, setSalvando] = useState(false);
+
+  const trocar = async () => {
+    setErro(null);
+    if (senhaNova.length < 6) {
+      setErro("A nova senha precisa ter no mínimo 6 caracteres.");
+      return;
+    }
+    if (senhaNova !== confirmarSenha) {
+      setErro("A confirmação da senha não bate. Digite de novo.");
+      return;
+    }
+    if (senhaNova === senhaAtual) {
+      setErro("A nova senha precisa ser diferente da atual.");
+      return;
+    }
+    setSalvando(true);
+    try {
+      // 1) Verifica senha atual fazendo um signIn (não precisa fazer logout)
+      const { data: sessao } = await supabase.auth.getSession();
+      const email = sessao?.session?.user?.email;
+      if (!email) {
+        setErro("Sessão expirada. Faça login de novo.");
+        return;
+      }
+      const { error: errSignIn } = await supabase.auth.signInWithPassword({
+        email,
+        password: senhaAtual,
+      });
+      if (errSignIn) {
+        setErro("Senha atual incorreta.");
+        return;
+      }
+      // 2) Atualiza pra nova senha
+      const { error: errUpd } = await supabase.auth.updateUser({ password: senhaNova });
+      if (errUpd) {
+        setErro("Erro ao trocar senha: " + errUpd.message);
+        return;
+      }
+      setSucesso(true);
+      setSenhaAtual("");
+      setSenhaNova("");
+      setConfirmarSenha("");
+    } catch (e) {
+      setErro("Erro inesperado: " + e.message);
+    } finally {
+      setSalvando(false);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ backgroundColor: "rgba(0,0,0,0.5)" }}
+    >
+      <div className="bg-white rounded-lg shadow-2xl w-full max-w-md p-6">
+        <div className="flex items-start justify-between mb-4">
+          <h2 className="font-serif text-xl font-bold text-stone-900">Trocar minha senha</h2>
+          <button onClick={onFechar} className="p-1 text-stone-500 hover:bg-stone-100 rounded">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        {sucesso ? (
+          <div className="space-y-4">
+            <div className="bg-emerald-50 border border-emerald-200 rounded-md p-3 flex items-start gap-2">
+              <CheckCircle2 className="w-4 h-4 text-emerald-700 mt-0.5 flex-shrink-0" />
+              <p className="text-sm text-emerald-900">
+                Senha trocada com sucesso! Você continua logada na sessão atual.
+              </p>
+            </div>
+            <button
+              onClick={onFechar}
+              className="w-full px-4 py-2 text-sm bg-stone-100 text-stone-700 rounded-md hover:bg-stone-200"
+            >
+              Fechar
+            </button>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <div>
+              <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+                Senha atual
+              </label>
+              <input
+                type="password"
+                value={senhaAtual}
+                onChange={(e) => setSenhaAtual(e.target.value)}
+                autoFocus
+                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-red-700/30 focus:border-red-700"
+              />
+            </div>
+            <div>
+              <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+                Nova senha (mínimo 6 caracteres)
+              </label>
+              <input
+                type="password"
+                value={senhaNova}
+                onChange={(e) => setSenhaNova(e.target.value)}
+                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-red-700/30 focus:border-red-700"
+              />
+            </div>
+            <div>
+              <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+                Confirmar nova senha
+              </label>
+              <input
+                type="password"
+                value={confirmarSenha}
+                onChange={(e) => setConfirmarSenha(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") trocar(); }}
+                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-red-700/30 focus:border-red-700"
+              />
+            </div>
+
+            {erro && (
+              <div className="bg-red-50 border border-red-200 rounded-md p-2 text-xs text-red-900">
+                {erro}
+              </div>
+            )}
+
+            <div className="flex gap-2">
+              <button
+                onClick={trocar}
+                disabled={salvando || !senhaAtual || !senhaNova || !confirmarSenha}
+                className="flex-1 flex items-center justify-center gap-1.5 px-4 py-2 text-sm bg-red-700 text-white font-medium rounded-md hover:bg-red-800 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {salvando ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                Trocar senha
+              </button>
+              <button
+                onClick={onFechar}
+                disabled={salvando}
+                className="px-3 py-2 text-sm text-stone-600 hover:text-stone-900"
+              >
+                Cancelar
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function PlaceholderModule({ title, description }) {
   return (
     <div className="max-w-3xl mx-auto text-center py-20">
@@ -6982,6 +7534,9 @@ export default function App() {
   const { taxas: taxasPV, save: saveTaxasPV, loaded: taxasPVLoaded, error: errorTaxasPV, reload: reloadTaxasPV } = useTaxasPagueVeloz();
   // ETAPA C: contexto do usuário (grupo + lojas + permissões)
   const userCtx = useUserContext(user);
+
+  // ETAPA C+: modal de trocar senha
+  const [mostrarTrocaSenha, setMostrarTrocaSenha] = useState(false);
 
   // Recarrega automaticamente os dados do Supabase quando o usuário entra
   // numa tela. Assim, se outra loja editou enquanto a tela estava aberta
@@ -7061,11 +7616,12 @@ export default function App() {
     },
     {
       id: "permissoes",
-      label: "Gerenciar Permissões",
+      label: userCtx.isRH && !userCtx.isAdmin ? "Cadastro de Funcionários" : "Gerenciar Permissões",
       icon: Users,
       available: true,
-      visible: userCtx.isAdmin, // só admin
-      adminOnly: true,
+      visible: userCtx.isAdmin || userCtx.isRH, // admin ou RH
+      adminOnly: userCtx.isAdmin, // só mostra badge "Admin" se for admin
+      rhOnly: userCtx.isRH && !userCtx.isAdmin, // badge "RH" se for só RH
     },
     {
       id: "estoque",
@@ -7157,6 +7713,11 @@ export default function App() {
                       Admin
                     </span>
                   )}
+                  {m.rhOnly && (
+                    <span className="text-[9px] uppercase tracking-wider bg-amber-600 text-white px-1.5 py-0.5 rounded">
+                      RH
+                    </span>
+                  )}
                   {!m.available && (
                     <span className="text-[9px] uppercase tracking-wider bg-stone-200 text-stone-600 px-1.5 py-0.5 rounded">
                       Em breve
@@ -7182,7 +7743,22 @@ export default function App() {
               <p className="text-xs text-stone-800 font-medium truncate" title={user.email}>
                 {user.email}
               </p>
+              {userCtx.grupoNome && (
+                <p className="text-[10px] text-stone-500 mt-0.5">
+                  {userCtx.grupoNome}
+                  {userCtx.isAdmin && <span className="ml-1 text-red-700 font-semibold">• Admin</span>}
+                  {userCtx.isRH && !userCtx.isAdmin && <span className="ml-1 text-amber-700 font-semibold">• RH</span>}
+                </p>
+              )}
             </div>
+            <button
+              onClick={() => setMostrarTrocaSenha(true)}
+              className="w-full flex items-center gap-2 px-3 py-2 rounded-md text-xs text-stone-600 hover:bg-stone-100 hover:text-stone-900 transition-colors"
+              title="Trocar minha senha"
+            >
+              <Lock className="w-3.5 h-3.5" />
+              <span>Trocar senha</span>
+            </button>
             <button
               onClick={logout}
               className="w-full flex items-center gap-2 px-3 py-2 rounded-md text-xs text-stone-600 hover:bg-stone-100 hover:text-stone-900 transition-colors"
@@ -7295,13 +7871,13 @@ export default function App() {
               Carregando taxas…
             </div>
           )}
-          {activeModule === "permissoes" && userCtx.isAdmin && (
-            <PermissoesModule />
+          {activeModule === "permissoes" && (userCtx.isAdmin || userCtx.isRH) && (
+            <PermissoesModule userCtx={userCtx} onUserAlterado={userCtx.reload} />
           )}
-          {activeModule === "permissoes" && !userCtx.isAdmin && (
+          {activeModule === "permissoes" && !userCtx.isAdmin && !userCtx.isRH && (
             <PlaceholderModule
               title="Acesso negado"
-              description="Apenas administradores podem acessar esta tela."
+              description="Você não tem permissão para acessar esta tela."
             />
           )}
           {activeModule === "estoque" && (
@@ -7324,6 +7900,11 @@ export default function App() {
           )}
         </main>
       </div>
+
+      {/* Modal de trocar senha */}
+      {mostrarTrocaSenha && (
+        <TrocaSenhaModal onFechar={() => setMostrarTrocaSenha(false)} />
+      )}
     </div>
   );
 }
