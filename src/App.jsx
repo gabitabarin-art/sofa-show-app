@@ -9098,10 +9098,19 @@ export default function App() {
   // disponível pro setActiveModule abaixo.
   const [abaAberta, setAbaAberta] = useState(null);
 
+  // resetKey: incrementa toda vez que o usuário clica num submódulo no menu.
+  // É passado como `key` pro componente do módulo — quando muda, o React
+  // desmonta e remonta o componente, resetando o estado interno (volta pra
+  // tela inicial do módulo).
+  const [resetKey, setResetKey] = useState(0);
+
   // Hooks restantes (sempre chamados, em qualquer ordem — regras de hooks do React)
   const { module: activeModule, bancoId: bancoSelecionadoId, navigate } = useHashRoute();
   const setActiveModule = (m) => {
     navigate(m, null);
+    // Sempre incrementa o resetKey: assim, mesmo se o usuário clicar no mesmo
+    // módulo onde já está, o componente é remontado e volta pra tela inicial.
+    setResetKey((k) => k + 1);
     // Quando o módulo é trocado (ex: via busca global ou logo), abre
     // automaticamente a aba pai dele pra o usuário ver onde está.
     const PARENT_DE = {
@@ -9546,10 +9555,11 @@ export default function App() {
           )}
 
           {activeModule === "conciliacao" && modulesVisiveis.find((m) => m.id === "conciliacao") && (
-            <ConciliacaoModule colorTable={colorTable} />
+            <ConciliacaoModule key={resetKey} colorTable={colorTable} />
           )}
           {activeModule === "cores" && modulesVisiveis.find((m) => m.id === "cores") && colorsLoaded && (
             <ColorTableModule
+              key={resetKey}
               table={colorTable}
               onSave={saveColorTable}
               supabaseError={errorCores}
@@ -9563,6 +9573,7 @@ export default function App() {
           )}
           {activeModule === "financeiro" && modulesVisiveis.find((m) => m.id === "financeiro") && (
             <FinanceiroModule
+              key={resetKey}
               bancoSelecionadoId={bancoSelecionadoId}
               onSelecionarBanco={(id) => navigate("financeiro", id)}
               onTrocarBanco={() => navigate("financeiro", null)}
@@ -9570,6 +9581,7 @@ export default function App() {
           )}
           {activeModule === "taxas" && modulesVisiveis.find((m) => m.id === "taxas") && taxasBluLoaded && taxasPVLoaded && (
             <TaxasModule
+              key={resetKey}
               taxasBlu={taxasBlu}
               onSaveTaxasBlu={saveTaxasBlu}
               taxasPV={taxasPV}
@@ -9585,7 +9597,7 @@ export default function App() {
             </div>
           )}
           {activeModule === "permissoes" && (userCtx.isAdmin || userCtx.isRH) && (
-            <PermissoesModule userCtx={userCtx} onUserAlterado={userCtx.reload} />
+            <PermissoesModule key={resetKey} userCtx={userCtx} onUserAlterado={userCtx.reload} />
           )}
           {activeModule === "permissoes" && !userCtx.isAdmin && !userCtx.isRH && (
             <PlaceholderModule
@@ -9594,7 +9606,7 @@ export default function App() {
             />
           )}
           {activeModule === "pedido_venda" && (
-            <PedidoVendaModule user={user} />
+            <PedidoVendaModule key={resetKey} user={user} />
           )}
           {activeModule === "estoque" && (
             <PlaceholderModule
