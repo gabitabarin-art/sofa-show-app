@@ -8952,7 +8952,9 @@ function ClientePesquisa({ clientes, loaded, onVoltar, onEditar, onRemover, onFa
         norm(c.documento).includes(q) ||
         norm(c.email).includes(q) ||
         norm(c.telefone).includes(q) ||
-        norm(c.cidade).includes(q)
+        norm(c.cidade).includes(q) ||
+        // Busca também por número do cliente (ex: digitar "5" acha o cliente nº 5)
+        String(c.numero_cliente || "").includes(q)
       );
     });
   }, [clientes, busca]);
@@ -8975,7 +8977,7 @@ function ClientePesquisa({ clientes, loaded, onVoltar, onEditar, onRemover, onFa
             value={busca}
             onChange={(e) => setBusca(e.target.value)}
             autoFocus
-            placeholder="Buscar por nome, CPF/CNPJ, email, telefone ou cidade..."
+            placeholder="Buscar por número, nome, CPF/CNPJ, email, telefone ou cidade..."
             className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-700/30 focus:border-red-700"
           />
         </div>
@@ -9017,7 +9019,17 @@ function ClienteCard({ cliente, onEditar, onRemover, onFazerPedido }) {
 
   return (
     <div className="border border-stone-200 bg-white rounded-lg p-4">
-      <div className="flex items-start justify-between gap-3 mb-2">
+      <div className="flex items-start gap-3 mb-2">
+        {/* Número do cliente — pequeno, lateral esquerda */}
+        {cliente.numero_cliente && (
+          <div className="flex-shrink-0 text-[10px] uppercase tracking-wider text-stone-400 font-semibold pt-0.5">
+            <div>Nº</div>
+            <div className="text-stone-700 text-sm font-bold leading-tight">
+              {cliente.numero_cliente}
+            </div>
+          </div>
+        )}
+
         <div className="flex-1 min-w-0">
           <h3 className="font-serif text-base font-semibold text-stone-900">
             {cliente.nome}
