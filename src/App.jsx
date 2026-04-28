@@ -8083,6 +8083,8 @@ function PedidoVendaModule({ user }) {
   const [perguntaPedido, setPerguntaPedido] = useState(null); // { cliente }
   // Mensagem "Em construção" ao confirmar pedido
   const [mostrarEmConstrucao, setMostrarEmConstrucao] = useState(false);
+  // Cliente já cadastrado detectado durante o cadastro de novo
+  const [clienteJaExiste, setClienteJaExiste] = useState(null);
 
   const { clientes, loaded, error, salvar, remover } = useClientes(user);
 
@@ -8178,6 +8180,7 @@ function PedidoVendaModule({ user }) {
             apósSalvar(salvo);
           }}
           onCancelar={() => { setTela("inicial"); setClienteEdicao(null); }}
+          onClienteJaExiste={(c) => setClienteJaExiste(c)}
         />
       )}
 
@@ -8266,6 +8269,104 @@ function PedidoVendaModule({ user }) {
           </div>
         </div>
       )}
+
+      {/* Pop-up "Cliente já cadastrado" — aparece quando o vendedor digita
+          um documento que já está no banco */}
+      {clienteJaExiste && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ backgroundColor: "rgba(0,0,0,0.5)" }}
+        >
+          <div className="bg-white rounded-lg shadow-2xl w-full max-w-lg p-6">
+            <div className="flex items-start gap-3 mb-4">
+              <div className="flex-shrink-0 inline-flex items-center justify-center w-12 h-12 rounded-full bg-amber-50">
+                <AlertTriangle className="w-6 h-6 text-amber-700" />
+              </div>
+              <div>
+                <h2 className="font-serif text-xl font-bold text-stone-900 mb-1">
+                  Cliente já cadastrado
+                </h2>
+                <p className="text-sm text-stone-700">
+                  Este {clienteJaExiste.tipo_documento.toUpperCase()} já está no nosso sistema. Não precisa cadastrar de novo!
+                </p>
+              </div>
+            </div>
+
+            {/* Card com dados do cliente existente */}
+            <div className="bg-stone-50 border border-stone-200 rounded-lg p-4 mb-4">
+              <div className="flex items-start gap-3">
+                {clienteJaExiste.numero_cliente && (
+                  <div className="flex-shrink-0 text-[10px] uppercase tracking-wider text-stone-400 font-semibold pt-0.5">
+                    <div>Nº</div>
+                    <div className="text-stone-700 text-sm font-bold leading-tight">
+                      {clienteJaExiste.numero_cliente}
+                    </div>
+                  </div>
+                )}
+                <div className="flex-1 min-w-0">
+                  <h3 className="font-serif text-base font-semibold text-stone-900 mb-1">
+                    {clienteJaExiste.nome}
+                  </h3>
+                  <div className="text-xs text-stone-600 space-y-0.5">
+                    <p>
+                      {clienteJaExiste.tipo_documento.toUpperCase()}:{" "}
+                      <strong className="text-stone-900">
+                        {clienteJaExiste.tipo_documento === "cnpj"
+                          ? formatarCNPJ(clienteJaExiste.documento)
+                          : formatarCPF(clienteJaExiste.documento)}
+                      </strong>
+                    </p>
+                    <p>📧 {clienteJaExiste.email}</p>
+                    <p>📞 {formatarTelefone(clienteJaExiste.telefone)}</p>
+                    <p>📍 {clienteJaExiste.endereco}, {clienteJaExiste.numero} — {clienteJaExiste.bairro}, {clienteJaExiste.cidade}/{clienteJaExiste.estado}</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Botões de ação */}
+            <div className="flex flex-col sm:flex-row gap-2">
+              <button
+                onClick={() => {
+                  // É este cliente: vai pra tela de fazer pedido
+                  const c = clienteJaExiste;
+                  setClienteJaExiste(null);
+                  setTela("inicial");
+                  setClienteEdicao(null);
+                  setPerguntaPedido({ cliente: c });
+                }}
+                className="flex-1 flex items-center justify-center gap-1.5 px-4 py-2 text-sm bg-red-700 text-white font-medium rounded-md hover:bg-red-800"
+              >
+                <ChevronRight className="w-4 h-4" />
+                É este cliente
+              </button>
+              <button
+                onClick={() => {
+                  // Editar dados: abre formulário com tudo preenchido
+                  const c = clienteJaExiste;
+                  setClienteJaExiste(null);
+                  setClienteEdicao(c);
+                  setTela("cadastro");
+                }}
+                className="flex-1 flex items-center justify-center gap-1.5 px-4 py-2 text-sm font-medium text-red-800 border border-red-200 rounded-md hover:bg-red-50"
+              >
+                <Pencil className="w-4 h-4" />
+                Editar dados
+              </button>
+              <button
+                onClick={() => {
+                  setClienteJaExiste(null);
+                  setTela("inicial");
+                  setClienteEdicao(null);
+                }}
+                className="px-4 py-2 text-sm text-stone-600 hover:text-stone-900"
+              >
+                Cancelar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -8274,7 +8375,7 @@ function PedidoVendaModule({ user }) {
 // FORMULÁRIO DE CADASTRO/EDIÇÃO DE CLIENTE
 // ============================================================
 
-function ClienteFormulario({ clienteInicial, onSalvar, onCancelar }) {
+function ClienteFormulario({ clienteInicial, onSalvar, onCancelar, onClienteJaExiste }) {
   // Estado do formulário (com formatação aplicada nos campos visuais)
   const [form, setForm] = useState(() => {
     if (clienteInicial) {
@@ -8502,6 +8603,48 @@ function ClienteFormulario({ clienteInicial, onSalvar, onCancelar }) {
 
     return () => clearTimeout(timer);
   }, [form.endereco, form.numero, form.bairro, form.cidade, form.estado]);
+
+  // ===== Detecção de cliente já cadastrado =====
+  // Quando o vendedor digitar um CPF/CNPJ válido em UM NOVO cadastro,
+  // verifica se já existe no banco. Se sim, dispara o callback pro
+  // PedidoVendaModule mostrar o pop-up.
+  // Não faz isso quando estiver EDITANDO um cliente existente.
+  useEffect(() => {
+    // Só verifica em CADASTROS NOVOS (não em edição)
+    if (clienteInicial?.id) return;
+    if (!onClienteJaExiste) return;
+
+    const docNumeros = soNumeros(form.documento);
+    const tipoDoc = form.tipoDocumento;
+
+    // Só verifica se o documento estiver completo e válido
+    if (tipoDoc === "cpf" && (docNumeros.length !== 11 || !validarCPF(docNumeros))) return;
+    if (tipoDoc === "cnpj" && (docNumeros.length !== 14 || !validarCNPJ(docNumeros))) return;
+
+    // Debounce de 500ms pra não buscar enquanto digita
+    const timer = setTimeout(async () => {
+      try {
+        const { data, error } = await supabase
+          .from("clientes")
+          .select("*")
+          .eq("documento", docNumeros)
+          .maybeSingle();
+
+        if (error) {
+          console.error("[ClienteForm] Erro ao verificar duplicado:", error);
+          return;
+        }
+        if (data) {
+          // Achou! Avisa o módulo pai
+          onClienteJaExiste(data);
+        }
+      } catch (err) {
+        console.error("[ClienteForm] Erro:", err);
+      }
+    }, 500);
+
+    return () => clearTimeout(timer);
+  }, [form.documento, form.tipoDocumento, clienteInicial, onClienteJaExiste]);
 
   const handleSalvar = async () => {
     setErroGeral(null);
