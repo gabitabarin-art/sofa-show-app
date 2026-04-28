@@ -39,6 +39,7 @@ import {
   ShoppingCart,
   UserPlus,
   ChevronDown,
+  Truck,
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 import LoginScreen from "./LoginScreen";
@@ -2210,7 +2211,7 @@ function podeEditarModulo(permissoes, modulo) {
 //   #/taxas                              → tabelas de taxas
 // ============================================================
 
-const ROTAS_VALIDAS = ["home", "conciliacao", "cores", "financeiro", "taxas", "permissoes", "pedido_venda", "estoque", "relatorios", "config"];
+const ROTAS_VALIDAS = ["home", "conciliacao", "cores", "fornecedores", "financeiro", "taxas", "permissoes", "pedido_venda", "estoque", "relatorios", "config"];
 const BANCOS_VALIDOS = ["sicredi", "blu_ss", "blu_lupe", "pague_veloz_express", "pague_veloz_pix"];
 
 function parseHashRoute(hash) {
@@ -9213,6 +9214,1118 @@ function ClienteCard({ cliente, onEditar, onRemover, onFazerPedido }) {
   );
 }
 
+// ============================================================
+// MÓDULO FORNECEDORES (Administrativo)
+// ============================================================
+
+// ----- Hook que carrega/persiste fornecedores no Supabase -----
+function useFornecedores(user) {
+  const [fornecedores, setFornecedores] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState(null);
+
+  const carregar = useCallback(async () => {
+    setError(null);
+    try {
+      const { data, error: e } = await supabase
+        .from("fornecedores")
+        .select("*")
+        .order("razao_social");
+      if (e) throw e;
+      setFornecedores(data || []);
+    } catch (e) {
+      console.error("[useFornecedores] Erro:", e);
+      setError(e.message);
+    } finally {
+      setLoaded(true);
+    }
+  }, []);
+
+  useEffect(() => { carregar(); }, [carregar]);
+
+  const salvar = async (f) => {
+    // Filtra e-mails vazios
+    const emailsEncomendas  = (f.emailsEncomendas  || []).map(s => s.trim().toLowerCase()).filter(Boolean);
+    const emailsAssistencia = (f.emailsAssistencia || []).map(s => s.trim().toLowerCase()).filter(Boolean);
+
+    const payload = {
+      tipo_documento:     f.tipoDocumento,
+      documento:          soNumeros(f.documento),
+      razao_social:       f.razaoSocial.trim(),
+      nome_fantasia:      f.tipoDocumento === "cnpj" ? (f.nomeFantasia?.trim() || null) : null,
+      inscricao_estadual: f.tipoDocumento === "cnpj" ? (f.inscricaoEstadual?.trim() || null) : null,
+      email_principal:    f.emailPrincipal.trim().toLowerCase(),
+      telefone:           soNumeros(f.telefone),
+      telefone_2:         f.telefone2 ? soNumeros(f.telefone2) : null,
+      emails_encomendas:  emailsEncomendas,
+      emails_assistencia: emailsAssistencia,
+      cep:                soNumeros(f.cep),
+      endereco:           f.endereco.trim(),
+      numero:             f.numero.trim(),
+      bairro:             f.bairro.trim(),
+      cidade:             f.cidade.trim(),
+      estado:             f.estado.trim().toUpperCase(),
+    };
+
+    if (f.id) {
+      payload.updated_at = new Date().toISOString();
+      const { data, error: e } = await supabase
+        .from("fornecedores")
+        .update(payload)
+        .eq("id", f.id)
+        .select()
+        .single();
+      if (e) throw e;
+      await carregar();
+      return data;
+    } else {
+      payload.created_by = user?.id || null;
+      const { data, error: e } = await supabase
+        .from("fornecedores")
+        .insert(payload)
+        .select()
+        .single();
+      if (e) throw e;
+      await carregar();
+      return data;
+    }
+  };
+
+  const remover = async (id) => {
+    const { error: e } = await supabase.from("fornecedores").delete().eq("id", id);
+    if (e) throw e;
+    await carregar();
+  };
+
+  return { fornecedores, loaded, error, salvar, remover, reload: carregar };
+}
+
+// ============================================================
+// MÓDULO PRINCIPAL
+// ============================================================
+
+function FornecedoresModule({ user, podeEditar }) {
+  const [tela, setTela] = useState("inicial");
+  const [fornecedorEdicao, setFornecedorEdicao] = useState(null);
+  const [fornecedorJaExiste, setFornecedorJaExiste] = useState(null);
+  const [sucessoSalvo, setSucessoSalvo] = useState(null); // { fornecedor }
+
+  const { fornecedores, loaded, error, salvar, remover } = useFornecedores(user);
+
+  const irParaCadastro = (f = null) => {
+    setFornecedorEdicao(f);
+    setTela("cadastro");
+  };
+
+  const apósSalvar = (salvo) => {
+    setTela("inicial");
+    setFornecedorEdicao(null);
+    setSucessoSalvo({ fornecedor: salvo });
+  };
+
+  return (
+    <div className="max-w-5xl mx-auto">
+      {/* Cabeçalho */}
+      <div className="mb-8 border-b border-stone-200 pb-6">
+        <div className="flex items-baseline gap-3 mb-2">
+          <span className="text-xs uppercase tracking-[0.2em] text-red-700 font-semibold">
+            Administrativo
+          </span>
+          <span className="text-stone-300">—</span>
+          <span className="text-xs uppercase tracking-wider text-stone-500">
+            Fornecedores
+          </span>
+        </div>
+        <h1 className="font-serif text-4xl font-bold text-stone-900 tracking-tight">
+          {tela === "cadastro"
+            ? fornecedorEdicao ? "Editar Fornecedor" : "Novo Fornecedor"
+            : tela === "pesquisa"
+            ? "Pesquisar Fornecedor"
+            : "Fornecedores"}
+        </h1>
+        {tela === "inicial" && (
+          <p className="text-stone-600 mt-2">
+            Cadastre um novo fornecedor ou pesquise um já cadastrado.
+          </p>
+        )}
+      </div>
+
+      {error && tela === "inicial" && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-4 flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 text-red-700 mt-0.5 flex-shrink-0" />
+          <p className="text-sm text-red-900">Erro ao carregar fornecedores: {error}</p>
+        </div>
+      )}
+
+      {/* TELA INICIAL */}
+      {tela === "inicial" && (
+        <div className="grid md:grid-cols-2 gap-4 max-w-2xl mx-auto py-8">
+          <button
+            onClick={() => irParaCadastro(null)}
+            disabled={!podeEditar}
+            className="bg-white border-2 border-red-200 hover:border-red-500 rounded-xl p-8 text-center transition-all hover:shadow-lg hover:-translate-y-0.5 group disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:border-stone-200 disabled:hover:translate-y-0"
+            title={!podeEditar ? "Você só tem permissão de visualização" : ""}
+          >
+            <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-red-50 group-hover:bg-red-100 mb-4 transition-colors">
+              <Plus className="w-8 h-8 text-red-700" />
+            </div>
+            <h2 className="font-serif text-xl font-semibold text-stone-900 mb-1">
+              Cadastrar Fornecedor
+            </h2>
+            <p className="text-sm text-stone-600">
+              Cadastrar um novo fornecedor
+            </p>
+          </button>
+
+          <button
+            onClick={() => setTela("pesquisa")}
+            className="bg-white border-2 border-stone-200 hover:border-red-500 rounded-xl p-8 text-center transition-all hover:shadow-lg hover:-translate-y-0.5 group"
+          >
+            <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-stone-100 group-hover:bg-red-100 mb-4 transition-colors">
+              <Search className="w-8 h-8 text-stone-700 group-hover:text-red-700 transition-colors" />
+            </div>
+            <h2 className="font-serif text-xl font-semibold text-stone-900 mb-1">
+              Pesquisar Fornecedor
+            </h2>
+            <p className="text-sm text-stone-600">
+              {loaded
+                ? `${fornecedores.length} fornecedor${fornecedores.length === 1 ? "" : "es"} cadastrado${fornecedores.length === 1 ? "" : "s"}`
+                : "Carregando..."}
+            </p>
+          </button>
+        </div>
+      )}
+
+      {/* TELA CADASTRO */}
+      {tela === "cadastro" && (
+        <FornecedorFormulario
+          fornecedorInicial={fornecedorEdicao}
+          podeEditar={podeEditar}
+          onSalvar={async (f) => {
+            const salvo = await salvar(f);
+            apósSalvar(salvo);
+          }}
+          onCancelar={() => { setTela("inicial"); setFornecedorEdicao(null); }}
+          onFornecedorJaExiste={(f) => setFornecedorJaExiste(f)}
+        />
+      )}
+
+      {/* TELA PESQUISA */}
+      {tela === "pesquisa" && (
+        <FornecedorPesquisa
+          fornecedores={fornecedores}
+          loaded={loaded}
+          podeEditar={podeEditar}
+          onVoltar={() => setTela("inicial")}
+          onEditar={(f) => irParaCadastro(f)}
+          onRemover={async (f) => {
+            if (!confirm(`Remover o fornecedor "${f.razao_social}"?\n\nEssa ação não pode ser desfeita.`)) return;
+            try {
+              await remover(f.id);
+            } catch (e) {
+              alert("Erro ao remover: " + e.message);
+            }
+          }}
+        />
+      )}
+
+      {/* Pop-up "Fornecedor já cadastrado" */}
+      {fornecedorJaExiste && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: "rgba(0,0,0,0.5)" }}>
+          <div className="bg-white rounded-lg shadow-2xl w-full max-w-lg p-6">
+            <div className="flex items-start gap-3 mb-4">
+              <div className="flex-shrink-0 inline-flex items-center justify-center w-12 h-12 rounded-full bg-amber-50">
+                <AlertTriangle className="w-6 h-6 text-amber-700" />
+              </div>
+              <div>
+                <h2 className="font-serif text-xl font-bold text-stone-900 mb-1">
+                  Fornecedor já cadastrado
+                </h2>
+                <p className="text-sm text-stone-700">
+                  Este {fornecedorJaExiste.tipo_documento.toUpperCase()} já está no nosso sistema.
+                </p>
+              </div>
+            </div>
+
+            <div className="bg-stone-50 border border-stone-200 rounded-lg p-4 mb-4">
+              <div className="flex items-start gap-3">
+                {fornecedorJaExiste.numero_fornecedor && (
+                  <div className="flex-shrink-0 text-[10px] uppercase tracking-wider text-stone-400 font-semibold pt-0.5">
+                    <div>Nº</div>
+                    <div className="text-stone-700 text-sm font-bold leading-tight">
+                      {fornecedorJaExiste.numero_fornecedor}
+                    </div>
+                  </div>
+                )}
+                <div className="flex-1 min-w-0">
+                  <h3 className="font-serif text-base font-semibold text-stone-900 mb-1">
+                    {fornecedorJaExiste.razao_social}
+                  </h3>
+                  {fornecedorJaExiste.nome_fantasia && (
+                    <p className="text-xs text-stone-600 mb-1">
+                      Nome fantasia: <strong>{fornecedorJaExiste.nome_fantasia}</strong>
+                    </p>
+                  )}
+                  <div className="text-xs text-stone-600 space-y-0.5">
+                    <p>
+                      {fornecedorJaExiste.tipo_documento.toUpperCase()}:{" "}
+                      <strong className="text-stone-900">
+                        {fornecedorJaExiste.tipo_documento === "cnpj"
+                          ? formatarCNPJ(fornecedorJaExiste.documento)
+                          : formatarCPF(fornecedorJaExiste.documento)}
+                      </strong>
+                    </p>
+                    <p>📧 {fornecedorJaExiste.email_principal}</p>
+                    <p>📞 {formatarTelefone(fornecedorJaExiste.telefone)}</p>
+                    <p>📍 {fornecedorJaExiste.cidade}/{fornecedorJaExiste.estado}</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex flex-col sm:flex-row gap-2">
+              {podeEditar && (
+                <button
+                  onClick={() => {
+                    const f = fornecedorJaExiste;
+                    setFornecedorJaExiste(null);
+                    setFornecedorEdicao(f);
+                    setTela("cadastro");
+                  }}
+                  className="flex-1 flex items-center justify-center gap-1.5 px-4 py-2 text-sm font-medium text-red-800 border border-red-200 rounded-md hover:bg-red-50"
+                >
+                  <Pencil className="w-4 h-4" />
+                  Editar dados
+                </button>
+              )}
+              <button
+                onClick={() => {
+                  setFornecedorJaExiste(null);
+                  setTela("inicial");
+                  setFornecedorEdicao(null);
+                }}
+                className="px-4 py-2 text-sm text-stone-600 hover:text-stone-900"
+              >
+                Cancelar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Pop-up de sucesso ao salvar */}
+      {sucessoSalvo && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: "rgba(0,0,0,0.5)" }}>
+          <div className="bg-white rounded-lg shadow-2xl w-full max-w-md p-6 text-center">
+            <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-emerald-50 mb-3">
+              <CheckCircle2 className="w-8 h-8 text-emerald-700" />
+            </div>
+            <h2 className="font-serif text-xl font-bold text-stone-900 mb-2">
+              Fornecedor salvo!
+            </h2>
+            <p className="text-sm text-stone-700 mb-5">
+              <strong>{sucessoSalvo.fornecedor?.razao_social}</strong> foi salvo com sucesso.
+            </p>
+            <button
+              onClick={() => setSucessoSalvo(null)}
+              className="px-4 py-2 text-sm bg-red-700 text-white rounded-md hover:bg-red-800"
+            >
+              Continuar
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// FORMULÁRIO DE FORNECEDOR
+// ============================================================
+
+function FornecedorFormulario({ fornecedorInicial, podeEditar, onSalvar, onCancelar, onFornecedorJaExiste }) {
+  const [form, setForm] = useState(() => {
+    if (fornecedorInicial) {
+      return {
+        id:                 fornecedorInicial.id,
+        tipoDocumento:      fornecedorInicial.tipo_documento || "cnpj",
+        documento:          fornecedorInicial.tipo_documento === "cnpj"
+                              ? formatarCNPJ(fornecedorInicial.documento)
+                              : formatarCPF(fornecedorInicial.documento),
+        razaoSocial:        fornecedorInicial.razao_social || "",
+        nomeFantasia:       fornecedorInicial.nome_fantasia || "",
+        inscricaoEstadual:  fornecedorInicial.inscricao_estadual || "",
+        emailPrincipal:     fornecedorInicial.email_principal || "",
+        telefone:           formatarTelefone(fornecedorInicial.telefone || ""),
+        telefone2:          formatarTelefone(fornecedorInicial.telefone_2 || ""),
+        emailsEncomendas:   (fornecedorInicial.emails_encomendas  && fornecedorInicial.emails_encomendas.length  > 0) ? [...fornecedorInicial.emails_encomendas]  : [""],
+        emailsAssistencia:  (fornecedorInicial.emails_assistencia && fornecedorInicial.emails_assistencia.length > 0) ? [...fornecedorInicial.emails_assistencia] : [""],
+        cep:                formatarCEP(fornecedorInicial.cep || ""),
+        endereco:           fornecedorInicial.endereco || "",
+        numero:             fornecedorInicial.numero || "",
+        bairro:             fornecedorInicial.bairro || "",
+        cidade:             fornecedorInicial.cidade || "",
+        estado:             fornecedorInicial.estado || "",
+      };
+    }
+    return {
+      id: null,
+      tipoDocumento: "cnpj", documento: "",
+      razaoSocial: "", nomeFantasia: "", inscricaoEstadual: "",
+      emailPrincipal: "", telefone: "", telefone2: "",
+      emailsEncomendas: [""],
+      emailsAssistencia: [""],
+      cep: "", endereco: "", numero: "", bairro: "", cidade: "", estado: "",
+    };
+  });
+
+  const [erros, setErros] = useState({});
+  const [erroGeral, setErroGeral] = useState(null);
+  const [salvando, setSalvando] = useState(false);
+  const [buscandoCEP, setBuscandoCEP] = useState(false);
+
+  const setCampo = (campo, valor) => {
+    setForm((f) => ({ ...f, [campo]: valor }));
+    setErros((e) => ({ ...e, [campo]: undefined }));
+    setErroGeral(null);
+  };
+
+  const setEmailLista = (categoria, idx, valor) => {
+    setForm((f) => {
+      const lista = [...f[categoria]];
+      lista[idx] = valor;
+      return { ...f, [categoria]: lista };
+    });
+  };
+
+  const adicionarEmail = (categoria) => {
+    setForm((f) => {
+      if (f[categoria].length >= 5) return f;
+      return { ...f, [categoria]: [...f[categoria], ""] };
+    });
+  };
+
+  const removerEmail = (categoria, idx) => {
+    setForm((f) => {
+      const lista = f[categoria].filter((_, i) => i !== idx);
+      return { ...f, [categoria]: lista.length === 0 ? [""] : lista };
+    });
+  };
+
+  // Validação completa
+  const validar = () => {
+    const e = {};
+
+    if (!form.documento.trim()) {
+      e.documento = `${form.tipoDocumento.toUpperCase()} é obrigatório.`;
+    } else if (form.tipoDocumento === "cpf") {
+      if (!validarCPF(form.documento)) e.documento = "CPF inválido.";
+    } else {
+      if (!validarCNPJ(form.documento)) e.documento = "CNPJ inválido.";
+    }
+
+    if (!form.razaoSocial.trim()) {
+      e.razaoSocial = form.tipoDocumento === "cnpj" ? "Razão Social é obrigatória." : "Nome é obrigatório.";
+    }
+
+    if (form.tipoDocumento === "cnpj") {
+      if (!form.nomeFantasia.trim())      e.nomeFantasia      = "Nome Fantasia é obrigatório.";
+      if (!form.inscricaoEstadual.trim()) e.inscricaoEstadual = "Inscrição Estadual é obrigatória (use 'ISENTO' se aplicável).";
+    }
+
+    if (!form.emailPrincipal.trim())             e.emailPrincipal = "E-mail principal é obrigatório.";
+    else if (!validarEmail(form.emailPrincipal)) e.emailPrincipal = "E-mail inválido.";
+
+    if (!form.telefone.trim())              e.telefone  = "Telefone é obrigatório.";
+    else if (!validarTelefone(form.telefone)) e.telefone = "Telefone inválido.";
+
+    if (form.telefone2.trim() && !validarTelefone(form.telefone2)) {
+      e.telefone2 = "Telefone secundário inválido.";
+    }
+
+    // E-mails de encomendas: pelo menos 1 obrigatório, todos os preenchidos válidos
+    const emailsEncPreenchidos = form.emailsEncomendas.filter(s => s.trim());
+    if (emailsEncPreenchidos.length === 0) {
+      e.emailsEncomendas = "Pelo menos um e-mail de encomendas é obrigatório.";
+    } else {
+      for (const em of emailsEncPreenchidos) {
+        if (!validarEmail(em)) {
+          e.emailsEncomendas = "Algum e-mail de encomendas está inválido.";
+          break;
+        }
+      }
+    }
+
+    // E-mails de assistência: pelo menos 1 obrigatório
+    const emailsAssPreenchidos = form.emailsAssistencia.filter(s => s.trim());
+    if (emailsAssPreenchidos.length === 0) {
+      e.emailsAssistencia = "Pelo menos um e-mail de assistência é obrigatório.";
+    } else {
+      for (const em of emailsAssPreenchidos) {
+        if (!validarEmail(em)) {
+          e.emailsAssistencia = "Algum e-mail de assistência está inválido.";
+          break;
+        }
+      }
+    }
+
+    if (!form.cep.trim()) e.cep = "CEP é obrigatório.";
+    else if (soNumeros(form.cep).length !== 8) e.cep = "CEP precisa ter 8 dígitos.";
+
+    if (!form.endereco.trim()) e.endereco = "Endereço é obrigatório.";
+    if (!form.numero.trim())   e.numero   = "Número é obrigatório (use 'S/N').";
+    if (!form.bairro.trim())   e.bairro   = "Bairro é obrigatório.";
+    if (!form.cidade.trim())   e.cidade   = "Cidade é obrigatória.";
+    if (!form.estado.trim())   e.estado   = "Estado é obrigatório.";
+
+    setErros(e);
+    return Object.keys(e).length === 0;
+  };
+
+  // Detecção de duplicado (igual cliente)
+  useEffect(() => {
+    if (fornecedorInicial?.id) return;
+    if (!onFornecedorJaExiste) return;
+    const docNumeros = soNumeros(form.documento);
+    const tipoDoc = form.tipoDocumento;
+    if (tipoDoc === "cpf"  && (docNumeros.length !== 11 || !validarCPF(docNumeros))) return;
+    if (tipoDoc === "cnpj" && (docNumeros.length !== 14 || !validarCNPJ(docNumeros))) return;
+
+    const timer = setTimeout(async () => {
+      try {
+        const { data, error } = await supabase
+          .from("fornecedores")
+          .select("*")
+          .eq("documento", docNumeros)
+          .maybeSingle();
+        if (error) {
+          console.error("[FornecedorForm] Erro:", error);
+          return;
+        }
+        if (data) onFornecedorJaExiste(data);
+      } catch (err) {
+        console.error("[FornecedorForm] Erro:", err);
+      }
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [form.documento, form.tipoDocumento, fornecedorInicial, onFornecedorJaExiste]);
+
+  // Busca CEP
+  const buscarCEP = async (cep) => {
+    const n = soNumeros(cep);
+    if (n.length !== 8) return;
+    setBuscandoCEP(true);
+    try {
+      const res = await fetch(`https://viacep.com.br/ws/${n}/json/`);
+      const data = await res.json();
+      if (data.erro) {
+        setErros((e) => ({ ...e, cep: "CEP não encontrado." }));
+        return;
+      }
+      setForm((f) => ({
+        ...f,
+        endereco: data.logradouro || f.endereco,
+        bairro:   data.bairro     || f.bairro,
+        cidade:   data.localidade || f.cidade,
+        estado:   data.uf         || f.estado,
+      }));
+      setErros((e) => ({ ...e, cep: undefined, endereco: undefined, bairro: undefined, cidade: undefined, estado: undefined }));
+    } catch (err) {
+      setErros((e) => ({ ...e, cep: "Não foi possível buscar o CEP." }));
+    } finally {
+      setBuscandoCEP(false);
+    }
+  };
+
+  const handleCEPChange = (valor) => {
+    const formatado = formatarCEP(valor);
+    setCampo("cep", formatado);
+    if (soNumeros(formatado).length === 8) buscarCEP(formatado);
+  };
+
+  const handleSalvar = async () => {
+    setErroGeral(null);
+    if (!validar()) {
+      setErroGeral("Verifique os campos marcados em vermelho.");
+      return;
+    }
+    setSalvando(true);
+    try {
+      await onSalvar(form);
+    } catch (err) {
+      console.error("[FornecedorForm] Erro ao salvar:", err);
+      if (err.code === "23505" || err.message?.includes("duplicate")) {
+        setErroGeral(`Já existe um fornecedor cadastrado com esse ${form.tipoDocumento.toUpperCase()}.`);
+      } else if (err.message?.includes("policy")) {
+        setErroGeral("Você não tem permissão para salvar este cadastro.");
+      } else {
+        setErroGeral("Erro ao salvar: " + err.message);
+      }
+    } finally {
+      setSalvando(false);
+    }
+  };
+
+  const inputClass = (campo) =>
+    `w-full px-3 py-2 text-sm border rounded-md bg-white focus:outline-none focus:ring-2 transition-colors ${
+      erros[campo]
+        ? "border-red-400 focus:ring-red-200 focus:border-red-500"
+        : "border-stone-300 focus:ring-red-700/30 focus:border-red-700"
+    }`;
+
+  const showErro = (campo) =>
+    erros[campo] ? <p className="text-xs text-red-700 mt-1">{erros[campo]}</p> : null;
+
+  const inputDesabilitado = !podeEditar;
+
+  return (
+    <div className="bg-white border border-stone-200 rounded-lg p-6 space-y-6">
+      {!podeEditar && (
+        <div className="bg-amber-50 border border-amber-200 rounded-md p-3 flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 text-amber-700 mt-0.5 flex-shrink-0" />
+          <p className="text-sm text-amber-900">Modo somente leitura — você não pode salvar alterações.</p>
+        </div>
+      )}
+
+      {/* Seção 1: Identificação */}
+      <div>
+        <h3 className="font-serif text-lg font-semibold text-stone-900 mb-4 pb-2 border-b border-stone-100">
+          Identificação
+        </h3>
+        <div className="grid md:grid-cols-2 gap-4">
+          <div className="md:col-span-2">
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              Tipo *
+            </label>
+            <div className="flex gap-2 max-w-md">
+              <button
+                type="button"
+                disabled={inputDesabilitado}
+                onClick={() => { setCampo("tipoDocumento", "cpf"); setCampo("documento", ""); }}
+                className={`flex-1 px-3 py-2.5 text-sm font-medium rounded-md border transition-colors ${
+                  form.tipoDocumento === "cpf"
+                    ? "bg-red-700 text-white border-red-700"
+                    : "bg-white text-stone-700 border-stone-300 hover:bg-stone-50"
+                } ${inputDesabilitado ? "opacity-50 cursor-not-allowed" : ""}`}
+              >
+                Pessoa Física (CPF)
+              </button>
+              <button
+                type="button"
+                disabled={inputDesabilitado}
+                onClick={() => { setCampo("tipoDocumento", "cnpj"); setCampo("documento", ""); }}
+                className={`flex-1 px-3 py-2.5 text-sm font-medium rounded-md border transition-colors ${
+                  form.tipoDocumento === "cnpj"
+                    ? "bg-red-700 text-white border-red-700"
+                    : "bg-white text-stone-700 border-stone-300 hover:bg-stone-50"
+                } ${inputDesabilitado ? "opacity-50 cursor-not-allowed" : ""}`}
+              >
+                Pessoa Jurídica (CNPJ)
+              </button>
+            </div>
+          </div>
+
+          <div className="md:col-span-2">
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              {form.tipoDocumento === "cpf" ? "CPF" : "CNPJ"} *
+            </label>
+            <input
+              type="text"
+              inputMode="numeric"
+              value={form.documento}
+              disabled={inputDesabilitado}
+              onChange={(e) => {
+                const formatado = form.tipoDocumento === "cpf"
+                  ? formatarCPF(e.target.value)
+                  : formatarCNPJ(e.target.value);
+                setCampo("documento", formatado);
+              }}
+              placeholder={form.tipoDocumento === "cpf" ? "000.000.000-00" : "00.000.000/0000-00"}
+              className={inputClass("documento")}
+              autoFocus
+            />
+            {showErro("documento")}
+          </div>
+
+          <div className={form.tipoDocumento === "cnpj" ? "" : "md:col-span-2"}>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              {form.tipoDocumento === "cnpj" ? "Razão Social *" : "Nome completo *"}
+            </label>
+            <input
+              type="text"
+              value={form.razaoSocial}
+              disabled={inputDesabilitado}
+              onChange={(e) => setCampo("razaoSocial", e.target.value)}
+              placeholder={form.tipoDocumento === "cnpj" ? "Ex: Móveis ABC Ltda" : "Ex: João da Silva"}
+              className={inputClass("razaoSocial")}
+            />
+            {showErro("razaoSocial")}
+          </div>
+
+          {form.tipoDocumento === "cnpj" && (
+            <>
+              <div>
+                <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+                  Nome Fantasia *
+                </label>
+                <input
+                  type="text"
+                  value={form.nomeFantasia}
+                  disabled={inputDesabilitado}
+                  onChange={(e) => setCampo("nomeFantasia", e.target.value)}
+                  placeholder="Ex: Móveis ABC"
+                  className={inputClass("nomeFantasia")}
+                />
+                {showErro("nomeFantasia")}
+              </div>
+
+              <div className="md:col-span-2">
+                <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+                  Inscrição Estadual *
+                </label>
+                <input
+                  type="text"
+                  value={form.inscricaoEstadual}
+                  disabled={inputDesabilitado}
+                  onChange={(e) => setCampo("inscricaoEstadual", e.target.value)}
+                  placeholder="Ex: 123.456.789.012 ou ISENTO"
+                  className={inputClass("inscricaoEstadual")}
+                />
+                <p className="text-xs text-stone-500 mt-1">Use "ISENTO" se a empresa for isenta.</p>
+                {showErro("inscricaoEstadual")}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Seção 2: Contato principal */}
+      <div>
+        <h3 className="font-serif text-lg font-semibold text-stone-900 mb-4 pb-2 border-b border-stone-100">
+          Contato principal
+        </h3>
+        <div className="grid md:grid-cols-2 gap-4">
+          <div className="md:col-span-2">
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              E-mail principal *
+            </label>
+            <input
+              type="email"
+              value={form.emailPrincipal}
+              disabled={inputDesabilitado}
+              onChange={(e) => setCampo("emailPrincipal", e.target.value)}
+              placeholder="contato@fornecedor.com"
+              className={inputClass("emailPrincipal")}
+            />
+            {showErro("emailPrincipal")}
+          </div>
+
+          <div>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              Telefone *
+            </label>
+            <input
+              type="text"
+              inputMode="tel"
+              value={form.telefone}
+              disabled={inputDesabilitado}
+              onChange={(e) => setCampo("telefone", formatarTelefone(e.target.value))}
+              placeholder="(11) 91234-5678"
+              className={inputClass("telefone")}
+            />
+            {showErro("telefone")}
+          </div>
+
+          <div>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              Telefone secundário (opcional)
+            </label>
+            <input
+              type="text"
+              inputMode="tel"
+              value={form.telefone2}
+              disabled={inputDesabilitado}
+              onChange={(e) => setCampo("telefone2", formatarTelefone(e.target.value))}
+              placeholder="(11) 91234-5678"
+              className={inputClass("telefone2")}
+            />
+            {showErro("telefone2")}
+          </div>
+        </div>
+      </div>
+
+      {/* Seção 3: E-mails específicos (até 5 cada) */}
+      <div>
+        <h3 className="font-serif text-lg font-semibold text-stone-900 mb-4 pb-2 border-b border-stone-100">
+          E-mails específicos
+        </h3>
+
+        {/* Encomendas */}
+        <ListaDeEmails
+          titulo="E-mails para envio de encomendas"
+          subtitulo="Pelo menos 1 obrigatório. Pode adicionar até 5."
+          emails={form.emailsEncomendas}
+          erro={erros.emailsEncomendas}
+          inputDesabilitado={inputDesabilitado}
+          onChange={(idx, valor) => setEmailLista("emailsEncomendas", idx, valor)}
+          onAdd={() => adicionarEmail("emailsEncomendas")}
+          onRemove={(idx) => removerEmail("emailsEncomendas", idx)}
+        />
+
+        {/* Assistência técnica */}
+        <div className="mt-6">
+          <ListaDeEmails
+            titulo="E-mails para assistência técnica"
+            subtitulo="Pelo menos 1 obrigatório. Pode adicionar até 5."
+            emails={form.emailsAssistencia}
+            erro={erros.emailsAssistencia}
+            inputDesabilitado={inputDesabilitado}
+            onChange={(idx, valor) => setEmailLista("emailsAssistencia", idx, valor)}
+            onAdd={() => adicionarEmail("emailsAssistencia")}
+            onRemove={(idx) => removerEmail("emailsAssistencia", idx)}
+          />
+        </div>
+      </div>
+
+      {/* Seção 4: Endereço */}
+      <div>
+        <h3 className="font-serif text-lg font-semibold text-stone-900 mb-4 pb-2 border-b border-stone-100">
+          Endereço
+        </h3>
+        <div className="grid md:grid-cols-3 gap-4">
+          <div>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              CEP *
+              {buscandoCEP && (
+                <span className="ml-2 inline-flex items-center gap-1 text-stone-500 normal-case font-normal">
+                  <Loader2 className="w-3 h-3 animate-spin" /> buscando...
+                </span>
+              )}
+            </label>
+            <input
+              type="text"
+              inputMode="numeric"
+              value={form.cep}
+              disabled={inputDesabilitado}
+              onChange={(e) => handleCEPChange(e.target.value)}
+              placeholder="00000-000"
+              className={inputClass("cep")}
+            />
+            {showErro("cep")}
+          </div>
+
+          <div className="md:col-span-2">
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              Endereço (rua/avenida) *
+            </label>
+            <input
+              type="text"
+              value={form.endereco}
+              disabled={inputDesabilitado}
+              onChange={(e) => setCampo("endereco", e.target.value)}
+              placeholder="Ex: Rua das Flores"
+              className={inputClass("endereco")}
+            />
+            {showErro("endereco")}
+          </div>
+
+          <div>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              Número *
+            </label>
+            <input
+              type="text"
+              value={form.numero}
+              disabled={inputDesabilitado}
+              onChange={(e) => setCampo("numero", e.target.value)}
+              placeholder="Ex: 123 ou S/N"
+              className={inputClass("numero")}
+            />
+            {showErro("numero")}
+          </div>
+
+          <div>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              Bairro *
+            </label>
+            <input
+              type="text"
+              value={form.bairro}
+              disabled={inputDesabilitado}
+              onChange={(e) => setCampo("bairro", e.target.value)}
+              placeholder="Ex: Centro"
+              className={inputClass("bairro")}
+            />
+            {showErro("bairro")}
+          </div>
+
+          <div>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              Cidade *
+            </label>
+            <input
+              type="text"
+              value={form.cidade}
+              disabled={inputDesabilitado}
+              onChange={(e) => setCampo("cidade", e.target.value)}
+              placeholder="Ex: São Paulo"
+              className={inputClass("cidade")}
+            />
+            {showErro("cidade")}
+          </div>
+
+          <div>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              Estado *
+            </label>
+            <input
+              type="text"
+              value={form.estado}
+              disabled={inputDesabilitado}
+              onChange={(e) => setCampo("estado", e.target.value.toUpperCase().slice(0, 2))}
+              placeholder="SP"
+              maxLength={2}
+              className={inputClass("estado")}
+            />
+            {showErro("estado")}
+          </div>
+        </div>
+      </div>
+
+      {erroGeral && (
+        <div className="bg-red-50 border border-red-200 rounded-md p-3 flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 text-red-700 mt-0.5 flex-shrink-0" />
+          <p className="text-sm text-red-900">{erroGeral}</p>
+        </div>
+      )}
+
+      <div className="flex gap-2 pt-4 border-t border-stone-100">
+        {podeEditar && (
+          <button
+            onClick={handleSalvar}
+            disabled={salvando}
+            className="flex items-center gap-1.5 px-5 py-2 text-sm bg-emerald-700 text-white font-medium rounded-md hover:bg-emerald-800 disabled:opacity-40"
+          >
+            {salvando ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+            {form.id ? "Salvar alterações" : "Cadastrar fornecedor"}
+          </button>
+        )}
+        <button
+          onClick={onCancelar}
+          disabled={salvando}
+          className="px-4 py-2 text-sm text-stone-600 hover:text-stone-900"
+        >
+          {podeEditar ? "Cancelar" : "Voltar"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// Componente: lista dinâmica de e-mails (até 5)
+// ============================================================
+function ListaDeEmails({ titulo, subtitulo, emails, erro, inputDesabilitado, onChange, onAdd, onRemove }) {
+  return (
+    <div>
+      <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1 block">
+        {titulo} *
+      </label>
+      <p className="text-xs text-stone-500 mb-2">{subtitulo}</p>
+      <div className="space-y-2">
+        {emails.map((email, idx) => (
+          <div key={idx} className="flex items-center gap-2">
+            <input
+              type="email"
+              value={email}
+              disabled={inputDesabilitado}
+              onChange={(e) => onChange(idx, e.target.value)}
+              placeholder={`E-mail ${idx + 1}`}
+              className={`flex-1 px-3 py-2 text-sm border rounded-md bg-white focus:outline-none focus:ring-2 transition-colors ${
+                erro
+                  ? "border-red-400 focus:ring-red-200 focus:border-red-500"
+                  : "border-stone-300 focus:ring-red-700/30 focus:border-red-700"
+              }`}
+            />
+            {emails.length > 1 && !inputDesabilitado && (
+              <button
+                type="button"
+                onClick={() => onRemove(idx)}
+                className="p-2 text-stone-500 hover:bg-red-50 hover:text-red-700 rounded-md"
+                title="Remover e-mail"
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+      {emails.length < 5 && !inputDesabilitado && (
+        <button
+          type="button"
+          onClick={onAdd}
+          className="mt-2 flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-red-800 border border-red-200 rounded-md hover:bg-red-50"
+        >
+          <Plus className="w-3 h-3" />
+          Adicionar e-mail ({emails.length}/5)
+        </button>
+      )}
+      {erro && <p className="text-xs text-red-700 mt-1">{erro}</p>}
+    </div>
+  );
+}
+
+// ============================================================
+// PESQUISA DE FORNECEDORES
+// ============================================================
+
+function FornecedorPesquisa({ fornecedores, loaded, podeEditar, onVoltar, onEditar, onRemover }) {
+  const [busca, setBusca] = useState("");
+
+  const norm = (s) =>
+    String(s || "")
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "");
+
+  const filtrados = useMemo(() => {
+    const q = norm(busca.trim());
+    if (!q) return fornecedores;
+    return fornecedores.filter((f) => {
+      return (
+        norm(f.razao_social).includes(q) ||
+        norm(f.nome_fantasia || "").includes(q) ||
+        norm(f.documento).includes(q) ||
+        norm(f.email_principal).includes(q) ||
+        norm(f.telefone).includes(q) ||
+        norm(f.cidade).includes(q) ||
+        String(f.numero_fornecedor || "").includes(q)
+      );
+    });
+  }, [fornecedores, busca]);
+
+  return (
+    <div>
+      <div className="mb-4 flex items-center gap-3">
+        <button
+          onClick={onVoltar}
+          className="flex items-center gap-1 px-3 py-2 text-sm text-stone-700 hover:bg-stone-100 rounded-md"
+        >
+          <ChevronRight className="w-4 h-4 rotate-180" />
+          Voltar
+        </button>
+        <div className="flex-1 relative">
+          <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-stone-400 pointer-events-none" />
+          <input
+            type="text"
+            value={busca}
+            onChange={(e) => setBusca(e.target.value)}
+            autoFocus
+            placeholder="Buscar por número, razão social, nome fantasia, CNPJ, email, telefone ou cidade..."
+            className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-700/30 focus:border-red-700"
+          />
+        </div>
+      </div>
+
+      {!loaded ? (
+        <div className="flex items-center gap-2 text-stone-500 justify-center py-20">
+          <Loader2 className="w-5 h-5 animate-spin" />
+          Carregando fornecedores...
+        </div>
+      ) : filtrados.length === 0 ? (
+        <div className="text-center py-12 bg-stone-50 rounded-lg text-stone-500 text-sm">
+          {fornecedores.length === 0
+            ? "Nenhum fornecedor cadastrado ainda."
+            : `Nenhum fornecedor encontrado para "${busca}".`}
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {filtrados.map((f) => (
+            <FornecedorCard
+              key={f.id}
+              fornecedor={f}
+              podeEditar={podeEditar}
+              onEditar={() => onEditar(f)}
+              onRemover={() => onRemover(f)}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FornecedorCard({ fornecedor, podeEditar, onEditar, onRemover }) {
+  const docFormatado = fornecedor.tipo_documento === "cnpj"
+    ? formatarCNPJ(fornecedor.documento)
+    : formatarCPF(fornecedor.documento);
+  const telFormatado = formatarTelefone(fornecedor.telefone);
+  const totalEmailsExtras = (fornecedor.emails_encomendas?.length || 0) + (fornecedor.emails_assistencia?.length || 0);
+
+  return (
+    <div className="border border-stone-200 bg-white rounded-lg p-4">
+      <div className="flex items-start gap-3 mb-2">
+        {fornecedor.numero_fornecedor && (
+          <div className="flex-shrink-0 text-[10px] uppercase tracking-wider text-stone-400 font-semibold pt-0.5">
+            <div>Nº</div>
+            <div className="text-stone-700 text-sm font-bold leading-tight">
+              {fornecedor.numero_fornecedor}
+            </div>
+          </div>
+        )}
+
+        <div className="flex-1 min-w-0">
+          <h3 className="font-serif text-base font-semibold text-stone-900">
+            {fornecedor.razao_social}
+          </h3>
+          {fornecedor.nome_fantasia && (
+            <p className="text-xs text-stone-500 italic">"{fornecedor.nome_fantasia}"</p>
+          )}
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-600 mt-1">
+            <span>{fornecedor.tipo_documento.toUpperCase()}: <strong>{docFormatado}</strong></span>
+            <span>📧 {fornecedor.email_principal}</span>
+            <span>📞 {telFormatado}</span>
+            <span>📍 {fornecedor.cidade}/{fornecedor.estado}</span>
+            {totalEmailsExtras > 0 && (
+              <span className="text-red-700 font-medium">+{totalEmailsExtras} e-mails específicos</span>
+            )}
+          </div>
+        </div>
+
+        <div className="flex gap-2 flex-shrink-0">
+          {podeEditar && (
+            <button
+              onClick={onEditar}
+              className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-red-800 border border-red-200 rounded-md hover:bg-red-50"
+            >
+              <Pencil className="w-3 h-3" />
+              Editar
+            </button>
+          )}
+          {!podeEditar && (
+            <button
+              onClick={onEditar}
+              className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-stone-700 border border-stone-200 rounded-md hover:bg-stone-50"
+            >
+              <Search className="w-3 h-3" />
+              Ver
+            </button>
+          )}
+          {podeEditar && (
+            <button
+              onClick={onRemover}
+              className="p-1.5 text-stone-500 hover:bg-red-50 hover:text-red-700 rounded-md"
+              title="Remover fornecedor"
+            >
+              <Trash2 className="w-4 h-4" />
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function PlaceholderModule({ title, description }) {
   return (
     <div className="max-w-3xl mx-auto text-center py-20">
@@ -9259,6 +10372,7 @@ export default function App() {
     const PARENT_DE = {
       conciliacao:   "administrativo",
       cores:         "administrativo",
+      fornecedores:  "administrativo",
       financeiro:    "financeiro",
       taxas:         "financeiro",
       pedido_venda:  "vendas",
@@ -9341,6 +10455,16 @@ export default function App() {
       label: "Tabela de Cores",
       icon: Palette,
       available: true,
+      visible: podeVerAdmin && podeVerModulo(userCtx.permissoes, "cores"),
+      parent: "administrativo",
+    },
+    {
+      id: "fornecedores",
+      label: "Fornecedores",
+      icon: Truck,
+      available: true,
+      // Usa a permissão de "cores" (administrativo genérico) — quem pode
+      // visualizar/editar cores também pode em fornecedores.
       visible: podeVerAdmin && podeVerModulo(userCtx.permissoes, "cores"),
       parent: "administrativo",
     },
@@ -9750,6 +10874,13 @@ export default function App() {
           )}
           {activeModule === "pedido_venda" && (
             <PedidoVendaModule key={resetKey} user={user} />
+          )}
+          {activeModule === "fornecedores" && modulesVisiveis.find((m) => m.id === "fornecedores") && (
+            <FornecedoresModule
+              key={resetKey}
+              user={user}
+              podeEditar={podeEditarModulo(userCtx.permissoes, "cores")}
+            />
           )}
           {activeModule === "estoque" && (
             <PlaceholderModule
