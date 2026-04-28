@@ -6067,12 +6067,14 @@ function PermissoesModule({ userCtx, onUserAlterado }) {
   const carregar = useCallback(async () => {
     setError(null);
     try {
-      const [resGrupos, resLojas, resUsuariosCom, resUsuariosSem, resPerms] = await Promise.all([
+      const [resGrupos, resLojas, resUsuariosCom, resUsuariosSem, resPerms, resSemLogin] = await Promise.all([
         supabase.from("grupos").select("id, nome, descricao, permissoes").order("nome"),
         supabase.from("lojas").select("id, nome, eh_escritorio, ativa").order("nome"),
         supabase.from("vw_usuarios_completo").select("user_id, email, grupo_id, grupo_nome, lojas_ids, lojas_nomes"),
         supabase.from("vw_usuarios_disponiveis").select("user_id, email, cadastrado_em"),
         supabase.from("user_permissions").select("user_id, is_admin, eh_rh"),
+        // RPC que retorna user_ids dos que nunca logaram (só admin/RH pode chamar)
+        supabase.rpc("usuarios_sem_login"),
       ]);
 
       if (resGrupos.error) throw resGrupos.error;
@@ -6087,11 +6089,20 @@ function PermissoesModule({ userCtx, onUserAlterado }) {
         }
       }
 
-      // Anexa info de admin/RH em cada usuário
+      // Set com os user_ids que NUNCA logaram (pra mostrar "Reenviar convite")
+      const semLoginSet = new Set();
+      if (!resSemLogin.error && resSemLogin.data) {
+        for (const r of resSemLogin.data) {
+          semLoginSet.add(r.user_id);
+        }
+      }
+
+      // Anexa info de admin/RH e nuncaLogou em cada usuário
       let usuariosCom = (resUsuariosCom.data || []).map((u) => ({
         ...u,
         is_admin: permsMap.get(u.user_id)?.is_admin || false,
         eh_rh: permsMap.get(u.user_id)?.eh_rh || false,
+        nunca_logou: semLoginSet.has(u.user_id),
       }));
 
       // Se for somente RH, filtra: esconde usuários que estão no Escritório
@@ -6282,6 +6293,19 @@ function UsuariosTab({ usuariosCadastrados, usuariosDisponiveis, grupos, lojas, 
     );
   };
 
+  // Marca todas as lojas ativas (que o usuário pode atribuir — ignora bloqueadas)
+  const marcarTodasLojas = () => {
+    const todas = lojas
+      .filter((l) => l.ativa && !lojasBloqueadasIds.includes(l.id))
+      .map((l) => l.id);
+    setDraftLojasIds(todas);
+  };
+
+  // Desmarca todas as lojas (mantém só as bloqueadas que já estavam marcadas)
+  const desmarcarTodasLojas = () => {
+    setDraftLojasIds((prev) => prev.filter((id) => lojasBloqueadasIds.includes(id)));
+  };
+
   const validarLojas = (lojasIds) => {
     if (!ehSomenteRH) return null;
     const temEscritorio = lojasIds.some((id) => lojasBloqueadasIds.includes(id));
@@ -6370,6 +6394,57 @@ function UsuariosTab({ usuariosCadastrados, usuariosDisponiveis, grupos, lojas, 
         return;
       }
       onChange();
+    } finally {
+      setSalvando(false);
+    }
+  };
+
+  // ===== Reenviar convite (pra quem nunca logou) =====
+  // Manda novo e-mail mágico de cadastro de senha. O Supabase cuida do resto.
+  const reenviarConvite = async (email) => {
+    if (!confirm(`Reenviar convite para ${email}?\n\nA pessoa vai receber um novo e-mail com link pra cadastrar a senha.`)) return;
+    setSalvando(true);
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: `${window.location.origin}/`,
+      });
+      if (error) {
+        // Trata erros comuns
+        if (error.message?.includes("rate limit") || error.message?.includes("Email rate")) {
+          alert("Muitos e-mails enviados nas últimas horas. Aguarde alguns minutos e tente de novo.\n\nO Supabase grátis tem limite de 4 e-mails por hora.");
+        } else {
+          alert("Erro ao reenviar convite: " + error.message);
+        }
+        return;
+      }
+      alert(`✅ Convite reenviado para ${email}!\n\nPede pra pessoa verificar a caixa de entrada (e o spam).`);
+    } catch (e) {
+      alert("Erro: " + e.message);
+    } finally {
+      setSalvando(false);
+    }
+  };
+
+  // ===== Resetar senha (pra quem esqueceu) =====
+  // Mesma chamada do "Esqueci minha senha", mas iniciada pelo admin.
+  const resetarSenha = async (email) => {
+    if (!confirm(`Enviar e-mail de redefinição de senha para ${email}?\n\nA pessoa vai receber um link pra criar uma senha nova.`)) return;
+    setSalvando(true);
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: `${window.location.origin}/`,
+      });
+      if (error) {
+        if (error.message?.includes("rate limit") || error.message?.includes("Email rate")) {
+          alert("Muitos e-mails enviados. Aguarde alguns minutos.");
+        } else {
+          alert("Erro: " + error.message);
+        }
+        return;
+      }
+      alert(`✅ E-mail de redefinição enviado para ${email}!`);
+    } catch (e) {
+      alert("Erro: " + e.message);
     } finally {
       setSalvando(false);
     }
@@ -6543,9 +6618,33 @@ function UsuariosTab({ usuariosCadastrados, usuariosDisponiveis, grupos, lojas, 
           </div>
 
           <div>
-            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
-              Lojas (selecione uma ou mais)
-            </label>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider">
+                Lojas (selecione uma ou mais)
+              </label>
+              <div className="flex gap-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    // Marca todas as lojas ativas que não estão bloqueadas
+                    const todas = lojas
+                      .filter((l) => l.ativa && !lojasBloqueadasIds.includes(l.id))
+                      .map((l) => l.id);
+                    setConviteLojasIds(todas);
+                  }}
+                  className="text-[10px] uppercase tracking-wider font-semibold px-2 py-1 text-red-700 hover:bg-red-50 rounded transition-colors"
+                >
+                  Marcar todas
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConviteLojasIds([])}
+                  className="text-[10px] uppercase tracking-wider font-semibold px-2 py-1 text-stone-600 hover:bg-stone-100 rounded transition-colors"
+                >
+                  Desmarcar todas
+                </button>
+              </div>
+            </div>
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
               {lojas.filter((l) => l.ativa).map((l) => {
                 const bloqueada = lojasBloqueadasIds.includes(l.id);
@@ -6649,6 +6748,8 @@ function UsuariosTab({ usuariosCadastrados, usuariosDisponiveis, grupos, lojas, 
                 salvando={salvando}
                 onChangeGrupo={setDraftGrupoId}
                 onToggleLoja={toggleLoja}
+                onMarcarTodasLojas={marcarTodasLojas}
+                onDesmarcarTodasLojas={desmarcarTodasLojas}
                 onIniciarEdicao={() => iniciarEdicao(u, true)}
                 onCancelar={cancelarEdicao}
                 onSalvar={() => salvar(u.user_id)}
@@ -6686,8 +6787,12 @@ function UsuariosTab({ usuariosCadastrados, usuariosDisponiveis, grupos, lojas, 
                 salvando={salvando}
                 mostrarRH={userCtx.isAdmin}
                 onAlternarRH={() => alternarRH(u.user_id, u.eh_rh, u.email)}
+                onReenviarConvite={() => reenviarConvite(u.email)}
+                onResetarSenha={() => resetarSenha(u.email)}
                 onChangeGrupo={setDraftGrupoId}
                 onToggleLoja={toggleLoja}
+                onMarcarTodasLojas={marcarTodasLojas}
+                onDesmarcarTodasLojas={desmarcarTodasLojas}
                 onIniciarEdicao={() => iniciarEdicao(u, false)}
                 onCancelar={cancelarEdicao}
                 onSalvar={() => salvar(u.user_id)}
@@ -6705,7 +6810,9 @@ function UsuarioCard({
   u, ehNovo, grupos, lojas, lojasBloqueadasIds = [], ehSomenteRH = false, editando,
   draftGrupoId, draftLojasIds, erroLinha, salvando,
   mostrarRH = false, onAlternarRH = null,
-  onChangeGrupo, onToggleLoja, onIniciarEdicao, onCancelar, onSalvar, onRemover,
+  onReenviarConvite = null, onResetarSenha = null,
+  onChangeGrupo, onToggleLoja, onMarcarTodasLojas, onDesmarcarTodasLojas,
+  onIniciarEdicao, onCancelar, onSalvar, onRemover,
 }) {
   return (
     <div className={`border rounded-lg bg-white overflow-hidden ${editando ? "border-red-300 shadow-md" : "border-stone-200"}`}>
@@ -6756,6 +6863,30 @@ function UsuarioCard({
                   {u.eh_rh ? "É RH" : "Tornar RH"}
                 </button>
               )}
+              {/* Reenviar convite — só pra quem nunca logou */}
+              {u.nunca_logou && onReenviarConvite && (
+                <button
+                  onClick={onReenviarConvite}
+                  disabled={salvando}
+                  className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-amber-800 border border-amber-200 rounded-md hover:bg-amber-50"
+                  title="A pessoa ainda não fez o primeiro login. Clique para reenviar o convite por e-mail."
+                >
+                  <Mail className="w-3 h-3" />
+                  Reenviar convite
+                </button>
+              )}
+              {/* Resetar senha — sempre aparece (pra quem esqueceu) */}
+              {onResetarSenha && (
+                <button
+                  onClick={onResetarSenha}
+                  disabled={salvando}
+                  className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-stone-700 border border-stone-200 rounded-md hover:bg-stone-50"
+                  title="Envia um e-mail de redefinição de senha"
+                >
+                  <Lock className="w-3 h-3" />
+                  Resetar senha
+                </button>
+              )}
               <button
                 onClick={onIniciarEdicao}
                 className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-red-800 border border-red-200 rounded-md hover:bg-red-50"
@@ -6797,9 +6928,31 @@ function UsuarioCard({
 
             {/* Seleção de lojas */}
             <div>
-              <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
-                Lojas (selecione uma ou mais)
-              </label>
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider">
+                  Lojas (selecione uma ou mais)
+                </label>
+                <div className="flex gap-1">
+                  {onMarcarTodasLojas && (
+                    <button
+                      type="button"
+                      onClick={onMarcarTodasLojas}
+                      className="text-[10px] uppercase tracking-wider font-semibold px-2 py-1 text-red-700 hover:bg-red-50 rounded transition-colors"
+                    >
+                      Marcar todas
+                    </button>
+                  )}
+                  {onDesmarcarTodasLojas && (
+                    <button
+                      type="button"
+                      onClick={onDesmarcarTodasLojas}
+                      className="text-[10px] uppercase tracking-wider font-semibold px-2 py-1 text-stone-600 hover:bg-stone-100 rounded transition-colors"
+                    >
+                      Desmarcar todas
+                    </button>
+                  )}
+                </div>
+              </div>
               <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
                 {lojas.filter((l) => l.ativa).map((l) => {
                   const bloqueada = lojasBloqueadasIds.includes(l.id);
