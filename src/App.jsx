@@ -2210,23 +2210,26 @@ function podeEditarModulo(permissoes, modulo) {
 //   #/taxas                              → tabelas de taxas
 // ============================================================
 
-const ROTAS_VALIDAS = ["conciliacao", "cores", "financeiro", "taxas", "permissoes", "pedido_venda", "estoque", "relatorios", "config"];
+const ROTAS_VALIDAS = ["home", "conciliacao", "cores", "financeiro", "taxas", "permissoes", "pedido_venda", "estoque", "relatorios", "config"];
 const BANCOS_VALIDOS = ["sicredi", "blu_ss", "blu_lupe", "pague_veloz_express", "pague_veloz_pix"];
 
 function parseHashRoute(hash) {
   // Remove o "#" e barras iniciais
   const limpo = (hash || "").replace(/^#\/?/, "").trim();
-  if (!limpo) return { module: "conciliacao", bancoId: null };
+  if (!limpo) return { module: "home", bancoId: null };
 
   const partes = limpo.split("/").filter(Boolean);
-  const module = ROTAS_VALIDAS.includes(partes[0]) ? partes[0] : "conciliacao";
+  const module = ROTAS_VALIDAS.includes(partes[0]) ? partes[0] : "home";
   const bancoId = (module === "financeiro" && BANCOS_VALIDOS.includes(partes[1])) ? partes[1] : null;
   return { module, bancoId };
 }
 
 function buildHashRoute(module, bancoId) {
-  if (!module || module === "conciliacao") {
-    return bancoId ? `#/conciliacao` : `#/`;
+  if (!module || module === "home") {
+    return `#/`;
+  }
+  if (module === "conciliacao") {
+    return bancoId ? `#/conciliacao` : `#/conciliacao`;
   }
   if (module === "financeiro" && bancoId) {
     return `#/financeiro/${bancoId}`;
@@ -8415,18 +8418,24 @@ function ClienteFormulario({ clienteInicial, onSalvar, onCancelar }) {
   };
 
   // ===== Verificação no mapa (OpenStreetMap / Nominatim) =====
-  // Quando o endereço, bairro e cidade estiverem preenchidos, faz uma
-  // busca no OpenStreetMap pra confirmar que o local existe.
-  // Usa debounce de 1 segundo pra não fazer chamadas a cada letra digitada.
+  // Só verifica DEPOIS que o número do endereço foi preenchido (o número
+  // é importante pra precisão da busca — sem ele o OSM costuma errar).
+  // Usa debounce de 1.5 segundos pra esperar o usuário parar de digitar.
   useEffect(() => {
-    // Só verifica se tiver o mínimo necessário
-    if (!form.endereco.trim() || !form.cidade.trim() || !form.estado.trim()) {
+    // Só verifica se TODOS os campos essenciais estiverem preenchidos
+    // (incluindo o NÚMERO, que é o que faltava antes)
+    if (
+      !form.endereco.trim() ||
+      !form.numero.trim() ||
+      !form.cidade.trim() ||
+      !form.estado.trim()
+    ) {
       setStatusMapa("ocioso");
       setEnderecoEncontrado(null);
       return;
     }
 
-    // Debounce de 1s — espera o usuário parar de digitar
+    // Debounce de 1.5s — espera o usuário parar de digitar
     const timer = setTimeout(async () => {
       setStatusMapa("verificando");
       try {
@@ -8452,15 +8461,29 @@ function ClienteFormulario({ clienteInicial, onSalvar, onCancelar }) {
         // Chama a API do Nominatim (OpenStreetMap)
         // Nota: Nominatim pede um User-Agent identificável e limita a 1 req/segundo.
         // O debounce acima já garante o limite.
-        const url = `https://nominatim.openstreetmap.org/search?` +
-          `format=json&limit=1&countrycodes=br&q=${encodeURIComponent(query)}`;
-        const res = await fetch(url, {
-          headers: {
-            "Accept": "application/json",
-          },
-        });
-        if (!res.ok) throw new Error("Falha na consulta ao mapa");
-        const data = await res.json();
+        const fazBusca = async (q) => {
+          const u = `https://nominatim.openstreetmap.org/search?` +
+            `format=json&limit=1&countrycodes=br&q=${encodeURIComponent(q)}`;
+          const r = await fetch(u, { headers: { "Accept": "application/json" } });
+          if (!r.ok) throw new Error("Falha na consulta ao mapa");
+          return await r.json();
+        };
+
+        // 1ª tentativa: com endereço completo (rua + número)
+        let data = await fazBusca(query);
+
+        // 2ª tentativa (fallback): se não achou e tinha número, tenta sem o número
+        // Muitas ruas no OSM não têm todos os números mapeados — o fallback ajuda.
+        if ((!data || data.length === 0) && numeroPraQuery) {
+          const querySemNumero = [
+            form.endereco,
+            form.bairro,
+            form.cidade,
+            form.estado,
+            "Brasil",
+          ].filter((s) => s && s.trim()).join(", ");
+          data = await fazBusca(querySemNumero);
+        }
 
         if (data && data.length > 0) {
           setStatusMapa("encontrado");
@@ -8475,7 +8498,7 @@ function ClienteFormulario({ clienteInicial, onSalvar, onCancelar }) {
         setStatusMapa("erro");
         setEnderecoEncontrado(null);
       }
-    }, 1000); // 1 segundo de debounce
+    }, 1500); // 1.5 segundos de debounce
 
     return () => clearTimeout(timer);
   }, [form.endereco, form.numero, form.bairro, form.cidade, form.estado]);
@@ -9255,7 +9278,10 @@ export default function App() {
       >
         <div className="max-w-7xl mx-auto px-6 py-4 flex items-center gap-4">
           <button
-            onClick={() => setActiveModule("conciliacao")}
+            onClick={() => {
+              navigate("home", null);
+              setAbaAberta(null); // fecha qualquer aba aberta também
+            }}
             title="Voltar para a tela inicial"
             className="flex items-center gap-3 rounded-md p-1 -m-1 hover:bg-white/10 active:bg-white/20 transition-colors cursor-pointer text-left flex-shrink-0"
           >
@@ -9302,11 +9328,26 @@ export default function App() {
                   // Aba pai: header clicável (sanfona) + filhos só aparecem se aberta
                   const AbaIcon = item.aba.icon;
                   const aberta = abaAberta === item.aba.id;
+                  // Verifica se o módulo ativo é filho dessa aba
+                  const moduloAtivoEhFilho = item.filhos.some((m) => m.id === activeModule);
                   return (
                     <div key={item.aba.id} className={idx > 0 ? "mt-3" : ""}>
                       {/* Cabeçalho da aba pai (clicável) */}
                       <button
-                        onClick={() => setAbaAberta(aberta ? null : item.aba.id)}
+                        onClick={() => {
+                          if (aberta) {
+                            // Aba já está aberta: fecha
+                            setAbaAberta(null);
+                            // Se o usuário está num submódulo dessa aba, volta pra tela inicial
+                            // (limpa o activeModule pra mostrar a tela de boas-vindas)
+                            if (moduloAtivoEhFilho) {
+                              navigate("home", null);
+                            }
+                          } else {
+                            // Aba fechada: abre
+                            setAbaAberta(item.aba.id);
+                          }
+                        }}
                         className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md text-sm text-left transition-colors ${
                           aberta
                             ? "bg-red-50 text-red-800 font-semibold"
