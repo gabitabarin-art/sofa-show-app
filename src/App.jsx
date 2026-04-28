@@ -38,6 +38,7 @@ import {
   Wallet,
   ShoppingCart,
   UserPlus,
+  ChevronDown,
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 import LoginScreen from "./LoginScreen";
@@ -8303,6 +8304,16 @@ function ClienteFormulario({ clienteInicial, onSalvar, onCancelar }) {
   const [salvando, setSalvando] = useState(false);
   const [buscandoCEP, setBuscandoCEP] = useState(false);
 
+  // ETAPA Mapa: verifica se o endereço existe no OpenStreetMap
+  // Estados possíveis:
+  //   "ocioso"       — ainda não verificou
+  //   "verificando"  — chamando a API
+  //   "encontrado"   — endereço foi achado no mapa
+  //   "nao_encontrado" — não foi achado (mostra alerta amarelo)
+  //   "erro"         — falha de rede
+  const [statusMapa, setStatusMapa] = useState("ocioso");
+  const [enderecoEncontrado, setEnderecoEncontrado] = useState(null); // texto retornado pelo OSM
+
   const setCampo = (campo, valor) => {
     setForm((f) => ({ ...f, [campo]: valor }));
     // Limpa o erro do campo quando o usuário edita
@@ -8387,6 +8398,64 @@ function ClienteFormulario({ clienteInicial, onSalvar, onCancelar }) {
       buscarCEP(formatado);
     }
   };
+
+  // ===== Verificação no mapa (OpenStreetMap / Nominatim) =====
+  // Quando o endereço, bairro e cidade estiverem preenchidos, faz uma
+  // busca no OpenStreetMap pra confirmar que o local existe.
+  // Usa debounce de 1 segundo pra não fazer chamadas a cada letra digitada.
+  useEffect(() => {
+    // Só verifica se tiver o mínimo necessário
+    if (!form.endereco.trim() || !form.cidade.trim() || !form.estado.trim()) {
+      setStatusMapa("ocioso");
+      setEnderecoEncontrado(null);
+      return;
+    }
+
+    // Debounce de 1s — espera o usuário parar de digitar
+    const timer = setTimeout(async () => {
+      setStatusMapa("verificando");
+      try {
+        // Monta a query com os dados do endereço
+        const query = [
+          form.endereco,
+          form.bairro,
+          form.cidade,
+          form.estado,
+          "Brasil",
+        ]
+          .filter((s) => s && s.trim())
+          .join(", ");
+
+        // Chama a API do Nominatim (OpenStreetMap)
+        // Nota: Nominatim pede um User-Agent identificável e limita a 1 req/segundo.
+        // O debounce acima já garante o limite.
+        const url = `https://nominatim.openstreetmap.org/search?` +
+          `format=json&limit=1&countrycodes=br&q=${encodeURIComponent(query)}`;
+        const res = await fetch(url, {
+          headers: {
+            "Accept": "application/json",
+          },
+        });
+        if (!res.ok) throw new Error("Falha na consulta ao mapa");
+        const data = await res.json();
+
+        if (data && data.length > 0) {
+          setStatusMapa("encontrado");
+          setEnderecoEncontrado(data[0].display_name);
+        } else {
+          setStatusMapa("nao_encontrado");
+          setEnderecoEncontrado(null);
+        }
+      } catch (err) {
+        console.error("[ClienteForm] Erro ao verificar endereço no mapa:", err);
+        // Em caso de erro de rede, não bloqueia — só marca como erro
+        setStatusMapa("erro");
+        setEnderecoEncontrado(null);
+      }
+    }, 1000); // 1 segundo de debounce
+
+    return () => clearTimeout(timer);
+  }, [form.endereco, form.bairro, form.cidade, form.estado]);
 
   const handleSalvar = async () => {
     setErroGeral(null);
@@ -8637,6 +8706,46 @@ function ClienteFormulario({ clienteInicial, onSalvar, onCancelar }) {
             {showErro("estado")}
           </div>
         </div>
+
+        {/* Card de status da verificação no mapa */}
+        {statusMapa === "verificando" && (
+          <div className="mt-3 bg-stone-50 border border-stone-200 rounded-md p-3 flex items-center gap-2 text-xs text-stone-600">
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            Verificando endereço no mapa...
+          </div>
+        )}
+
+        {statusMapa === "encontrado" && enderecoEncontrado && (
+          <div className="mt-3 bg-emerald-50 border border-emerald-200 rounded-md p-3 flex items-start gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-700 mt-0.5 flex-shrink-0" />
+            <div className="text-xs text-emerald-900">
+              <p className="font-semibold mb-0.5">Endereço encontrado no mapa</p>
+              <p className="text-emerald-800">{enderecoEncontrado}</p>
+            </div>
+          </div>
+        )}
+
+        {statusMapa === "nao_encontrado" && (
+          <div className="mt-3 bg-amber-50 border border-amber-300 rounded-md p-3 flex items-start gap-2">
+            <AlertTriangle className="w-4 h-4 text-amber-700 mt-0.5 flex-shrink-0" />
+            <div className="text-xs text-amber-900">
+              <p className="font-semibold mb-0.5">⚠ Endereço não localizado no mapa</p>
+              <p className="text-amber-800">
+                Não conseguimos encontrar este endereço no mapa. Confirme os dados com o cliente antes de finalizar.
+                O cadastro pode ser salvo mesmo assim.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {statusMapa === "erro" && (
+          <div className="mt-3 bg-stone-50 border border-stone-200 rounded-md p-3 flex items-start gap-2">
+            <AlertTriangle className="w-4 h-4 text-stone-600 mt-0.5 flex-shrink-0" />
+            <p className="text-xs text-stone-700">
+              Não foi possível verificar o endereço no mapa agora (erro de conexão). O cadastro pode ser salvo mesmo assim.
+            </p>
+          </div>
+        )}
       </div>
 
       {/* Seção 3: Tipo de moradia */}
@@ -8884,9 +8993,29 @@ export default function App() {
   // Autenticação
   const { user, loading: authLoading, logout } = useAuth();
 
+  // Sanfona: qual aba pai está aberta (null = todas fechadas).
+  // Só uma pode ficar aberta por vez. Declarado aqui no topo pra ficar
+  // disponível pro setActiveModule abaixo.
+  const [abaAberta, setAbaAberta] = useState(null);
+
   // Hooks restantes (sempre chamados, em qualquer ordem — regras de hooks do React)
   const { module: activeModule, bancoId: bancoSelecionadoId, navigate } = useHashRoute();
-  const setActiveModule = (m) => navigate(m, null);
+  const setActiveModule = (m) => {
+    navigate(m, null);
+    // Quando o módulo é trocado (ex: via busca global ou logo), abre
+    // automaticamente a aba pai dele pra o usuário ver onde está.
+    const PARENT_DE = {
+      conciliacao:   "administrativo",
+      cores:         "administrativo",
+      financeiro:    "financeiro",
+      taxas:         "financeiro",
+      pedido_venda:  "vendas",
+    };
+    const parent = PARENT_DE[m];
+    if (parent) {
+      setAbaAberta(parent);
+    }
+  };
   // ETAPA B: agora também recebemos o `error` de cada hook pra mostrar na UI
   // E `reload` pra atualizar quando o usuário entra na tela
   const { table: colorTable, save: saveColorTable, loaded: colorsLoaded, error: errorCores, reload: reloadCores } = useColorTable();
@@ -9105,35 +9234,51 @@ export default function App() {
             <nav className="space-y-1">
               {menuAgrupado.map((item, idx) => {
                 if (item.tipo === "aba") {
-                  // Aba pai: header não-clicável + filhos identados
+                  // Aba pai: header clicável (sanfona) + filhos só aparecem se aberta
                   const AbaIcon = item.aba.icon;
+                  const aberta = abaAberta === item.aba.id;
                   return (
                     <div key={item.aba.id} className={idx > 0 ? "mt-3" : ""}>
-                      {/* Cabeçalho da aba pai */}
-                      <div className="flex items-center gap-3 px-3 py-2 text-[11px] uppercase tracking-[0.15em] text-stone-500 font-semibold">
-                        <AbaIcon className="w-3.5 h-3.5 flex-shrink-0 text-red-700" />
+                      {/* Cabeçalho da aba pai (clicável) */}
+                      <button
+                        onClick={() => setAbaAberta(aberta ? null : item.aba.id)}
+                        className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md text-sm text-left transition-colors ${
+                          aberta
+                            ? "bg-red-50 text-red-800 font-semibold"
+                            : "text-stone-700 hover:bg-stone-100 font-medium"
+                        }`}
+                      >
+                        <AbaIcon className={`w-4 h-4 flex-shrink-0 ${aberta ? "text-red-700" : "text-stone-500"}`} />
                         <span className="flex-1">{item.aba.label}</span>
-                      </div>
-                      {/* Submódulos identados */}
-                      <div className="space-y-1">
-                        {item.filhos.map((m) => (
-                          <button
-                            key={m.id}
-                            onClick={() => m.available && setActiveModule(m.id)}
-                            disabled={!m.available}
-                            className={`w-full flex items-center gap-3 pl-7 pr-3 py-2 rounded-md text-sm text-left transition-colors ${
-                              activeModule === m.id
-                                ? "bg-red-50 text-red-800 font-semibold border-l-4 border-red-700 rounded-l-none pl-6"
-                                : m.available
-                                ? "text-stone-700 hover:bg-stone-100"
-                                : "text-stone-400 cursor-not-allowed"
-                            }`}
-                          >
-                            <m.icon className="w-4 h-4 flex-shrink-0" />
-                            <span className="flex-1">{m.label}</span>
-                          </button>
-                        ))}
-                      </div>
+                        <ChevronDown
+                          className={`w-4 h-4 flex-shrink-0 transition-transform ${
+                            aberta ? "rotate-180 text-red-700" : "text-stone-400"
+                          }`}
+                        />
+                      </button>
+
+                      {/* Submódulos identados — só aparecem se aba aberta */}
+                      {aberta && (
+                        <div className="space-y-1 mt-1">
+                          {item.filhos.map((m) => (
+                            <button
+                              key={m.id}
+                              onClick={() => m.available && setActiveModule(m.id)}
+                              disabled={!m.available}
+                              className={`w-full flex items-center gap-3 pl-9 pr-3 py-2 rounded-md text-sm text-left transition-colors ${
+                                activeModule === m.id
+                                  ? "bg-red-50 text-red-800 font-semibold border-l-4 border-red-700 rounded-l-none pl-8"
+                                  : m.available
+                                  ? "text-stone-700 hover:bg-stone-100"
+                                  : "text-stone-400 cursor-not-allowed"
+                              }`}
+                            >
+                              <m.icon className="w-4 h-4 flex-shrink-0" />
+                              <span className="flex-1">{m.label}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   );
                 } else {
