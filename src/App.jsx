@@ -8011,20 +8011,25 @@ function useClientes(user) {
 
   const salvar = async (cliente) => {
     const payload = {
-      nome:           cliente.nome.trim(),
-      tipo_documento: cliente.tipoDocumento,
-      documento:      soNumeros(cliente.documento),
-      email:          cliente.email.trim().toLowerCase(),
-      telefone:       soNumeros(cliente.telefone),
-      telefone_2:     cliente.telefone2 ? soNumeros(cliente.telefone2) : null,
-      cep:            soNumeros(cliente.cep),
-      endereco:       cliente.endereco.trim(),
-      bairro:         cliente.bairro.trim(),
-      cidade:         cliente.cidade.trim(),
-      estado:         cliente.estado.trim().toUpperCase(),
-      tipo_moradia:   cliente.tipoMoradia,
-      bloco:          cliente.tipoMoradia === "apartamento" ? cliente.bloco?.trim() || null : null,
-      andar:          cliente.tipoMoradia === "apartamento" ? cliente.andar?.trim() || null : null,
+      nome:               cliente.nome.trim(),
+      tipo_documento:     cliente.tipoDocumento,
+      documento:          soNumeros(cliente.documento),
+      // Inscrição Estadual: só envia quando for CNPJ. Se for vazio, salva NULL.
+      inscricao_estadual: cliente.tipoDocumento === "cnpj"
+                            ? (cliente.inscricaoEstadual?.trim() || null)
+                            : null,
+      email:              cliente.email.trim().toLowerCase(),
+      telefone:           soNumeros(cliente.telefone),
+      telefone_2:         cliente.telefone2 ? soNumeros(cliente.telefone2) : null,
+      cep:                soNumeros(cliente.cep),
+      endereco:           cliente.endereco.trim(),
+      numero:             cliente.numero.trim(),
+      bairro:             cliente.bairro.trim(),
+      cidade:             cliente.cidade.trim(),
+      estado:             cliente.estado.trim().toUpperCase(),
+      tipo_moradia:       cliente.tipoMoradia,
+      bloco:              cliente.tipoMoradia === "apartamento" ? cliente.bloco?.trim() || null : null,
+      andar:              cliente.tipoMoradia === "apartamento" ? cliente.andar?.trim() || null : null,
     };
 
     if (cliente.id) {
@@ -8271,30 +8276,32 @@ function ClienteFormulario({ clienteInicial, onSalvar, onCancelar }) {
   const [form, setForm] = useState(() => {
     if (clienteInicial) {
       return {
-        id:             clienteInicial.id,
-        nome:           clienteInicial.nome || "",
-        tipoDocumento:  clienteInicial.tipo_documento || "cpf",
-        documento:      clienteInicial.tipo_documento === "cnpj"
-                          ? formatarCNPJ(clienteInicial.documento)
-                          : formatarCPF(clienteInicial.documento),
-        email:          clienteInicial.email || "",
-        telefone:       formatarTelefone(clienteInicial.telefone || ""),
-        telefone2:      formatarTelefone(clienteInicial.telefone_2 || ""),
-        cep:            formatarCEP(clienteInicial.cep || ""),
-        endereco:       clienteInicial.endereco || "",
-        bairro:         clienteInicial.bairro || "",
-        cidade:         clienteInicial.cidade || "",
-        estado:         clienteInicial.estado || "",
-        tipoMoradia:    clienteInicial.tipo_moradia || "casa",
-        bloco:          clienteInicial.bloco || "",
-        andar:          clienteInicial.andar || "",
+        id:                 clienteInicial.id,
+        nome:               clienteInicial.nome || "",
+        tipoDocumento:      clienteInicial.tipo_documento || "cpf",
+        documento:          clienteInicial.tipo_documento === "cnpj"
+                              ? formatarCNPJ(clienteInicial.documento)
+                              : formatarCPF(clienteInicial.documento),
+        inscricaoEstadual:  clienteInicial.inscricao_estadual || "",
+        email:              clienteInicial.email || "",
+        telefone:           formatarTelefone(clienteInicial.telefone || ""),
+        telefone2:          formatarTelefone(clienteInicial.telefone_2 || ""),
+        cep:                formatarCEP(clienteInicial.cep || ""),
+        endereco:           clienteInicial.endereco || "",
+        numero:             clienteInicial.numero || "",
+        bairro:             clienteInicial.bairro || "",
+        cidade:             clienteInicial.cidade || "",
+        estado:             clienteInicial.estado || "",
+        tipoMoradia:        clienteInicial.tipo_moradia || "casa",
+        bloco:              clienteInicial.bloco || "",
+        andar:              clienteInicial.andar || "",
       };
     }
     return {
       id: null,
-      nome: "", tipoDocumento: "cpf", documento: "", email: "",
+      nome: "", tipoDocumento: "cpf", documento: "", inscricaoEstadual: "", email: "",
       telefone: "", telefone2: "",
-      cep: "", endereco: "", bairro: "", cidade: "", estado: "",
+      cep: "", endereco: "", numero: "", bairro: "", cidade: "", estado: "",
       tipoMoradia: "casa", bloco: "", andar: "",
     };
   });
@@ -8325,8 +8332,15 @@ function ClienteFormulario({ clienteInicial, onSalvar, onCancelar }) {
   const validar = () => {
     const e = {};
 
-    if (!form.nome.trim()) e.nome = "Nome é obrigatório.";
-    else if (form.nome.trim().length < 2) e.nome = "Nome muito curto.";
+    if (!form.nome.trim()) {
+      e.nome = form.tipoDocumento === "cnpj"
+        ? "Razão Social é obrigatória."
+        : "Nome é obrigatório.";
+    } else if (form.nome.trim().length < 2) {
+      e.nome = form.tipoDocumento === "cnpj"
+        ? "Razão Social muito curta."
+        : "Nome muito curto.";
+    }
 
     if (!form.documento.trim()) {
       e.documento = `${form.tipoDocumento.toUpperCase()} é obrigatório.`;
@@ -8350,6 +8364,7 @@ function ClienteFormulario({ clienteInicial, onSalvar, onCancelar }) {
     else if (soNumeros(form.cep).length !== 8) e.cep = "CEP precisa ter 8 dígitos.";
 
     if (!form.endereco.trim()) e.endereco = "Endereço é obrigatório.";
+    if (!form.numero.trim())   e.numero   = "Número é obrigatório (use 'S/N' se não houver).";
     if (!form.bairro.trim())   e.bairro   = "Bairro é obrigatório.";
     if (!form.cidade.trim())   e.cidade   = "Cidade é obrigatória.";
     if (!form.estado.trim())   e.estado   = "Estado é obrigatório.";
@@ -8416,8 +8431,16 @@ function ClienteFormulario({ clienteInicial, onSalvar, onCancelar }) {
       setStatusMapa("verificando");
       try {
         // Monta a query com os dados do endereço
+        // Inclui o número se for um número real (não 'S/N')
+        const numeroPraQuery = form.numero && !/^s\/?n$/i.test(form.numero.trim())
+          ? form.numero.trim()
+          : null;
+        const enderecoCompleto = numeroPraQuery
+          ? `${form.endereco}, ${numeroPraQuery}`
+          : form.endereco;
+
         const query = [
-          form.endereco,
+          enderecoCompleto,
           form.bairro,
           form.cidade,
           form.estado,
@@ -8455,7 +8478,7 @@ function ClienteFormulario({ clienteInicial, onSalvar, onCancelar }) {
     }, 1000); // 1 segundo de debounce
 
     return () => clearTimeout(timer);
-  }, [form.endereco, form.bairro, form.cidade, form.estado]);
+  }, [form.endereco, form.numero, form.bairro, form.cidade, form.estado]);
 
   const handleSalvar = async () => {
     setErroGeral(null);
@@ -8498,58 +8521,50 @@ function ClienteFormulario({ clienteInicial, onSalvar, onCancelar }) {
       {/* Seção 1: Dados pessoais */}
       <div>
         <h3 className="font-serif text-lg font-semibold text-stone-900 mb-4 pb-2 border-b border-stone-100">
-          Dados pessoais
+          Dados {form.tipoDocumento === "cnpj" ? "da empresa" : "pessoais"}
         </h3>
         <div className="grid md:grid-cols-2 gap-4">
-          {/* Nome - linha inteira */}
+          {/* PRIMEIRO: Tipo de documento (CPF / CNPJ) */}
           <div className="md:col-span-2">
             <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
-              Nome completo *
+              Tipo de cadastro *
             </label>
-            <input
-              type="text"
-              value={form.nome}
-              onChange={(e) => setCampo("nome", e.target.value)}
-              placeholder="Ex: Maria Silva"
-              autoFocus
-              className={inputClass("nome")}
-            />
-            {showErro("nome")}
-          </div>
-
-          {/* Tipo de documento */}
-          <div>
-            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
-              Tipo de documento *
-            </label>
-            <div className="flex gap-2">
+            <div className="flex gap-2 max-w-md">
               <button
                 type="button"
-                onClick={() => { setCampo("tipoDocumento", "cpf"); setCampo("documento", ""); }}
-                className={`flex-1 px-3 py-2 text-sm font-medium rounded-md border transition-colors ${
+                onClick={() => {
+                  setCampo("tipoDocumento", "cpf");
+                  setCampo("documento", "");
+                  // Limpa inscrição estadual se trocar pra CPF
+                  setCampo("inscricaoEstadual", "");
+                }}
+                className={`flex-1 px-3 py-2.5 text-sm font-medium rounded-md border transition-colors ${
                   form.tipoDocumento === "cpf"
                     ? "bg-red-700 text-white border-red-700"
                     : "bg-white text-stone-700 border-stone-300 hover:bg-stone-50"
                 }`}
               >
-                CPF
+                Pessoa Física (CPF)
               </button>
               <button
                 type="button"
-                onClick={() => { setCampo("tipoDocumento", "cnpj"); setCampo("documento", ""); }}
-                className={`flex-1 px-3 py-2 text-sm font-medium rounded-md border transition-colors ${
+                onClick={() => {
+                  setCampo("tipoDocumento", "cnpj");
+                  setCampo("documento", "");
+                }}
+                className={`flex-1 px-3 py-2.5 text-sm font-medium rounded-md border transition-colors ${
                   form.tipoDocumento === "cnpj"
                     ? "bg-red-700 text-white border-red-700"
                     : "bg-white text-stone-700 border-stone-300 hover:bg-stone-50"
                 }`}
               >
-                CNPJ
+                Pessoa Jurídica (CNPJ)
               </button>
             </div>
           </div>
 
           {/* Número do documento */}
-          <div>
+          <div className="md:col-span-2">
             <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
               {form.tipoDocumento === "cpf" ? "CPF" : "CNPJ"} *
             </label>
@@ -8565,11 +8580,46 @@ function ClienteFormulario({ clienteInicial, onSalvar, onCancelar }) {
               }}
               placeholder={form.tipoDocumento === "cpf" ? "000.000.000-00" : "00.000.000/0000-00"}
               className={inputClass("documento")}
+              autoFocus
             />
             {showErro("documento")}
           </div>
 
-          {/* E-mail - linha inteira */}
+          {/* Nome do cliente OU Razão Social — depende do tipo */}
+          <div className="md:col-span-2">
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              {form.tipoDocumento === "cpf" ? "Nome completo *" : "Razão Social *"}
+            </label>
+            <input
+              type="text"
+              value={form.nome}
+              onChange={(e) => setCampo("nome", e.target.value)}
+              placeholder={form.tipoDocumento === "cpf" ? "Ex: Maria Silva" : "Ex: Sofá Show Comércio Ltda"}
+              className={inputClass("nome")}
+            />
+            {showErro("nome")}
+          </div>
+
+          {/* Inscrição Estadual — só pra CNPJ, opcional */}
+          {form.tipoDocumento === "cnpj" && (
+            <div className="md:col-span-2">
+              <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+                Inscrição Estadual (opcional)
+              </label>
+              <input
+                type="text"
+                value={form.inscricaoEstadual || ""}
+                onChange={(e) => setCampo("inscricaoEstadual", e.target.value)}
+                placeholder="Ex: 123.456.789.012 ou ISENTO"
+                className={inputClass("inscricaoEstadual")}
+              />
+              <p className="text-xs text-stone-500 mt-1">
+                Se a empresa for isenta, pode digitar "ISENTO".
+              </p>
+            </div>
+          )}
+
+          {/* E-mail */}
           <div className="md:col-span-2">
             <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
               E-mail *
@@ -8578,7 +8628,7 @@ function ClienteFormulario({ clienteInicial, onSalvar, onCancelar }) {
               type="email"
               value={form.email}
               onChange={(e) => setCampo("email", e.target.value)}
-              placeholder="cliente@exemplo.com"
+              placeholder={form.tipoDocumento === "cnpj" ? "contato@empresa.com" : "cliente@exemplo.com"}
               className={inputClass("email")}
             />
             {showErro("email")}
@@ -8645,7 +8695,7 @@ function ClienteFormulario({ clienteInicial, onSalvar, onCancelar }) {
             {showErro("cep")}
           </div>
 
-          {/* Endereço (rua) */}
+          {/* Endereço (rua) — ocupa 2 colunas */}
           <div className="md:col-span-2">
             <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
               Endereço (rua/avenida) *
@@ -8654,10 +8704,25 @@ function ClienteFormulario({ clienteInicial, onSalvar, onCancelar }) {
               type="text"
               value={form.endereco}
               onChange={(e) => setCampo("endereco", e.target.value)}
-              placeholder="Ex: Rua das Flores, 123"
+              placeholder="Ex: Rua das Flores"
               className={inputClass("endereco")}
             />
             {showErro("endereco")}
+          </div>
+
+          {/* Número */}
+          <div>
+            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
+              Número *
+            </label>
+            <input
+              type="text"
+              value={form.numero}
+              onChange={(e) => setCampo("numero", e.target.value)}
+              placeholder="Ex: 123 ou S/N"
+              className={inputClass("numero")}
+            />
+            {showErro("numero")}
           </div>
 
           {/* Bairro */}
