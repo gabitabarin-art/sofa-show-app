@@ -9254,7 +9254,6 @@ function useFornecedores(user) {
       razao_social:       f.razaoSocial.trim(),
       nome_fantasia:      f.tipoDocumento === "cnpj" ? (f.nomeFantasia?.trim() || null) : null,
       inscricao_estadual: f.tipoDocumento === "cnpj" ? (f.inscricaoEstadual?.trim() || null) : null,
-      email_principal:    f.emailPrincipal.trim().toLowerCase(),
       telefone:           soNumeros(f.telefone),
       telefone_2:         f.telefone2 ? soNumeros(f.telefone2) : null,
       emails_encomendas:  emailsEncomendas,
@@ -9475,7 +9474,7 @@ function FornecedoresModule({ user, podeEditar }) {
                           : formatarCPF(fornecedorJaExiste.documento)}
                       </strong>
                     </p>
-                    <p>📧 {fornecedorJaExiste.email_principal}</p>
+                    <p>📧 {fornecedorJaExiste.emails_encomendas?.[0] || fornecedorJaExiste.email_principal || "(sem e-mail)"}</p>
                     <p>📞 {formatarTelefone(fornecedorJaExiste.telefone)}</p>
                     <p>📍 {fornecedorJaExiste.cidade}/{fornecedorJaExiste.estado}</p>
                   </div>
@@ -9555,7 +9554,6 @@ function FornecedorFormulario({ fornecedorInicial, podeEditar, onSalvar, onCance
         razaoSocial:        fornecedorInicial.razao_social || "",
         nomeFantasia:       fornecedorInicial.nome_fantasia || "",
         inscricaoEstadual:  fornecedorInicial.inscricao_estadual || "",
-        emailPrincipal:     fornecedorInicial.email_principal || "",
         telefone:           formatarTelefone(fornecedorInicial.telefone || ""),
         telefone2:          formatarTelefone(fornecedorInicial.telefone_2 || ""),
         emailsEncomendas:   (fornecedorInicial.emails_encomendas  && fornecedorInicial.emails_encomendas.length  > 0) ? [...fornecedorInicial.emails_encomendas]  : [""],
@@ -9572,7 +9570,7 @@ function FornecedorFormulario({ fornecedorInicial, podeEditar, onSalvar, onCance
       id: null,
       tipoDocumento: "cnpj", documento: "",
       razaoSocial: "", nomeFantasia: "", inscricaoEstadual: "",
-      emailPrincipal: "", telefone: "", telefone2: "",
+      telefone: "", telefone2: "",
       emailsEncomendas: [""],
       emailsAssistencia: [""],
       cep: "", endereco: "", numero: "", bairro: "", cidade: "", estado: "",
@@ -9632,9 +9630,6 @@ function FornecedorFormulario({ fornecedorInicial, podeEditar, onSalvar, onCance
       if (!form.nomeFantasia.trim())      e.nomeFantasia      = "Nome Fantasia é obrigatório.";
       if (!form.inscricaoEstadual.trim()) e.inscricaoEstadual = "Inscrição Estadual é obrigatória (use 'ISENTO' se aplicável).";
     }
-
-    if (!form.emailPrincipal.trim())             e.emailPrincipal = "E-mail principal é obrigatório.";
-    else if (!validarEmail(form.emailPrincipal)) e.emailPrincipal = "E-mail inválido.";
 
     if (!form.telefone.trim())              e.telefone  = "Telefone é obrigatório.";
     else if (!validarTelefone(form.telefone)) e.telefone = "Telefone inválido.";
@@ -9899,27 +9894,12 @@ function FornecedorFormulario({ fornecedorInicial, podeEditar, onSalvar, onCance
         </div>
       </div>
 
-      {/* Seção 2: Contato principal */}
+      {/* Seção 2: Telefones */}
       <div>
         <h3 className="font-serif text-lg font-semibold text-stone-900 mb-4 pb-2 border-b border-stone-100">
-          Contato principal
+          Telefones
         </h3>
         <div className="grid md:grid-cols-2 gap-4">
-          <div className="md:col-span-2">
-            <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
-              E-mail principal *
-            </label>
-            <input
-              type="email"
-              value={form.emailPrincipal}
-              disabled={inputDesabilitado}
-              onChange={(e) => setCampo("emailPrincipal", e.target.value)}
-              placeholder="contato@fornecedor.com"
-              className={inputClass("emailPrincipal")}
-            />
-            {showErro("emailPrincipal")}
-          </div>
-
           <div>
             <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5 block">
               Telefone *
@@ -10196,7 +10176,8 @@ function FornecedorPesquisa({ fornecedores, loaded, podeEditar, onVoltar, onEdit
         norm(f.razao_social).includes(q) ||
         norm(f.nome_fantasia || "").includes(q) ||
         norm(f.documento).includes(q) ||
-        norm(f.email_principal).includes(q) ||
+        norm((f.emails_encomendas || []).join(" ")).includes(q) ||
+        norm((f.emails_assistencia || []).join(" ")).includes(q) ||
         norm(f.telefone).includes(q) ||
         norm(f.cidade).includes(q) ||
         String(f.numero_fornecedor || "").includes(q)
@@ -10283,7 +10264,7 @@ function FornecedorCard({ fornecedor, podeEditar, onEditar, onRemover }) {
           )}
           <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-600 mt-1">
             <span>{fornecedor.tipo_documento.toUpperCase()}: <strong>{docFormatado}</strong></span>
-            <span>📧 {fornecedor.email_principal}</span>
+            <span>📧 {fornecedor.emails_encomendas?.[0] || fornecedor.email_principal || "(sem e-mail)"}</span>
             <span>📞 {telFormatado}</span>
             <span>📍 {fornecedor.cidade}/{fornecedor.estado}</span>
             {totalEmailsExtras > 0 && (
